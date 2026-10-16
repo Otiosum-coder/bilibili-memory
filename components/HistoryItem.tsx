@@ -88,7 +88,10 @@ export const HistoryItem: React.FC<HistoryItemProps> = ({ item, displayMode, onD
         return;
       }
 
-      const isSyncDelete = await getStorageValue(IS_SYNC_DELETE, true);
+      // 默认必须是 false。设置页读的是同一个键但默认 false（显示为"关闭"），
+      // 这里原来是 true —— 结果是**从未动过开关的用户，界面显示关闭，实际却在删 B 站服务器上的记录**。
+      // 对一个以"防丢失"为目的的扩展来说，这是最不能接受的默认值：宁可少删，不可多删。
+      const isSyncDelete = await getStorageValue(IS_SYNC_DELETE, false);
       if (isSyncDelete) {
         // 先删除B站服务器上的历史记录
         await deleteBilibiliHistory(item.business, item.id);

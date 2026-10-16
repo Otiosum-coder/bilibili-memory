@@ -18,7 +18,7 @@ interface GuideStep {
 
 const steps: GuideStep[] = [
   {
-    title: "欢迎使用 Bilibili History",
+    title: "欢迎使用哔哩哔哩记忆",
     description: "接下来用几步了解历史记录和备份。每一步都会指向真实功能，也可以随时跳过。",
     icon: History,
     accent: "bg-pink-50 text-pink-600 dark:bg-pink-500/10 dark:text-pink-400",
@@ -31,7 +31,7 @@ const steps: GuideStep[] = [
     icon: History,
     accent: "bg-pink-50 text-pink-600 dark:bg-pink-500/10 dark:text-pink-400",
     target: "[data-tour='history-menu']",
-    path: "/",
+    path: "/history",
   },
   {
     title: "历史记录工具栏",
@@ -39,7 +39,7 @@ const steps: GuideStep[] = [
     icon: History,
     accent: "bg-pink-50 text-pink-600 dark:bg-pink-500/10 dark:text-pink-400",
     target: "[data-tour='history-toolbar']",
-    path: "/",
+    path: "/history",
   },
   {
     title: "数据备份",
@@ -61,7 +61,7 @@ const steps: GuideStep[] = [
   {
     title: "WebDAV 自动备份",
     description:
-      "配置自己的 WebDAV 服务后，可按设定周期在后台自动同步已选数据，适合跨设备保存历史记录、音乐、收藏夹和合集。请先测试并保存连接，再开启自动同步。",
+      "配置自己的 WebDAV 服务后，可按设定周期在后台自动同步已选数据，适合跨设备保存历史记录、收藏夹、订阅合集、关注列表与消失档案。请先测试并保存连接，再开启自动同步。",
     icon: DatabaseBackup,
     accent: "bg-orange-50 text-orange-600 dark:bg-orange-500/10 dark:text-orange-400",
     target: "[data-tour='backup-webdav-auto']",

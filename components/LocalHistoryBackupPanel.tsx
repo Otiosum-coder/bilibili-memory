@@ -32,14 +32,18 @@ import {
 import { getStorageValue, setStorageValue, setStorageValues } from "../utils/storage";
 import { LocalHistoryBackupResult } from "../utils/types";
 import { Select } from "./Select";
+import { BackupItemsPicker } from "./BackupItemsPicker";
 
 const LOCAL_BACKUP_ITEM_OPTIONS: { key: BackupItemKey; label: string }[] = [
   { key: "history", label: "历史记录" },
-  { key: "likedMusic", label: "喜欢的音乐" },
   { key: "favFolders", label: "收藏夹" },
   { key: "favResources", label: "收藏资源" },
   { key: "subscribedCollections", label: "订阅合集" },
   { key: "subscribedCollectionResources", label: "合集视频" },
+  { key: "following", label: "关注的 UP 主" },
+  { key: "followingEvents", label: "关注变动" },
+  { key: "vanishArchive", label: "消失档案" },
+  { key: "interactions", label: "点赞与投币" },
 ];
 
 export const LocalHistoryBackupPanel = () => {
@@ -256,18 +260,6 @@ export const LocalHistoryBackupPanel = () => {
     }
   };
 
-  const toggleBackupItem = async (key: BackupItemKey) => {
-    const selectedCount = Object.values(backupItems).filter(Boolean).length;
-    if (backupItems[key] && selectedCount === 1) {
-      toast.error("请至少保留一项备份内容");
-      return;
-    }
-
-    const next = { ...backupItems, [key]: !backupItems[key] };
-    setBackupItems(next);
-    await setStorageValue(LOCAL_HISTORY_BACKUP_ITEMS, next);
-  };
-
   return (
     <section className="overflow-hidden rounded-2xl border border-gray-200 bg-white dark:border-neutral-800 dark:bg-neutral-900">
       <div className="border-b border-gray-100 px-5 py-4 dark:border-neutral-800">
@@ -382,44 +374,24 @@ export const LocalHistoryBackupPanel = () => {
               </label>
             </div>
 
-            <fieldset disabled={isRunning}>
-              <legend className="mb-2 flex w-full items-center justify-between gap-3 text-sm font-medium text-gray-700 dark:text-neutral-300">
-                <span>备份内容</span>
-                <button
-                  type="button"
-                  onClick={() => {
-                    const allSelected = Object.fromEntries(
-                      LOCAL_BACKUP_ITEM_OPTIONS.map((item) => [item.key, true]),
-                    ) as BackupItems;
-                    setBackupItems(allSelected);
-                    void setStorageValue(LOCAL_HISTORY_BACKUP_ITEMS, allSelected);
-                  }}
-                  className="rounded-md px-2 py-1 text-xs font-medium text-emerald-700 transition-colors hover:bg-emerald-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-emerald-500 disabled:cursor-not-allowed disabled:opacity-50 dark:text-emerald-400 dark:hover:bg-emerald-500/10"
-                >
-                  全部选择
-                </button>
-              </legend>
-              <div className="grid grid-cols-2 gap-2 sm:grid-cols-3">
-                {LOCAL_BACKUP_ITEM_OPTIONS.map((item) => (
-                  <label
-                    key={item.key}
-                    className={`flex min-h-10 cursor-pointer items-center gap-2 rounded-lg border px-3 py-2 text-sm transition-colors has-[:disabled]:cursor-not-allowed has-[:disabled]:opacity-60 ${
-                      backupItems[item.key]
-                        ? "border-emerald-200 bg-emerald-50 text-emerald-800 dark:border-emerald-500/30 dark:bg-emerald-500/10 dark:text-emerald-200"
-                        : "border-gray-200 text-gray-700 hover:bg-gray-50 dark:border-neutral-700 dark:text-neutral-300 dark:hover:bg-neutral-800"
-                    }`}
-                  >
-                    <input
-                      type="checkbox"
-                      checked={backupItems[item.key]}
-                      onChange={() => void toggleBackupItem(item.key)}
-                      className="h-4 w-4 accent-emerald-600 focus:ring-2 focus:ring-emerald-500 focus:ring-offset-1 dark:accent-emerald-500"
-                    />
-                    <span>{item.label}</span>
-                  </label>
-                ))}
-              </div>
-            </fieldset>
+            <div>
+              <p className="mb-2 text-sm font-medium text-gray-700 dark:text-neutral-300">备份内容</p>
+              <BackupItemsPicker
+                options={LOCAL_BACKUP_ITEM_OPTIONS}
+                value={backupItems}
+                onChange={(next) => {
+                  setBackupItems(next);
+                  void setStorageValue(LOCAL_HISTORY_BACKUP_ITEMS, next);
+                }}
+                disabled={isRunning}
+                accent="emerald"
+                hints={{
+                  vanishArchive:
+                    "收藏、订阅合集、关注与互动四处「已查不到」内容的快照。它无法从 B 站重新同步，建议保留",
+                }}
+                scopeHint="只影响本地目录备份。WebDAV 同步与 JSON 导出各有自己的备份内容，互不影响。"
+              />
+            </div>
 
             <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
               <Select
@@ -440,7 +412,7 @@ export const LocalHistoryBackupPanel = () => {
                 ]}
               />
               <Select
-                label="保留份数"
+                label="最多保留备份文件"
                 value={String(retentionCount)}
                 onChange={(value) => {
                   const next = Number(value);
@@ -456,6 +428,14 @@ export const LocalHistoryBackupPanel = () => {
                 ]}
               />
             </div>
+
+            <p className="text-xs leading-relaxed text-gray-400 dark:text-neutral-500">
+              超出份数的旧备份文件会被自动删除。与「备份周期」一起决定能往前翻多久：
+              每 24 小时 + 7 份 ≈ 一周。<code className="rounded bg-gray-100 px-1 dark:bg-neutral-800">
+                images/
+              </code>{" "}
+              里的归档图片是增量写入，不受份数限制。
+            </p>
 
             <dl className="space-y-2 text-xs text-gray-600 dark:text-neutral-400">
               <div className="flex justify-between gap-3">

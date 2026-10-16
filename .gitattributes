@@ -1,0 +1,22 @@
+# 统一行尾为 LF。
+#
+# 为什么需要它：`.editorconfig` 与 `.vscode/settings.json` 都要求 `lf`，
+# 但 Windows 的 git 默认 `core.autocrlf=true` 会在检出时把工作区换成 CRLF，
+# 与项目自己的约定冲突（也会让 Prettier 校验出现无关差异）。
+# 这里显式钉死，让仓库与工作区都用 LF，不受各人 git 配置影响。
+* text=auto eol=lf
+
+# 二进制文件不要做行尾转换，否则会被损坏
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.webp binary
+*.ico binary
+*.zip binary
+*.woff binary
+*.woff2 binary
+
+# 锁文件按文本处理，但不要出现在 diff 里（它们很大且由工具生成）
+pnpm-lock.yaml linguist-generated=true
+package-lock.json linguist-generated=true

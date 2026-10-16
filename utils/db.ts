@@ -1,5 +1,9 @@
 import {
+  AssetKind,
+  AssetRecord,
   DBConfig,
+  FollowingEvent,
+  FollowingItem,
   HistoryCursor,
   HistoryDisplayMode,
   HistoryEvent,
@@ -8,22 +12,33 @@ import {
   HistoryListItem,
   HistoryTombstone,
   HistoryV2Backup,
+  InteractionItem,
+  InteractionType,
   LikedMusic,
   SubscribedCollection,
   SubscribedCollectionResource,
+  VanishArchiveItem,
+  VanishedFavResource,
 } from "./types";
 import dayjs from "dayjs";
 import { recordStorageWarning } from "./storageHealth";
+import { estimateJsonBytes } from "./storageFormat";
 import { getStorageValue, setStorageValue } from "./storage";
 import {
   DELETED_HISTORY_IDS,
   HISTORY_EVENT_MIGRATION_REPORT,
   HISTORY_LEGACY_TOMBSTONES_MIGRATED,
 } from "./constants";
+import {
+  INVALIDATED_TITLE_RE,
+  isInvalidatedResource,
+  resolveInvalidatedKind,
+} from "./favVanishedDiff";
+import { shouldPreserveLocalMetadata } from "./favRecovery";
 
 const DB_CONFIG: DBConfig = {
   name: "bilibiliHistory",
-  version: 8,
+  version: 11,
   stores: {
     history: {
       keyPath: "id",
@@ -56,6 +71,30 @@ const DB_CONFIG: DBConfig = {
     subscribedCollectionResources: {
       keyPath: "id",
       indexes: ["collection_id", "pubdate"],
+    },
+    following: {
+      keyPath: "mid",
+      indexes: ["status"],
+    },
+    followingEvents: {
+      keyPath: "event_id",
+      indexes: ["day", "type", "mid", "occurred_at"],
+    },
+    assets: {
+      keyPath: "id",
+      indexes: ["kind"],
+    },
+    vanishedFavResources: {
+      keyPath: ["folder_id", "id"],
+      indexes: ["vanishedAt", "vanishReason"],
+    },
+    interactions: {
+      keyPath: "id",
+      indexes: ["type", "bvid", "state", "observed_at", "type_observed_at"],
+    },
+    vanishArchive: {
+      keyPath: "id",
+      indexes: ["kind", "source", "vanishedAt", "reason"],
     },
   },
 };
@@ -348,6 +387,83 @@ export const openDB = (): Promise<IDBDatabase> => {
         }
       }
 
+      // v9：关注追踪与内容保全所需的新 store。
+      // 覆盖两条路径：全新安装（oldVersion === 0）与从任意旧版本升级；
+      // contains 判断使其具备幂等性，也顺带修补历史版本遗留的 store 缺失。
+      if (oldVersion < 9) {
+        if (!db.objectStoreNames.contains("following")) {
+          const followingStore = db.createObjectStore("following", { keyPath: "mid" });
+          followingStore.createIndex("status", "status", { unique: false });
+        }
+
+        if (!db.objectStoreNames.contains("followingEvents")) {
+          const followingEventsStore = db.createObjectStore("followingEvents", {
+            keyPath: "event_id",
+          });
+          followingEventsStore.createIndex("day", "day", { unique: false });
+          followingEventsStore.createIndex("type", "type", { unique: false });
+          followingEventsStore.createIndex("mid", "mid", { unique: false });
+          followingEventsStore.createIndex("occurred_at", "occurred_at", { unique: false });
+        }
+
+        if (!db.objectStoreNames.contains("assets")) {
+          const assetsStore = db.createObjectStore("assets", { keyPath: "id" });
+          assetsStore.createIndex("kind", "kind", { unique: false });
+        }
+
+        if (!db.objectStoreNames.contains("vanishedFavResources")) {
+          const vanishedStore = db.createObjectStore("vanishedFavResources", {
+            keyPath: ["folder_id", "id"],
+          });
+          vanishedStore.createIndex("vanishedAt", "vanishedAt", { unique: false });
+          vanishedStore.createIndex("vanishReason", "vanishReason", { unique: false });
+        }
+
+        console.log("v9: 已创建关注追踪与内容保全所需的 store");
+      }
+
+      // v10：点赞 / 投币互动记录。
+      // 索引里刻意没有 `lastSeenOnlineAt`：它的用途是"按最近可见时间取出探测候选"，
+      // 而候选集本身很小（只含掉出列表的条目），在内存里排一次足够，不值得多维护一个索引。
+      if (oldVersion < 10) {
+        if (!db.objectStoreNames.contains("interactions")) {
+          const interactionsStore = db.createObjectStore("interactions", { keyPath: "id" });
+          interactionsStore.createIndex("type", "type", { unique: false });
+          interactionsStore.createIndex("bvid", "bvid", { unique: false });
+          interactionsStore.createIndex("state", "state", { unique: false });
+          interactionsStore.createIndex("observed_at", "lastSeenAt", { unique: false });
+          interactionsStore.createIndex("type_observed_at", ["type", "lastSeenAt"], {
+            unique: false,
+          });
+        }
+
+        console.log("v10: 已创建点赞 / 投币互动记录所需的 store");
+      }
+
+      // v11：统一消失档案。收藏 / 订阅合集 / 关注 / 互动四处的"内容查不到了"统一存这里。
+      // 保留 `vanishedFavResources` 不动（旧备份与旧版本仍要能读写），
+      // 旧档案在页面首次打开时惰性迁入（见 `utils/vanishArchive.ts`）。
+      if (oldVersion < 11) {
+        if (!db.objectStoreNames.contains("vanishArchive")) {
+          const archiveStore = db.createObjectStore("vanishArchive", { keyPath: "id" });
+          archiveStore.createIndex("kind", "kind", { unique: false });
+          archiveStore.createIndex("source", "source", { unique: false });
+          archiveStore.createIndex("vanishedAt", "vanishedAt", { unique: false });
+          archiveStore.createIndex("reason", "reason", { unique: false });
+        }
+
+        console.log("v11: 已创建统一消失档案所需的 store");
+      }
+
+      if (!db.objectStoreNames.contains("vanishArchive")) {
+        console.log("补创建vanishArchive表");
+        const archiveStore = db.createObjectStore("vanishArchive", { keyPath: "id" });
+        archiveStore.createIndex("kind", "kind", { unique: false });
+        archiveStore.createIndex("source", "source", { unique: false });
+        archiveStore.createIndex("vanishedAt", "vanishedAt", { unique: false });
+        archiveStore.createIndex("reason", "reason", { unique: false });
+      }
+
       // 兜底修复：检查并补创建所有缺失的 store
       // 修复旧版本 else-if 互斥导致部分 store 未创建的问题
       if (!db.objectStoreNames.contains("history")) {
@@ -422,6 +538,50 @@ export const openDB = (): Promise<IDBDatabase> => {
           unique: false,
         });
         subscribedCollectionResourcesStore.createIndex("pubdate", "pubdate", { unique: false });
+      }
+
+      if (!db.objectStoreNames.contains("following")) {
+        console.log("补创建following表");
+        const followingStore = db.createObjectStore("following", { keyPath: "mid" });
+        followingStore.createIndex("status", "status", { unique: false });
+      }
+
+      if (!db.objectStoreNames.contains("followingEvents")) {
+        console.log("补创建followingEvents表");
+        const followingEventsStore = db.createObjectStore("followingEvents", {
+          keyPath: "event_id",
+        });
+        followingEventsStore.createIndex("day", "day", { unique: false });
+        followingEventsStore.createIndex("type", "type", { unique: false });
+        followingEventsStore.createIndex("mid", "mid", { unique: false });
+        followingEventsStore.createIndex("occurred_at", "occurred_at", { unique: false });
+      }
+
+      if (!db.objectStoreNames.contains("assets")) {
+        console.log("补创建assets表");
+        const assetsStore = db.createObjectStore("assets", { keyPath: "id" });
+        assetsStore.createIndex("kind", "kind", { unique: false });
+      }
+
+      if (!db.objectStoreNames.contains("vanishedFavResources")) {
+        console.log("补创建vanishedFavResources表");
+        const vanishedStore = db.createObjectStore("vanishedFavResources", {
+          keyPath: ["folder_id", "id"],
+        });
+        vanishedStore.createIndex("vanishedAt", "vanishedAt", { unique: false });
+        vanishedStore.createIndex("vanishReason", "vanishReason", { unique: false });
+      }
+
+      if (!db.objectStoreNames.contains("interactions")) {
+        console.log("补创建interactions表");
+        const interactionsStore = db.createObjectStore("interactions", { keyPath: "id" });
+        interactionsStore.createIndex("type", "type", { unique: false });
+        interactionsStore.createIndex("bvid", "bvid", { unique: false });
+        interactionsStore.createIndex("state", "state", { unique: false });
+        interactionsStore.createIndex("observed_at", "lastSeenAt", { unique: false });
+        interactionsStore.createIndex("type_observed_at", ["type", "lastSeenAt"], {
+          unique: false,
+        });
       }
     };
   });
@@ -1029,6 +1189,59 @@ export const getAllHistoryEvents = async (limit?: number): Promise<HistoryEvent[
   });
 };
 
+/**
+ * 按 `view_at` 索引读取时间区间内的观看事件（含两端）。
+ *
+ * 与 `getAllHistoryEvents` 的差别：这里走索引做区间游标，只把窗口内的记录读进内存。
+ * 观看事件表通常比 `history` 投影大一个数量级，数据面板的按天统计必须先限定窗口。
+ */
+export const getHistoryEventsInRange = async (
+  fromViewAt: number,
+  toViewAt: number,
+): Promise<HistoryEvent[]> => {
+  const db = await openDB();
+  const tx = db.transaction("historyEvents", "readonly");
+  const index = tx.objectStore("historyEvents").index("view_at");
+
+  return new Promise((resolve, reject) => {
+    const request = index.openCursor(IDBKeyRange.bound(fromViewAt, toViewAt));
+    const items: HistoryEvent[] = [];
+    request.onsuccess = () => {
+      const cursor = request.result;
+      if (!cursor) {
+        resolve(items);
+        return;
+      }
+      items.push(cursor.value as HistoryEvent);
+      cursor.continue();
+    };
+    request.onerror = () => reject(request.error);
+  });
+};
+
+/**
+ * 库里最早一条观看事件的时间（秒级）；没有任何记录时返回 null。
+ *
+ * 这是"记录起点"的唯一来源：数据面板用它显示"记录自 X"，
+ * 也用它判断报告是否已经攒够天数（周报 7 天 / 月报 30 天 / 年报 365 天）。
+ * 取的是最早一条**任意类型**的记录——直播与文章虽然不进统计，
+ * 但它们同样是"插件开始记录"的时间证据。
+ */
+export const getEarliestHistoryEventViewAt = async (): Promise<number | null> => {
+  const db = await openDB();
+  const tx = db.transaction("historyEvents", "readonly");
+  const index = tx.objectStore("historyEvents").index("view_at");
+
+  return new Promise((resolve, reject) => {
+    const request = index.openCursor(null, "next");
+    request.onsuccess = () => {
+      const cursor = request.result;
+      resolve(cursor ? Number((cursor.value as HistoryEvent).view_at) : null);
+    };
+    request.onerror = () => reject(request.error);
+  });
+};
+
 export const getAllHistoryTombstones = async (): Promise<HistoryTombstone[]> => {
   const db = await openDB();
   const tx = db.transaction("historyTombstones", "readonly");
@@ -1591,6 +1804,62 @@ export const getFavFolders = async (mid?: number): Promise<FavoriteFolder[]> => 
   });
 };
 
+/**
+ * 写入第三方恢复来的数据。
+ *
+ * 刻意**绕开** `saveFavResources` 的占位保护：那里判断的是"新数据是不是失效内容"，
+ * 而恢复场景写入的正是更好的数据，走保护逻辑反而会被拒。
+ */
+export const applyFavResourceRecovery = async (
+  updates: FavoriteResource[],
+): Promise<number> => {
+  if (updates.length === 0) return 0;
+
+  const db = await openDB();
+  const tx = db.transaction("favResources", "readwrite");
+  const store = tx.objectStore("favResources");
+
+  for (const resource of updates) {
+    store.put(resource);
+  }
+
+  await new Promise<void>((resolve, reject) => {
+    tx.oncomplete = () => resolve();
+    tx.onerror = () => reject(tx.error);
+    tx.onabort = () => reject(tx.error);
+  });
+
+  return updates.length;
+};
+
+/**
+ * 写入订阅合集内容的封面归档结果。
+ *
+ * 与 `applyFavResourceRecovery` 同构，只是 store 与主键不同
+ * （`subscribedCollectionResources` 用字符串 `id`）。
+ */
+export const applySubscribedCollectionCoverAssets = async (
+  updates: SubscribedCollectionResource[],
+): Promise<number> => {
+  if (updates.length === 0) return 0;
+
+  const db = await openDB();
+  const tx = db.transaction("subscribedCollectionResources", "readwrite");
+  const store = tx.objectStore("subscribedCollectionResources");
+
+  for (const resource of updates) {
+    store.put(resource);
+  }
+
+  await new Promise<void>((resolve, reject) => {
+    tx.oncomplete = () => resolve();
+    tx.onerror = () => reject(tx.error);
+    tx.onabort = () => reject(tx.error);
+  });
+
+  return updates.length;
+};
+
 export const saveFavResources = async (resources: FavoriteResource[]): Promise<void> => {
   const db = await openDB();
   const tx = db.transaction("favResources", "readwrite");
@@ -1612,24 +1881,36 @@ export const saveFavResources = async (resources: FavoriteResource[]): Promise<v
     resources.forEach((res) => {
       if (operationsFailed) return;
 
-      // 检查是否是失效视频
-      if (res.title === "已失效视频") {
+      // 失效判定：以 attr 为主、标题文案为兜底。
+      // 原实现只查 title === "已失效视频"，一旦 B 站调整文案，失效保护就会失效并让元数据被占位内容覆盖。
+      const invalidatedKind = resolveInvalidatedKind(res.attr);
+      if (invalidatedKind !== null || INVALIDATED_TITLE_RE.test(res.title ?? "")) {
         const getReq = store.get([res.folder_id, res.id]);
         getReq.onsuccess = () => {
-          const oldData = getReq.result as FavoriteResource;
-          let dataToSave = res;
+          const oldData = getReq.result as FavoriteResource | undefined;
+          let dataToSave: FavoriteResource = {
+            ...res,
+            invalidatedKind: invalidatedKind ?? oldData?.invalidatedKind ?? "other",
+            // 首次观测到失效的时间只记一次，后续同步不覆盖
+            invalidatedAt: oldData?.invalidatedAt ?? Date.now(),
+          };
 
-          // 如果本地有旧数据，且旧数据是有效的（标题不是已失效视频）
-          // 那么保留旧数据的关键元数据
-          if (oldData && oldData.title !== "已失效视频") {
+          // 失效保护：本地已有有效数据（或第三方恢复来的数据）时保留其关键元数据。
+          // 判定走 shouldPreserveLocalMetadata —— 它额外覆盖了 recoveredAt 的情况，
+          // 否则每次同步都会把辛苦查回来的标题换回"已失效视频"。
+          if (oldData && shouldPreserveLocalMetadata(oldData)) {
             dataToSave = {
-              ...res,
+              ...dataToSave,
               title: oldData.title,
               cover: oldData.cover,
               intro: oldData.intro,
               upper: oldData.upper,
               ctime: oldData.ctime, // 保持创建时间
-              // 可以根据需要保留更多字段
+              // 时长必须在保留列表里：稿件失效后 B 站返回的 `duration` 是 0
+              // （它自己也不记得这条视频多长了），于是本地那份**基本不变**的时长
+              // 会被 0 覆盖掉，而且是不可逆的——再同步也拿不回来了。
+              // 时长比标题更能说明"这是哪条内容"，标题会被占位文案顶掉，它不会。
+              duration: oldData.duration || res.duration,
             };
             console.log(`[失效保护] 保留了视频 ${oldData.id} 的元数据: ${oldData.title}`);
           }
@@ -1744,20 +2025,81 @@ export const replaceSubscribedCollectionResources = async (
   return new Promise((resolve, reject) => {
     // 先 diff 再写：新数据先 put，只在最后删除本地有而远端没有的键。
     // 避免"先清空后写入"在失败时留下被清空的本地数据。
-    const existingKeysRequest = collectionIndex.getAllKeys(collectionId);
-    existingKeysRequest.onsuccess = () => {
+    //
+    // 这里用 `getAll` 而不是 `getAllKeys`：除了 diff 键，还要拿到**旧记录本身**
+    // 做失效保护（见下方 preserve）。
+    const existingRequest = collectionIndex.getAll(collectionId);
+    existingRequest.onsuccess = () => {
+      const existingById = new Map(
+        (existingRequest.result as SubscribedCollectionResource[]).map((item) => [item.id, item]),
+      );
       const incomingKeys = new Set(resources.map((resource) => resource.id));
-      resources.forEach((resource) => store.put(resource));
-      existingKeysRequest.result.forEach((key) => {
-        if (!incomingKeys.has(String(key))) {
-          store.delete(key);
-        }
+
+      resources.forEach((resource) => {
+        const previous = existingById.get(resource.id);
+        store.put(previous ? preserveCollectionMetadata(previous, resource) : resource);
+      });
+
+      existingRequest.result.forEach((existing) => {
+        if (!incomingKeys.has(existing.id)) store.delete(existing.id);
       });
     };
-    existingKeysRequest.onerror = () => reject(existingKeysRequest.error);
+    existingRequest.onerror = () => reject(existingRequest.error);
     tx.oncomplete = () => resolve();
     tx.onerror = () => reject(tx.error);
   });
+};
+
+/**
+ * 合集资源的失效保护。
+ *
+ * 合集同步是**整夹替换**，而稿件失效后 B 站返回的是占位数据（标题变成
+ * "已失效视频"、`duration` 变 0）。原实现直接 `put`，于是本地那份**失效前保存的**
+ * 标题 / 封面 / 时长被永久覆盖——收藏早就有这层保护，合集一直漏着。
+ *
+ * 只保留"基本不变"的字段。播放量、点赞数这类会变的绝不保留，否则本地会显示
+ * 一个过期数字，比没有更糟。
+ */
+const preserveCollectionMetadata = (
+  previous: SubscribedCollectionResource,
+  incoming: SubscribedCollectionResource,
+): SubscribedCollectionResource => {
+  const incomingInvalidated =
+    resolveInvalidatedKind(incoming.attr) !== null ||
+    INVALIDATED_TITLE_RE.test(incoming.title ?? "");
+  const previousInvalidated =
+    resolveInvalidatedKind(previous.attr) !== null ||
+    INVALIDATED_TITLE_RE.test(previous.title ?? "");
+
+  // 首次观测到失效的时间只写一次，沿用收藏侧的语义
+  const invalidatedKind = resolveInvalidatedKind(incoming.attr) ?? previous.invalidatedKind;
+  const invalidatedAt =
+    previous.invalidatedAt ??
+    (incomingInvalidated ? Date.now() : undefined);
+
+  // 只有"本地有有效数据"时才保护。本地本身就是失效状态的话，
+  // 保留占位数据毫无意义，让远端覆盖即可。
+  if (!incomingInvalidated || previousInvalidated) {
+    return {
+      ...incoming,
+      coverAssetId: previous.coverAssetId ?? incoming.coverAssetId,
+      invalidatedKind,
+      invalidatedAt,
+    };
+  }
+
+  return {
+    ...incoming,
+    title: previous.title || incoming.title,
+    cover: previous.cover || incoming.cover,
+    duration: previous.duration || incoming.duration,
+    pubdate: previous.pubdate || incoming.pubdate,
+    author_name: previous.author_name || incoming.author_name,
+    author_mid: previous.author_mid || incoming.author_mid,
+    coverAssetId: previous.coverAssetId ?? incoming.coverAssetId,
+    invalidatedKind,
+    invalidatedAt,
+  };
 };
 
 export const getSubscribedCollectionResources = async (
@@ -2055,6 +2397,13 @@ export const smartMergeFavResources = async (
   remoteItems: FavoriteResource[],
 ): Promise<{ merged: number; skipped: number }> => {
   const db = await openDB();
+
+  // 先取消失档案的键：远端备份里仍留有已消失的记录，若不拦住就会把它们"复活"回 favResources，
+  // 使消失档案失去意义。仓库已有的 historyTombstones 处理的是同类问题。
+  const vanishedKeys = new Set(
+    (await getAllVanishedFavResources()).map((item) => `${item.folder_id}:${item.id}`),
+  );
+
   const tx = db.transaction("favResources", "readwrite");
   const store = tx.objectStore("favResources");
   let merged = 0;
@@ -2070,6 +2419,13 @@ export const smartMergeFavResources = async (
     const total = remoteItems.length;
 
     remoteItems.forEach((remoteItem) => {
+      // 已在消失档案里：跳过，绝不写回
+      if (vanishedKeys.has(`${remoteItem.folder_id}:${remoteItem.id}`)) {
+        skipped++;
+        processed++;
+        return;
+      }
+
       const getReq = store.get([remoteItem.folder_id, remoteItem.id]);
       getReq.onsuccess = () => {
         const localItem = getReq.result as FavoriteResource | undefined;
@@ -2136,3 +2492,835 @@ export const smartMergeSubscribedCollectionResources = async (
     tx.onerror = () => reject(tx.error);
   });
 };
+
+// ---------------------------------------------------------------------------
+// v9 新增 store 的读写：关注追踪 / 图片字节归档 / 收藏消失档案
+//
+// 本层只做存取，不包含任何判定逻辑。改名/取关/注销的判定放在
+// utils/followingDiff.ts 等纯函数模块里，以便在不依赖 IndexedDB 的前提下做单元测试。
+// ---------------------------------------------------------------------------
+
+/** 读取全部关注快照，按 UID 升序 */
+export const getAllFollowing = async (): Promise<FollowingItem[]> => {
+  const db = await openDB();
+  const tx = db.transaction("following", "readonly");
+  const items = (await requestResult(tx.objectStore("following").getAll())) as FollowingItem[];
+  return items.sort((a, b) => a.mid - b.mid);
+};
+
+export const getFollowingItem = async (mid: number): Promise<FollowingItem | undefined> => {
+  const db = await openDB();
+  const tx = db.transaction("following", "readonly");
+  return (await requestResult(tx.objectStore("following").get(mid))) as FollowingItem | undefined;
+};
+
+export const countFollowing = async (): Promise<number> => {
+  const db = await openDB();
+  const tx = db.transaction("following", "readonly");
+  return await requestResult(tx.objectStore("following").count());
+};
+
+/** 批量写入关注快照。不做 diff，调用方负责传入已经算好的最终状态。 */
+export const putFollowingItems = async (items: FollowingItem[]): Promise<void> => {
+  if (items.length === 0) return;
+  const db = await openDB();
+  const tx = db.transaction("following", "readwrite");
+  const store = tx.objectStore("following");
+  for (const item of items) store.put(item);
+  await transactionDone(tx);
+};
+
+/**
+ * 对指定 UID 批量打补丁（用于回填 avatarAssetId、status、第三方曾用名等）。
+ *
+ * 注意：读与写分两个事务。同一事务里 await 每次 get，会让事务在没有待处理请求时
+ * 自动提交，后续 put 会抛 TransactionInactiveError。
+ */
+export const patchFollowingItems = async (
+  mids: number[],
+  patch: Partial<FollowingItem>,
+): Promise<number> => {
+  if (mids.length === 0) return 0;
+
+  const db = await openDB();
+  const readTx = db.transaction("following", "readonly");
+  const readStore = readTx.objectStore("following");
+  // 同步发起全部 get，保持事务存活
+  const current = (await Promise.all(
+    mids.map((mid) => requestResult(readStore.get(mid)) as Promise<FollowingItem | undefined>),
+  )) as Array<FollowingItem | undefined>;
+
+  const writeTx = db.transaction("following", "readwrite");
+  const writeStore = writeTx.objectStore("following");
+  let changed = 0;
+  for (const item of current) {
+    if (!item) continue;
+    writeStore.put({ ...item, ...patch });
+    changed++;
+  }
+  await transactionDone(writeTx);
+  return changed;
+};
+
+export const deleteFollowingItems = async (mids: number[]): Promise<void> => {
+  if (mids.length === 0) return;
+  const db = await openDB();
+  const tx = db.transaction("following", "readwrite");
+  const store = tx.objectStore("following");
+  for (const mid of mids) store.delete(mid);
+  await transactionDone(tx);
+};
+
+/** 读取全部关注事件，按发生时间升序 */
+export const getAllFollowingEvents = async (): Promise<FollowingEvent[]> => {
+  const db = await openDB();
+  const tx = db.transaction("followingEvents", "readonly");
+  const items = (await requestResult(
+    tx.objectStore("followingEvents").getAll(),
+  )) as FollowingEvent[];
+  return items.sort((a, b) => a.occurred_at - b.occurred_at);
+};
+
+export const getFollowingEventsByDay = async (day: string): Promise<FollowingEvent[]> => {
+  const db = await openDB();
+  const tx = db.transaction("followingEvents", "readonly");
+  const items = (await requestResult(
+    tx.objectStore("followingEvents").index("day").getAll(day),
+  )) as FollowingEvent[];
+  return items.sort((a, b) => a.occurred_at - b.occurred_at);
+};
+
+/** 批量写入关注事件。event_id 为 `type:mid:day`，同日重复同步自然幂等。 */
+export const putFollowingEvents = async (events: FollowingEvent[]): Promise<void> => {
+  if (events.length === 0) return;
+  const db = await openDB();
+  const tx = db.transaction("followingEvents", "readwrite");
+  const store = tx.objectStore("followingEvents");
+  for (const event of events) store.put(event);
+  await transactionDone(tx);
+};
+
+/** 写入关注快照与事件共用一个事务，避免只落其一 */
+export const applyFollowingSync = async (
+  items: FollowingItem[],
+  events: FollowingEvent[],
+): Promise<void> => {
+  if (items.length === 0 && events.length === 0) return;
+  const db = await openDB();
+  const tx = db.transaction(["following", "followingEvents"], "readwrite");
+  const itemStore = tx.objectStore("following");
+  const eventStore = tx.objectStore("followingEvents");
+  for (const item of items) itemStore.put(item);
+  for (const event of events) eventStore.put(event);
+  await transactionDone(tx);
+};
+
+export const putAsset = async (asset: AssetRecord): Promise<void> => {
+  const db = await openDB();
+  const tx = db.transaction("assets", "readwrite");
+  tx.objectStore("assets").put(asset);
+  await transactionDone(tx);
+};
+
+export const getAsset = async (id: string): Promise<AssetRecord | undefined> => {
+  const db = await openDB();
+  const tx = db.transaction("assets", "readonly");
+  return (await requestResult(tx.objectStore("assets").get(id))) as AssetRecord | undefined;
+};
+
+export const deleteAsset = async (id: string): Promise<void> => {
+  const db = await openDB();
+  const tx = db.transaction("assets", "readwrite");
+  tx.objectStore("assets").delete(id);
+  await transactionDone(tx);
+};
+
+// ---------------------------------------------------------------------------
+// WebDAV 双向同步的合并基元（fork 新增的三个 store）
+//
+// 三个都用**并集**语义，保证不丢数据。图片字节（assets）刻意不参与备份：
+// 它是纯缓存，内容还在时随时能重抓，不该让备份体积膨胀几十 MB。
+// ---------------------------------------------------------------------------
+
+/**
+ * 关注快照合并：按 `mid` 取并集。
+ *
+ * 冲突时保留「最近一次被观测到」的那条（`lastSeenAt` 更大者），
+ * 因为状态与昵称都随时间演进，更晚的观测更准。
+ * `nameHistory` 另做并集——否则会把另一台机器观测到的旧名丢掉。
+ */
+export const smartMergeFollowing = async (
+  remoteItems: FollowingItem[],
+): Promise<{ merged: number; skipped: number }> => {
+  if (remoteItems.length === 0) return { merged: 0, skipped: 0 };
+
+  const existing = await getAllFollowing();
+  const byMid = new Map(existing.map((item) => [item.mid, item]));
+
+  const db = await openDB();
+  const tx = db.transaction("following", "readwrite");
+  const store = tx.objectStore("following");
+  let merged = 0;
+  let skipped = 0;
+
+  for (const remote of remoteItems) {
+    const local = byMid.get(remote.mid);
+    if (!local) {
+      store.put(remote);
+      merged += 1;
+      continue;
+    }
+
+    const remoteIsNewer = (remote.lastSeenAt ?? 0) > (local.lastSeenAt ?? 0);
+    const base = remoteIsNewer ? remote : local;
+    const names = [...(local.nameHistory ?? [])];
+    for (const record of remote.nameHistory ?? []) {
+      if (!names.some((item) => item.name === record.name)) names.push(record);
+    }
+
+    store.put({ ...base, nameHistory: names });
+    if (remoteIsNewer) merged += 1;
+    else skipped += 1;
+  }
+
+  await new Promise<void>((resolve, reject) => {
+    tx.oncomplete = () => resolve();
+    tx.onerror = () => reject(tx.error);
+    tx.onabort = () => reject(tx.error);
+  });
+
+  return { merged, skipped };
+};
+
+/** 关注变动事件合并：按 `event_id` 取并集。事件是只增不改的，天然可并 */
+export const smartMergeFollowingEvents = async (
+  remoteItems: FollowingEvent[],
+): Promise<{ merged: number; skipped: number }> => {
+  if (remoteItems.length === 0) return { merged: 0, skipped: 0 };
+
+  const existingIds = new Set((await getAllFollowingEvents()).map((event) => event.event_id));
+
+  const db = await openDB();
+  const tx = db.transaction("followingEvents", "readwrite");
+  const store = tx.objectStore("followingEvents");
+  let merged = 0;
+  let skipped = 0;
+
+  for (const event of remoteItems) {
+    if (existingIds.has(event.event_id)) {
+      skipped += 1;
+      continue;
+    }
+    store.put(event);
+    merged += 1;
+  }
+
+  await new Promise<void>((resolve, reject) => {
+    tx.oncomplete = () => resolve();
+    tx.onerror = () => reject(tx.error);
+    tx.onabort = () => reject(tx.error);
+  });
+
+  return { merged, skipped };
+};
+
+/**
+ * 消失档案合并：按 `[folder_id, id]` 取并集。
+ *
+ * 冲突时保留**更早**的 `vanishedAt`——首次消失的时间才是真相，
+ * 后来的同步只会把它往后推。
+ */
+export const smartMergeVanishedFavResources = async (
+  remoteItems: VanishedFavResource[],
+): Promise<{ merged: number; skipped: number }> => {
+  if (remoteItems.length === 0) return { merged: 0, skipped: 0 };
+
+  const existing = await getAllVanishedFavResources();
+  const byKey = new Map(existing.map((item) => [`${item.folder_id}:${item.id}`, item]));
+
+  const db = await openDB();
+  const tx = db.transaction("vanishedFavResources", "readwrite");
+  const store = tx.objectStore("vanishedFavResources");
+  let merged = 0;
+  let skipped = 0;
+
+  for (const remote of remoteItems) {
+    const local = byKey.get(`${remote.folder_id}:${remote.id}`);
+    if (!local) {
+      store.put(remote);
+      merged += 1;
+      continue;
+    }
+    if (remote.vanishedAt < local.vanishedAt) {
+      store.put(remote);
+      merged += 1;
+    } else {
+      skipped += 1;
+    }
+  }
+
+  await new Promise<void>((resolve, reject) => {
+    tx.oncomplete = () => resolve();
+    tx.onerror = () => reject(tx.error);
+    tx.onabort = () => reject(tx.error);
+  });
+
+  return { merged, skipped };
+};
+
+export const countAssets = async (kind?: AssetKind): Promise<number> => {
+  const db = await openDB();
+  const tx = db.transaction("assets", "readonly");
+  const store = tx.objectStore("assets");
+  if (!kind) return await requestResult(store.count());
+  return await requestResult(store.index("kind").count(kind));
+};
+
+/**
+ * 取出各 store 的判重键集合，供导入前的预览统计使用。
+ *
+ * `history` 刻意**不在这里**——它可能有几万条，为了预览全读一遍不值得；
+ * 预览时用 `getTotalHistoryCount()` 的总数代替。
+ */
+export const getBackupLocalIds = async (): Promise<Record<string, Set<string>>> => {
+  const [
+    liked,
+    folders,
+    resources,
+    collections,
+    collectionResources,
+    following,
+    events,
+    vanished,
+    interactions,
+  ] = await Promise.all([
+    getAllLikedMusic(),
+    getAllFavFolders(),
+    getAllFavResources(),
+    getAllSubscribedCollections(),
+    getAllSubscribedCollectionResources(),
+    getAllFollowing(),
+    getAllFollowingEvents(),
+    getAllVanishedFavResources(),
+    getAllInteractions(),
+  ]);
+
+  return {
+    likedMusic: new Set(liked.map((item) => String(item.bvid))),
+    favFolders: new Set(folders.map((item) => String(item.id))),
+    favResources: new Set(resources.map((item) => `${item.folder_id}:${item.id}`)),
+    subscribedCollections: new Set(collections.map((item) => String(item.id))),
+    subscribedCollectionResources: new Set(
+      collectionResources.map((item) => String(item.id)),
+    ),
+    following: new Set(following.map((item) => String(item.mid))),
+    followingEvents: new Set(events.map((event) => String(event.event_id))),
+    vanishedFavResources: new Set(vanished.map((item) => `${item.folder_id}:${item.id}`)),
+    interactions: new Set(interactions.map((item) => String(item.id))),
+  };
+};
+
+/**
+ * 读取全部归档图片字节。用于本地目录备份把它们写成 `images/` 下的独立文件。
+ *
+ * 一次全读进内存（约 1900 张 × 5KB ≈ 10MB）——备份是低频操作，可以接受。
+ */
+export const getAllAssets = async (): Promise<AssetRecord[]> => {
+  const db = await openDB();
+  const tx = db.transaction("assets", "readonly");
+  return (await requestResult(tx.objectStore("assets").getAll())) as AssetRecord[];
+};
+
+export const getAllAssetIds = async (): Promise<string[]> => {
+  const db = await openDB();
+  const tx = db.transaction("assets", "readonly");
+  return (await requestResult(tx.objectStore("assets").getAllKeys())) as string[];
+};
+
+export const clearAssets = async (): Promise<void> => {
+  const db = await openDB();
+  const tx = db.transaction("assets", "readwrite");
+  tx.objectStore("assets").clear();
+  await transactionDone(tx);
+};
+
+/**
+ * 按类型清空图片归档，返回删掉的条数与释放的字节数。
+ *
+ * 用 `kind` 索引走游标逐个删，而不是 `getAll()` 后再删：
+ * `assets` 里是真实图片字节，一次全读进内存在大库上会明显卡顿甚至爆内存。
+ * 每 `ASSET_DELETE_BATCH` 条让出一次事件循环，避免长时间阻塞界面。
+ */
+const ASSET_DELETE_BATCH = 200;
+
+export const clearAssetsByKind = async (
+  kind: AssetKind,
+): Promise<{ deleted: number; freedBytes: number }> => {
+  const db = await openDB();
+  const tx = db.transaction("assets", "readwrite");
+  const index = tx.objectStore("assets").index("kind");
+  let deleted = 0;
+  let freedBytes = 0;
+
+  await new Promise<void>((resolve, reject) => {
+    const request = index.openCursor(IDBKeyRange.only(kind));
+    request.onsuccess = () => {
+      const cursor = request.result;
+      if (!cursor) {
+        resolve();
+        return;
+      }
+      const record = cursor.value as AssetRecord;
+      freedBytes += record?.blob?.size ?? 0;
+      deleted += 1;
+      cursor.delete();
+      if (deleted % ASSET_DELETE_BATCH === 0) {
+        // 让出一帧再继续，长任务不至于把设置页卡住
+        setTimeout(() => cursor.continue(), 0);
+        return;
+      }
+      cursor.continue();
+    };
+    request.onerror = () => reject(request.error);
+    tx.onabort = () => reject(tx.error);
+  });
+
+  return { deleted, freedBytes };
+};
+
+/**
+ * 统计某类图片归档的条数与字节数。
+ *
+ * 字节数取 `blob.size`，是**精确值**（不是估算）：图片归档是本扩展里唯一
+ * 存真实二进制的部分，也是占用的大头，所以它的数字必须可信。
+ */
+export const measureAssets = async (
+  kind: AssetKind,
+): Promise<{ count: number; bytes: number }> => {
+  const db = await openDB();
+  const tx = db.transaction("assets", "readonly");
+  const index = tx.objectStore("assets").index("kind");
+  let count = 0;
+  let bytes = 0;
+
+  return await new Promise<{ count: number; bytes: number }>((resolve, reject) => {
+    const request = index.openCursor(IDBKeyRange.only(kind));
+    request.onsuccess = () => {
+      const cursor = request.result;
+      if (!cursor) {
+        resolve({ count, bytes });
+        return;
+      }
+      const record = cursor.value as AssetRecord;
+      count += 1;
+      bytes += record?.blob?.size ?? 0;
+      cursor.continue();
+    };
+    request.onerror = () => reject(request.error);
+  });
+};
+
+/**
+ * 结构化 store 的体积估算。
+ *
+ * 只读最多 `limit` 条算平均行大小再乘以总数——为了量体积把几万条观看事件
+ * 全读一遍不值得。因此结果**是估算**，界面必须如实标注。
+ *
+ * 每行按字符类别计费（ASCII 1 字节、其余 2 字节，见 `estimateJsonBytes`），
+ * 不再一律按 2 字节——那会让估算值大到超过浏览器报的整站用量。
+ */
+export const estimateStoreSize = async (
+  storeName: string,
+  limit = 50,
+): Promise<{ count: number; bytes: number }> => {
+  const db = await openDB();
+  const tx = db.transaction(storeName, "readonly");
+  const store = tx.objectStore(storeName);
+  const count = await requestResult(store.count());
+  if (count === 0) return { count: 0, bytes: 0 };
+
+  const samples = await requestResult(store.getAll(undefined, limit));
+  let sampleBytes = 0;
+  let sampled = 0;
+  for (const record of samples) {
+    try {
+      sampleBytes += estimateJsonBytes(JSON.stringify(record) ?? "");
+    } catch {
+      // 含循环引用的记录不该出现；真出现了就不计入样本，别让它把估算带崩
+      continue;
+    }
+    sampled += 1;
+  }
+  if (sampled === 0) return { count, bytes: 0 };
+
+  return { count, bytes: Math.round((sampleBytes / sampled) * count) };
+};
+
+/** 读取全部消失档案，按消失时间倒序（最近消失的在前） */
+export const getAllVanishedFavResources = async (): Promise<VanishedFavResource[]> => {
+  const db = await openDB();
+  const tx = db.transaction("vanishedFavResources", "readonly");
+  const items = (await requestResult(
+    tx.objectStore("vanishedFavResources").getAll(),
+  )) as VanishedFavResource[];
+  return items.sort((a, b) => b.vanishedAt - a.vanishedAt);
+};
+
+export const countVanishedFavResources = async (): Promise<number> => {
+  const db = await openDB();
+  const tx = db.transaction("vanishedFavResources", "readonly");
+  return await requestResult(tx.objectStore("vanishedFavResources").count());
+};
+
+// ---------------------------------------------------------------------------
+// 统一消失档案（vanishArchive，v11）
+//
+// 旧的 `vanishedFavResources` 保持原样可读写（旧备份、旧版本兼容），
+// 页面读的是两者合并后的结果，旧数据在首次打开页面时惰性迁入。
+// ---------------------------------------------------------------------------
+
+export const getAllVanishArchive = async (): Promise<VanishArchiveItem[]> => {
+  const db = await openDB();
+  const tx = db.transaction("vanishArchive", "readonly");
+  return (await requestResult(tx.objectStore("vanishArchive").getAll())) as VanishArchiveItem[];
+};
+
+export const countVanishArchive = async (): Promise<number> => {
+  const db = await openDB();
+  const tx = db.transaction("vanishArchive", "readonly");
+  return await requestResult(tx.objectStore("vanishArchive").count());
+};
+
+/**
+ * 批量写入档案条目。
+ *
+ * 用 `put` 而不是 `add`：同一条内容每轮同步都会被重新判定一次，
+ * 重复归档要幂等覆盖（`vanishedAt` 由纯函数保留最早值，不会被刷成新时间）。
+ */
+export const putVanishArchive = async (items: VanishArchiveItem[]): Promise<void> => {
+  if (items.length === 0) return;
+  const db = await openDB();
+  const tx = db.transaction("vanishArchive", "readwrite");
+  const store = tx.objectStore("vanishArchive");
+  for (const item of items) store.put(item);
+  await transactionDone(tx);
+};
+
+export const deleteVanishArchiveItems = async (ids: string[]): Promise<void> => {
+  if (ids.length === 0) return;
+  const db = await openDB();
+  const tx = db.transaction("vanishArchive", "readwrite");
+  const store = tx.objectStore("vanishArchive");
+  for (const id of ids) store.delete(id);
+  await transactionDone(tx);
+};
+
+/**
+ * 把档案条目**恢复到原来的 store 与原来的位置**。
+ *
+ * 这是"消失档案"存在的根本目的：归档的 `item` 是消失那一刻的完整快照，
+ * 直接原样写回对应 store 即可让收藏夹 / 订阅合集 / 关注列表 / 互动记录页
+ * 重新看到这条内容。没有它，档案就只是"一个只读的汇总列表"——
+ * 清空浏览器数据后能靠备份把档案读回来，却回不到任何一个功能页面上。
+ *
+ * 刻意的行为：
+ * - 只恢复**有快照**的条目。历史遗留档案没有 `item` 时跳过并在结果里说明，
+ *   不猜、不伪造记录。
+ * - **不删除档案条目**：恢复后档案仍保留，用户可以按需再删。
+ *   档案只增不删这条原则不因为"恢复"而破例。
+ * - 一个事务写多个 store：任一条错就整体回滚，避免"恢复了一半"。
+ */
+export const restoreVanishArchiveItems = async (
+  items: VanishArchiveItem[],
+): Promise<{ restored: number; skipped: number }> => {
+  const restorable = items.filter(
+    (item) => item && typeof item.id === "string" && item.item && typeof item.item === "object",
+  );
+  const skipped = items.length - restorable.length;
+  if (restorable.length === 0) return { restored: 0, skipped };
+
+  const db = await openDB();
+  const tx = db.transaction(
+    ["favResources", "subscribedCollectionResources", "following", "interactions"],
+    "readwrite",
+  );
+
+  let restored = 0;
+  for (const entry of restorable) {
+    const snapshot = entry.item as { id?: unknown };
+    if (!snapshot || snapshot.id === undefined) continue;
+    if (entry.kind === "favorite") tx.objectStore("favResources").put(snapshot);
+    else if (entry.kind === "collection") tx.objectStore("subscribedCollectionResources").put(snapshot);
+    else if (entry.kind === "following") tx.objectStore("following").put(snapshot);
+    else tx.objectStore("interactions").put(snapshot);
+    restored += 1;
+  }
+
+  await transactionDone(tx);
+  return { restored, skipped };
+};
+
+/** 批量写入消失档案。档案只增不删，除非用户主动清理。 */
+export const putVanishedFavResources = async (items: VanishedFavResource[]): Promise<void> => {
+  if (items.length === 0) return;
+  const db = await openDB();
+  const tx = db.transaction("vanishedFavResources", "readwrite");
+  const store = tx.objectStore("vanishedFavResources");
+  for (const item of items) store.put(item);
+  await transactionDone(tx);
+};
+
+export const deleteVanishedFavResources = async (keys: Array<[number, number]>): Promise<void> => {
+  if (keys.length === 0) return;
+  const db = await openDB();
+  const tx = db.transaction("vanishedFavResources", "readwrite");
+  const store = tx.objectStore("vanishedFavResources");
+  for (const key of keys) store.delete(key);
+  await transactionDone(tx);
+};
+
+/**
+ * 从 favResources 移入消失档案：同一事务内写入档案并删除原记录。
+ * 保证不会出现"已从收藏夹移除、但档案没写成功"的证据丢失。
+ */
+export const moveFavResourcesToVanished = async (
+  folderId: number,
+  items: VanishedFavResource[],
+): Promise<void> => {
+  if (items.length === 0) return;
+  const db = await openDB();
+  const tx = db.transaction(["favResources", "vanishedFavResources"], "readwrite");
+  const favStore = tx.objectStore("favResources");
+  const vanishedStore = tx.objectStore("vanishedFavResources");
+  for (const item of items) {
+    vanishedStore.put(item);
+    favStore.delete([folderId, item.id]);
+  }
+  await transactionDone(tx);
+};
+
+// ---------------------------------------------------------------------------
+// v10 新增：点赞 / 投币互动记录（interactions）
+//
+// 与关注模块同样的分工：本层只做存取，判定逻辑全在 utils/interactionDiff.ts 的纯函数里。
+// 主键是字符串 `${type}:${bvid}`，所以同一条视频的点赞与投币互不覆盖。
+// ---------------------------------------------------------------------------
+
+/** 读取全部互动记录，按最近一次被同步扫到的时间倒序 */
+export const getAllInteractions = async (): Promise<InteractionItem[]> => {
+  const db = await openDB();
+  const tx = db.transaction("interactions", "readonly");
+  const items = (await requestResult(tx.objectStore("interactions").getAll())) as
+    | InteractionItem[]
+    | undefined;
+  return (items ?? []).sort((a, b) => b.lastSeenAt - a.lastSeenAt);
+};
+
+/** 按类型读取互动记录。同步只关心同一类型的既有记录 */
+export const getInteractionsByType = async (
+  type: InteractionType,
+): Promise<InteractionItem[]> => {
+  const db = await openDB();
+  const tx = db.transaction("interactions", "readonly");
+  const items = (await requestResult(
+    tx.objectStore("interactions").index("type").getAll(type),
+  )) as InteractionItem[] | undefined;
+  return (items ?? []).sort((a, b) => b.lastSeenAt - a.lastSeenAt);
+};
+
+export const countInteractions = async (type?: InteractionType): Promise<number> => {
+  const db = await openDB();
+  const tx = db.transaction("interactions", "readonly");
+  const store = tx.objectStore("interactions");
+  if (!type) return await requestResult(store.count());
+  return await requestResult(store.index("type").count(type));
+};
+
+/** 批量写入互动记录。不做判定，调用方负责传入已经算好的最终状态 */
+export const putInteractionItems = async (items: InteractionItem[]): Promise<void> => {
+  if (items.length === 0) return;
+  const db = await openDB();
+  const tx = db.transaction("interactions", "readwrite");
+  const store = tx.objectStore("interactions");
+  for (const item of items) store.put(item);
+  await transactionDone(tx);
+};
+
+/**
+ * 按 id 删除互动记录（用户主动清理）。
+ *
+ * **这是互动记录唯一的删除入口**，只由用户在界面上触发。
+ * 同步流程永远不删——掉出 20 条窗口、探测失败、判定为"赞已消失"的条目都保留，
+ * 因为 `relation` 接口只反映近期状态，"查不到"不等于"用户取消了"。
+ *
+ * 注意一个已知后果：删掉的条目如果仍在 B 站列表里，下次同步会**重新抓回来**；
+ * 已经从列表掉出去的（窗口外）才会真正消失。界面文案必须说清这一点。
+ */
+export const deleteInteractionItems = async (ids: string[]): Promise<void> => {
+  if (ids.length === 0) return;
+  const db = await openDB();
+  const tx = db.transaction("interactions", "readwrite");
+  const store = tx.objectStore("interactions");
+  for (const id of ids) store.delete(id);
+  await transactionDone(tx);
+};
+
+/**
+ * 按 id 批量打补丁（回填 coverAssetId 等）。
+ *
+ * 读与写必须分成两个事务：同一事务里 await 每次 get，一旦没有待处理请求事务就会自动提交，
+ * 后续 put 会抛 TransactionInactiveError。这一点与 `patchFollowingItems` 完全一致。
+ */
+export const patchInteractionItems = async (
+  ids: string[],
+  patch: Partial<InteractionItem>,
+): Promise<number> => {
+  if (ids.length === 0) return 0;
+
+  const db = await openDB();
+  const readTx = db.transaction("interactions", "readonly");
+  const readStore = readTx.objectStore("interactions");
+  const current = (await Promise.all(
+    ids.map((id) => requestResult(readStore.get(id)) as Promise<InteractionItem | undefined>),
+  )) as Array<InteractionItem | undefined>;
+
+  const writeTx = db.transaction("interactions", "readwrite");
+  const writeStore = writeTx.objectStore("interactions");
+  let changed = 0;
+  for (const item of current) {
+    if (!item) continue;
+    writeStore.put({ ...item, ...patch });
+    changed++;
+  }
+  await transactionDone(writeTx);
+  return changed;
+};
+
+/** 写入封面归档结果。与 `applyFavResourceRecovery` 同构，只是 store 不同 */
+export const applyInteractionCoverAssets = async (
+  updates: InteractionItem[],
+): Promise<number> => {
+  if (updates.length === 0) return 0;
+  await putInteractionItems(updates);
+  return updates.length;
+};
+
+const earlierOf = (a: number | undefined, b: number | undefined): number | undefined => {
+  if (a === undefined) return b;
+  if (b === undefined) return a;
+  return Math.min(a, b);
+};
+
+/**
+ * 互动记录合并：按 `id` 取并集。
+ *
+ * 冲突时逐字段取更可信的一方，而不是整条二选一：
+ * - `lastSeenAt` 更大者作基（状态与标题都随时间演进，更晚的观测更准）
+ * - `firstSeenAt` / `firstTitle` 取**更早**的一方：首次观测才是"我当时点的是什么"的真相
+ * - `unlistedDetectedAt` / `endedDetectedAt` 取**更早**的一方：首次发现消失的时间才有意义
+ * - `interactedAt` 优先保留有接口时间戳（exact）的那一方
+ */
+export const smartMergeInteractions = async (
+  remoteItems: InteractionItem[],
+): Promise<{ merged: number; skipped: number }> => {
+  if (remoteItems.length === 0) return { merged: 0, skipped: 0 };
+
+  const existing = await getAllInteractions();
+  const byId = new Map(existing.map((item) => [item.id, item]));
+
+  const db = await openDB();
+  const tx = db.transaction("interactions", "readwrite");
+  const store = tx.objectStore("interactions");
+  let merged = 0;
+  let skipped = 0;
+
+  for (const remote of remoteItems) {
+    if (!remote || typeof remote.id !== "string" || !remote.id) continue;
+    const local = byId.get(remote.id);
+    if (!local) {
+      store.put(remote);
+      merged += 1;
+      continue;
+    }
+
+    const remoteIsNewer = (remote.lastSeenAt ?? 0) > (local.lastSeenAt ?? 0);
+    const base = remoteIsNewer ? remote : local;
+    const other = remoteIsNewer ? local : remote;
+    const firstIsRemote =
+      (remote.firstSeenAt ?? Number.MAX_SAFE_INTEGER) <
+      (local.firstSeenAt ?? Number.MAX_SAFE_INTEGER);
+
+    const interactedSource =
+      remote.interactedAtExact && !local.interactedAtExact
+        ? remote
+        : local.interactedAtExact && !remote.interactedAtExact
+          ? local
+          : base;
+
+    store.put({
+      ...base,
+      firstSeenAt: Math.min(local.firstSeenAt ?? 0, remote.firstSeenAt ?? 0) || base.firstSeenAt,
+      firstTitle: firstIsRemote ? remote.firstTitle : local.firstTitle,
+      interactedAt: interactedSource.interactedAt,
+      interactedAtExact: interactedSource.interactedAtExact,
+      unlistedDetectedAt: earlierOf(local.unlistedDetectedAt, remote.unlistedDetectedAt),
+      endedDetectedAt: earlierOf(local.endedDetectedAt, remote.endedDetectedAt),
+      probeAttemptedAt:
+        Math.max(local.probeAttemptedAt ?? 0, remote.probeAttemptedAt ?? 0) || undefined,
+      probeError: base.probeError ?? other.probeError,
+      coverAssetId: local.coverAssetId ?? remote.coverAssetId,
+    });
+    if (remoteIsNewer) merged += 1;
+    else skipped += 1;
+  }
+
+  await transactionDone(tx);
+  return { merged, skipped };
+};
+
+/**
+ * 消失档案合并：按 `id` 取并集，同一条冲突时**保留消失时间更早的一版**。
+ *
+ * 理由：`vanishedAt` 回答的是"它什么时候没的"，两端都记过同一条时，
+ * 更早那个才是真相；后面的观测只是重复判定。其余字段取更晚的一次观测
+ * （`probeAttemptedAt` / `reason` / 快照），因为那是最新掌握的信息。
+ */
+export const smartMergeVanishArchive = async (
+  remoteItems: VanishArchiveItem[],
+): Promise<{ merged: number; skipped: number }> => {
+  if (remoteItems.length === 0) return { merged: 0, skipped: 0 };
+
+  const existing = await getAllVanishArchive();
+  const byId = new Map(existing.map((item) => [item.id, item]));
+
+  const db = await openDB();
+  const tx = db.transaction("vanishArchive", "readwrite");
+  const store = tx.objectStore("vanishArchive");
+  let merged = 0;
+  let skipped = 0;
+
+  for (const remote of remoteItems) {
+    if (!remote || typeof remote.id !== "string" || !remote.id) continue;
+    const local = byId.get(remote.id);
+    if (!local) {
+      store.put(remote);
+      merged += 1;
+      continue;
+    }
+
+    const remoteIsNewer = (remote.probeAttemptedAt ?? 0) > (local.probeAttemptedAt ?? 0);
+    const base = remoteIsNewer ? remote : local;
+    store.put({
+      ...base,
+      vanishedAt: Math.min(local.vanishedAt, remote.vanishedAt),
+      // 封面归档指针是本地资产，优先保留已有的
+      coverAssetId: local.coverAssetId ?? remote.coverAssetId,
+    });
+    if (remoteIsNewer) merged += 1;
+    else skipped += 1;
+  }
+
+  await transactionDone(tx);
+  return { merged, skipped };
+};
+

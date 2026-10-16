@@ -1,4 +1,16 @@
+import {
+  INJECTED_FETCH_GUARD_KEY,
+  PAGE_MESSAGE_DELETE_HISTORY,
+} from "../utils/constants";
+
 export default defineUnlistedScript(() => {
+  const pageWindow = window as unknown as Record<string, unknown>;
+
+  // 防重复包装：SPA 导航或扩展重载可能让本脚本在同一页面执行多次。
+  // 标志带项目前缀，避免与同时安装的上游扩展互相误判。
+  if (pageWindow[INJECTED_FETCH_GUARD_KEY]) return;
+  pageWindow[INJECTED_FETCH_GUARD_KEY] = true;
+
   const setupFetchInterceptor = () => {
     const originalFetch = window.fetch;
     window.fetch = async function (input, init) {
@@ -28,7 +40,7 @@ export default defineUnlistedScript(() => {
             targets.forEach(({ business, id }) => {
               window.postMessage(
                 {
-                  type: "DELETE_HISTORY_FROM_INJECT",
+                  type: PAGE_MESSAGE_DELETE_HISTORY,
                   action: "deleteHistoryItem",
                   business,
                   id,

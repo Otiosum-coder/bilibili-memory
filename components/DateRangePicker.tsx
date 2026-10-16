@@ -1,22 +1,17 @@
 import React, { useState, useEffect, useRef } from "react";
 import { ChevronLeft, ChevronRight, Calendar as CalendarIcon, X } from "lucide-react";
 import dayjs from "dayjs";
-import isBetween from "dayjs/plugin/isBetween";
-
-dayjs.extend(isBetween);
 
 interface DateRangePickerProps {
   startDate: string;
   endDate: string;
   onChange: (start: string, end: string) => void;
-  mode?: "range" | "single";
 }
 
 export const DateRangePicker: React.FC<DateRangePickerProps> = ({
   startDate,
   endDate,
   onChange,
-  mode = "range",
 }) => {
   const [isOpen, setIsOpen] = useState(false);
   const [currentMonth, setCurrentMonth] = useState(dayjs());
@@ -50,13 +45,15 @@ export const DateRangePicker: React.FC<DateRangePickerProps> = ({
     return () => document.removeEventListener("keydown", handleKeyDown);
   }, [isOpen]);
 
+  /**
+   * 日期选择只有一种交互：连点两天选出范围。
+   *
+   * 曾经有一个「单日选择」模式（点一下 = 起止同一天），已按评审删除：
+   * 它并没有带来新能力——`matchDate` 里 `start === end` 与"只设起始日"
+   * 的结果完全相同——却要求用户先切模式才能选一天，属于纯粹的额外成本。
+   * 只想看某一天时，点那一天两次即可。
+   */
   const handleDateClick = (dateStr: string) => {
-    if (mode === "single") {
-      onChange(dateStr, dateStr);
-      setIsOpen(false);
-      return;
-    }
-
     if (!startDate && !endDate) {
       onChange(dateStr, "");
     } else if (startDate && !endDate) {

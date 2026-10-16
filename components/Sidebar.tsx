@@ -1,31 +1,43 @@
 import { useLocation } from "react-router-dom";
-import { useState, useEffect } from "react";
+import { useMemo, useState, useEffect } from "react";
 import {
-  CloudIcon,
   Star,
   HistoryIcon,
   InfoIcon,
   MessageCircleIcon,
-  MusicIcon,
   SettingsIcon,
   HardDriveDownload,
-  Sparkles,
   Sun,
   Moon,
-  Heart,
   LibraryBig,
+  Users,
+  LayoutDashboard,
+  Heart,
+  Archive as ArchiveIcon,
 } from "lucide-react";
 import { UserInfo } from "./UserInfo";
 import ExpandableMenu from "./ExpandableMenu";
-import { UPDATE_HISTORY, HIDE_USER_INFO, HIDDEN_MENUS, THEME_MODE } from "../utils/constants";
+import {
+  UPDATE_HISTORY,
+  HIDE_USER_INFO,
+  HIDDEN_MENUS,
+  SIDEBAR_MENU_ORDER,
+  THEME_MODE,
+} from "../utils/constants";
 import { getStorageValue } from "../utils/storage";
 import { setTheme, type ThemeMode } from "../utils/theme";
 
 const menuList = [
   {
+    // 首页：总览（App.tsx 里 "/" 指向 Dashboard）
+    title: "总览",
+    icon: <LayoutDashboard className="w-4 h-4" />,
+    to: "/",
+  },
+  {
     title: "历史记录",
     icon: <HistoryIcon className="w-4 h-4" />,
-    to: "/",
+    to: "/history",
     tourId: "history-menu",
   },
   {
@@ -34,28 +46,25 @@ const menuList = [
     to: "/favorites",
   },
   {
-    title: "合集",
+    title: "订阅合集",
     icon: <LibraryBig className="w-4 h-4" />,
     to: "/collections",
   },
   {
-    title: "AI探索",
-    icon: <Sparkles className="w-4 h-4" />,
-    to: "/ai-search",
+    title: "关注列表",
+    icon: <Users className="w-4 h-4" />,
+    to: "/following",
   },
   {
-    title: "听歌",
-    icon: <MusicIcon className="w-4 h-4" />,
-    subMenus: [
-      {
-        title: "搜索",
-        to: "/music/search",
-      },
-      {
-        title: "我喜欢的音乐",
-        to: "/music/liked",
-      },
-    ],
+    title: "互动记录",
+    icon: <Heart className="w-4 h-4" />,
+    to: "/interactions",
+  },
+  {
+    // 侧边栏只有 w-40（160px），标题必须短：用「消失档案」四个字
+    title: "消失档案",
+    icon: <ArchiveIcon className="w-4 h-4" />,
+    to: "/vanished",
   },
   {
     title: "关于",
@@ -68,20 +77,10 @@ const menuList = [
     to: "/feedback",
   },
   {
-    title: "云同步",
-    icon: <CloudIcon className="w-4 h-4" />,
-    to: "/cloud-sync",
-  },
-  {
     title: "数据备份",
     icon: <HardDriveDownload className="w-4 h-4" />,
     to: "/webdav-sync",
     tourId: "backup-menu",
-  },
-  {
-    title: "赞赏",
-    icon: <Heart className="w-4 h-4" />,
-    to: "/reward",
   },
   {
     title: "设置",
@@ -90,22 +89,51 @@ const menuList = [
   },
 ];
 
+/**
+ * 侧边栏菜单标题。设置页的「侧边栏菜单管理」从这里生成选项，
+ * 避免两处各写一份硬编码——之前那份列了 3 个已删除的页面，
+ * 又漏了 4 个真实菜单。
+ */
+export const SIDEBAR_MENU_TITLES: string[] = menuList.map((item) => item.title);
+
+/**
+ * 不允许隐藏「设置」：隐藏后用户没有任何界面入口把它改回来，
+ * 只能清空扩展存储。其余菜单都可以隐藏。
+ */
+export const HIDEABLE_MENU_TITLES: string[] = SIDEBAR_MENU_TITLES.filter(
+  (title) => title !== "设置",
+);
+
 export const Sidebar = () => {
   const location = useLocation();
 
   const [version, setVersion] = useState<string>(UPDATE_HISTORY[0]?.version || "");
   const [hideUserInfo, setHideUserInfo] = useState(false);
   const [hiddenMenus, setHiddenMenus] = useState<string[]>([]);
+  const [menuOrder, setMenuOrder] = useState<string[]>([]);
   const [themeMode, setThemeMode] = useState<ThemeMode>("light");
 
   useEffect(() => {
     getStorageValue(HIDE_USER_INFO, false).then(setHideUserInfo);
     getStorageValue<string[]>(HIDDEN_MENUS, []).then((menus) => {
-      // Keep the renamed entry hidden for users who previously hid "WebDAV".
+      // 菜单改名后，把旧标题的隐藏状态迁移到新标题，否则隐藏设置会静默失效。
+      const migrations: Array<[string, string]> = [
+        ["WebDAV", "数据备份"],
+        ["关注", "关注列表"],
+        ["合集", "订阅合集"],
+        ["数据面板", "总览"],
+      ];
       setHiddenMenus(
-        menus.includes("WebDAV") && !menus.includes("数据备份") ? [...menus, "数据备份"] : menus,
+        migrations.reduce((acc, [oldTitle, newTitle]) => {
+          if (acc.includes(oldTitle) && !acc.includes(newTitle)) {
+            // 旧标题保留在数组里（里面可能还有 "WebDAV" 这类历史值），只做追加。
+            return [...acc, newTitle];
+          }
+          return acc;
+        }, menus),
       );
     });
+    getStorageValue<string[]>(SIDEBAR_MENU_ORDER, []).then(setMenuOrder);
     getStorageValue<ThemeMode>(THEME_MODE, "light").then((m) =>
       setThemeMode(m === "dark" ? "dark" : "light"),
     );
@@ -121,6 +149,9 @@ export const Sidebar = () => {
         if (changes[HIDDEN_MENUS]) {
           setHiddenMenus((changes[HIDDEN_MENUS].newValue as string[]) || []);
         }
+        if (changes[SIDEBAR_MENU_ORDER]) {
+          setMenuOrder((changes[SIDEBAR_MENU_ORDER].newValue as string[]) || []);
+        }
         if (changes[THEME_MODE]) {
           const next = changes[THEME_MODE].newValue as ThemeMode | undefined;
           setThemeMode(next === "dark" ? "dark" : "light");
@@ -134,6 +165,24 @@ export const Sidebar = () => {
     };
   }, []);
 
+  /**
+   * 按用户自定义顺序排列菜单。
+   *
+   * 没出现在顺序里的标题（比如新版本新增的页面）排到末尾，并保持默认相对顺序——
+   * Array.prototype.sort 是稳定排序，所以这里返回 0 即可。
+   */
+  const orderedMenus = useMemo(() => {
+    if (menuOrder.length === 0) return menuList;
+    return [...menuList].sort((a, b) => {
+      const indexA = menuOrder.indexOf(a.title);
+      const indexB = menuOrder.indexOf(b.title);
+      if (indexA === -1 && indexB === -1) return 0;
+      if (indexA === -1) return 1;
+      if (indexB === -1) return -1;
+      return indexA - indexB;
+    });
+  }, [menuOrder]);
+
   const handleToggleTheme = () => {
     setTheme(themeMode === "dark" ? "light" : "dark");
   };
@@ -145,10 +194,10 @@ export const Sidebar = () => {
       {!hideUserInfo && <UserInfo />}
 
       <nav className="space-y-2 p-4">
-        {menuList
+        {orderedMenus
           .filter((item) => !hiddenMenus.includes(item.title))
-          .map((item, index) => (
-            <ExpandableMenu key={index} {...item} />
+          .map((item) => (
+            <ExpandableMenu key={item.title} {...item} />
           ))}
       </nav>
 

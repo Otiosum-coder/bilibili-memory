@@ -22,22 +22,106 @@ import {
   getAllHistory,
   getAllHistoryEvents,
   getAllHistoryTombstones,
-  getAllLikedMusic,
   getAllSubscribedCollectionResources,
   getAllSubscribedCollections,
+  getAllFollowing,
+  getAllFollowingEvents,
+  getAllVanishedFavResources,
+  getAllVanishArchive,
+  getAllInteractions,
+  getAllAssets,
 } from "./db";
+import { assetFileName } from "./assetArchive";
+import { mergeArchiveWithLegacy } from "./vanishArchive";
 import { getLocalBackupDirectoryHandle } from "./localBackupHandle";
 import { getStorageValue, setStorageValues } from "./storage";
 import { LocalHistoryBackupErrorCode, LocalHistoryBackupResult } from "./types";
 
 const AUTO_BACKUP_FILE_PATTERN = /^bilibili-history-\d{4}-\d{2}-\d{2}-\d{6}\.json$/;
 
+/** 归档图片字节所在的子目录名 */
+export const ASSET_BACKUP_DIRECTORY = "images";
+
+export interface AssetBackupResult {
+  total: number;
+  written: number;
+  skipped: number;
+  failed: number;
+}
+
+/**
+ * 把归档的图片字节写进 `images/` 子目录，一图一文件。
+ *
+ * ## 为什么必须单独做这件事
+ *
+ * `assets` 里存的是**已经消失内容的最后一份影像**——头像被 B站 换成 noface、
+ * 封面被换成占位图之后，就只剩本地这份。但它没有进任何备份：
+ * 浏览器配置被清、换机器、扩展重装，这些字节就全部蒸发，
+ * 而它们恰恰是当初为了"防丢失"才存下来的。
+ *
+ * 放进 JSON 做 base64 是错的：文件会膨胀三分之一以上且没法直接查看。
+ * 本地目录本来就是二进制该待的地方。
+ *
+ * ## 增量写入
+ *
+ * 文件名由 asset id 确定派生（见 `assetFileName`），内容也由路径哈希决定，
+ * 所以**已存在的文件直接跳过**——后续每次备份几乎是零成本。
+ */
+export const writeAssetFiles = async (
+  directoryHandle: FileSystemDirectoryHandle,
+  assets: Array<{ id: string; blob: Blob }>,
+): Promise<AssetBackupResult> => {
+  const result: AssetBackupResult = {
+    total: assets.length,
+    written: 0,
+    skipped: 0,
+    failed: 0,
+  };
+  if (assets.length === 0) return result;
+
+  const imagesDirectory = await directoryHandle.getDirectoryHandle(ASSET_BACKUP_DIRECTORY, {
+    create: true,
+  });
+
+  for (const asset of assets) {
+    const name = assetFileName(asset.id);
+    try {
+      try {
+        await imagesDirectory.getFileHandle(name);
+        result.skipped += 1;
+        continue;
+      } catch {
+        // 不存在，继续写入
+      }
+
+      const fileHandle = await imagesDirectory.getFileHandle(name, { create: true });
+      const writable = await fileHandle.createWritable();
+      try {
+        await writable.write(asset.blob);
+        await writable.close();
+      } catch (error) {
+        try {
+          await writable.abort();
+        } catch {
+          // 保留原始写入错误
+        }
+        throw error;
+      }
+      result.written += 1;
+    } catch (error) {
+      result.failed += 1;
+      console.warn(`写入归档图片失败（${asset.id}）:`, error);
+    }
+  }
+
+  return result;
+};
+
 const LOCAL_BACKUP_DATA_ITEMS: {
   key: Exclude<BackupItemKey, "history">;
   label: string;
   getAll: () => Promise<unknown[]>;
 }[] = [
-  { key: "likedMusic", label: "喜欢的音乐", getAll: getAllLikedMusic },
   { key: "favFolders", label: "收藏夹", getAll: getAllFavFolders },
   { key: "favResources", label: "收藏资源", getAll: getAllFavResources },
   { key: "subscribedCollections", label: "订阅合集", getAll: getAllSubscribedCollections },
@@ -46,6 +130,13 @@ const LOCAL_BACKUP_DATA_ITEMS: {
     label: "合集视频",
     getAll: getAllSubscribedCollectionResources,
   },
+  { key: "following", label: "关注的 UP 主", getAll: getAllFollowing },
+  { key: "followingEvents", label: "关注变动", getAll: getAllFollowingEvents },
+  // 旧 store 不再单独作为备份项：它已被 `vanishArchive` 取代，
+  // 数据会在写 `vanishArchive` 时一起并进来（见本文件下方的合并逻辑）
+  { key: "vanishedFavResources", label: "消失档案", getAll: getAllVanishedFavResources },
+  { key: "vanishArchive", label: "消失档案", getAll: getAllVanishArchive },
+  { key: "interactions", label: "点赞与投币", getAll: getAllInteractions },
 ];
 
 const toErrorMessage = (error: unknown): string => {
@@ -155,6 +246,20 @@ export const buildHistoryBackupJson = async (
 
   for (const item of LOCAL_BACKUP_DATA_ITEMS) {
     if (!selectedItems[item.key]) continue;
+    // 统一消失档案：把旧 store 的收藏档案一起并进来。
+    // 界面上只有「消失档案」一个勾选项——分两个选项让用户去理解
+    // 「消失档案（旧）/ 统一消失档案」的区别是没必要的负担，
+    // 而旧数据仍然要保下来（旧备份、旧版本兼容）。
+    if (item.key === "vanishArchive") {
+      const [archive, legacy] = await Promise.all([
+        getAllVanishArchive(),
+        getAllVanishedFavResources(),
+      ]);
+      const merged = mergeArchiveWithLegacy(archive, legacy);
+      data[item.key] = merged;
+      summaries.push(`${item.label} ${merged.length} 条`);
+      continue;
+    }
     const records = await item.getAll();
     data[item.key] = records;
     summaries.push(`${item.label} ${records.length} 条`);
@@ -293,6 +398,21 @@ export const runLocalHistoryBackup = async (
     return updateFailureState("WRITE_FAILED", `写入备份文件失败：${toErrorMessage(error)}`);
   }
 
+  // 归档的图片字节单独写进 images/ 子目录。
+  // 失败**不判整次备份失败**——JSON 才是主体，图片是附加保险。
+  let assetSummary = "";
+  try {
+    const assets = await getAllAssets();
+    const assetResult = await writeAssetFiles(directoryHandle, assets);
+    assetSummary =
+      `归档图片 ${assetResult.total} 张` +
+      `（新增 ${assetResult.written}，已存在 ${assetResult.skipped}` +
+      (assetResult.failed > 0 ? `，失败 ${assetResult.failed}` : "") +
+      "）";
+  } catch (error) {
+    assetSummary = `归档图片备份失败：${toErrorMessage(error)}`;
+  }
+
   const completedAt = Date.now();
   const retentionCount = await getStorageValue<number>(
     LOCAL_HISTORY_BACKUP_RETENTION_COUNT,
@@ -326,7 +446,7 @@ export const runLocalHistoryBackup = async (
     recordCount: backupData.recordCount,
     contentCount: backupData.contentCount,
     eventCount: backupData.eventCount,
-    summary: backupData.summary,
+    summary: [backupData.summary, assetSummary].filter(Boolean).join("，"),
     completedAt,
     cleanupWarning: cleanupWarning || undefined,
   };

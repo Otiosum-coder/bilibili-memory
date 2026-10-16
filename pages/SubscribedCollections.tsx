@@ -4,6 +4,7 @@ import { getSubscribedCollectionResources, getSubscribedCollections } from "../u
 import { SubscribedCollection, SubscribedCollectionResource } from "../utils/types";
 import { ChevronDownIcon, LibraryBig, RefreshCw, Search, X } from "lucide-react";
 import { Pagination } from "../components/Pagination";
+import { formatInteractionDuration } from "../utils/interactionQuery";
 
 type SearchType = "all" | "title" | "up" | "bvid" | "avid";
 
@@ -139,7 +140,7 @@ export const SubscribedCollections = () => {
         <div className="p-4 border-b border-gray-200 dark:border-neutral-800 flex items-center justify-between gap-3">
           <h2 className="text-lg font-bold flex items-center gap-2 min-w-0">
             <LibraryBig className="w-5 h-5 shrink-0" />
-            <span className="truncate">我的订阅合集</span>
+            <span className="truncate">订阅合集</span>
           </h2>
           <button
             type="button"
@@ -313,6 +314,13 @@ export const SubscribedCollections = () => {
                               <LibraryBig className="w-8 h-8" />
                             </div>
                           )}
+                          {/* 时长压在封面右下角。它是"基本不变"的元数据，
+                              比标题更能说明这是哪条内容——标题会被占位文案顶掉 */}
+                          {formatInteractionDuration(item.duration) ? (
+                            <span className="absolute bottom-1.5 right-1.5 rounded bg-black/70 px-1.5 py-0.5 text-xs tabular-nums text-white">
+                              {formatInteractionDuration(item.duration)}
+                            </span>
+                          ) : null}
                         </div>
                         <div className="p-3 flex-1 flex flex-col">
                           <h3

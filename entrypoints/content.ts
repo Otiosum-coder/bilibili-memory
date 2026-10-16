@@ -1,10 +1,10 @@
+import { PAGE_MESSAGE_DELETE_HISTORY } from "../utils/constants";
+
 export default defineContentScript({
   matches: ["*://*.bilibili.com/*"],
   runAt: "document_start",
   async main() {
-    console.log("hello content");
-
-    // 监听来自injected script的window消息
+    // 监听来自 injected script 的 window 消息
     window.addEventListener("message", (event) => {
       // 确保消息来自同源
       if (event.origin !== window.location.origin) {
@@ -13,7 +13,7 @@ export default defineContentScript({
 
       // 处理来自injected script的删除历史记录消息
       if (
-        event.data.type === "DELETE_HISTORY_FROM_INJECT" &&
+        event.data.type === PAGE_MESSAGE_DELETE_HISTORY &&
         event.data.action === "deleteHistoryItem"
       ) {
         // 转发消息给background

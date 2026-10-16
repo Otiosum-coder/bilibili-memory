@@ -1,4 +1,4 @@
-import { useEffect, useState, useRef } from "react";
+import { useEffect, useState, useRef, useMemo } from "react";
 import toast from "react-hot-toast";
 import {
   clearFavResourcesByFolder,
@@ -28,8 +28,19 @@ import {
   RefreshCw,
   Trash2,
   MoreHorizontal,
+  Wand2,
+  Copy,
 } from "lucide-react";
 import { Pagination } from "../components/Pagination";
+import { buildRecoveryStats } from "../utils/favRecovery";
+import {
+  buildResourceCopyText,
+  resolveFavResourceBadge,
+  resolveFavResourceHint,
+  resolveFavResourceState,
+} from "../utils/favResourceInfo";
+import { PLACEHOLDER_COVER_PATH } from "../utils/imageUrl";
+import { formatInteractionDuration } from "../utils/interactionQuery";
 import { FavoriteFolderSyncModal } from "../components/FavoriteFolderSyncModal";
 import { AllFavoriteFoldersSyncModal } from "../components/AllFavoriteFoldersSyncModal";
 import { ClearFavoriteFolderModal } from "../components/ClearFavoriteFolderModal";
@@ -48,6 +59,12 @@ export const Favorites = () => {
   const [isAllFoldersSyncOpen, setIsAllFoldersSyncOpen] = useState(false);
   const [clearTargetFolder, setClearTargetFolder] = useState<FavoriteFolder | null>(null);
   const [isClearingFolder, setIsClearingFolder] = useState(false);
+  const [isRecovering, setIsRecovering] = useState(false);
+  const [recoveryResult, setRecoveryResult] = useState<{
+    attempted: number;
+    recovered: number;
+    remaining: number;
+  } | null>(null);
   const [openFolderMenuId, setOpenFolderMenuId] = useState<number | null>(null);
   const [deleteTargetFolder, setDeleteTargetFolder] = useState<FavoriteFolder | null>(null);
   const [isDeletingFolder, setIsDeletingFolder] = useState(false);
@@ -221,6 +238,58 @@ export const Favorites = () => {
       if (showLoading) setLoading(false);
     }
   };
+
+  /**
+   * 失效内容的第三方恢复。
+   *
+   * 能力边界（Phase 4 实测）：biliplus 持有部分独立档案，能救回「UP 主自己删除」
+   * 那一类（B站 返回 62002），但对 B站 彻底删除的（-404）同样没有数据。
+   * 所以恢复数量可能是 0，那是数据源的限制而不是故障。
+   */
+  const handleRecoverInvalid = async () => {
+    setIsRecovering(true);
+    try {
+      const response = await browser.runtime.sendMessage({ action: "recoverInvalidFavorites" });
+      if (!response?.success) {
+        throw new Error(response?.error || "恢复失效内容失败");
+      }
+      setRecoveryResult({
+        attempted: response.attempted ?? 0,
+        recovered: response.recovered ?? 0,
+        remaining: response.remaining ?? 0,
+      });
+      if (response.attempted === 0) {
+        toast("没有需要恢复的条目：失效内容都已有本地数据");
+      } else if (response.recovered === 0) {
+        toast(
+          `查询 ${response.attempted} 条，第三方档案中都没有记录（数据源限制，非故障）`,
+        );
+      } else {
+        toast.success(response.message ?? `已恢复 ${response.recovered} 条`);
+      }
+      if (selectedFolderId) {
+        await loadResources(selectedFolderId, { resetSearch: false });
+      }
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : "恢复失效内容失败");
+    } finally {
+      setIsRecovering(false);
+    }
+  };
+
+  /** 复制单条收藏的完整信息，便于外部留存与检索 */
+  const handleCopyResource = async (resource: Parameters<typeof buildResourceCopyText>[0]) => {
+    try {
+      await navigator.clipboard.writeText(buildResourceCopyText(resource));
+      toast.success("已复制这条收藏的完整信息");
+    } catch (error) {
+      console.error("复制失败:", error);
+      toast.error("复制失败，请检查剪贴板权限");
+    }
+  };
+
+  /** 当前收藏夹的失效与待恢复统计。纯本地计算，不发请求 */
+  const recoveryStats = useMemo(() => buildRecoveryStats(resources), [resources]);
 
   const handleFolderSyncSuccess = async (folderId: number) => {
     const foldersRefreshed = await loadFolders();
@@ -620,6 +689,47 @@ export const Favorites = () => {
                   <Trash2 className="h-4 w-4" />
                   清空
                 </button>
+
+                <button
+                  type="button"
+                  onClick={handleRecoverInvalid}
+                  disabled={!selectedFolder || loading || isRecovering || isFavoriteSyncing}
+                  className={`inline-flex items-center gap-1.5 rounded-lg border px-3 py-1.5 text-sm font-medium transition-colors disabled:cursor-not-allowed disabled:opacity-40 ${
+                    recoveryStats.pending > 0
+                      ? "border-transparent bg-[#fb7299] text-white hover:bg-[#e4638a] dark:border-transparent"
+                      : "border-pink-200 bg-white text-pink-600 hover:border-pink-300 hover:bg-pink-50 dark:border-pink-500/30 dark:bg-neutral-900 dark:text-pink-400 dark:hover:border-pink-500/50 dark:hover:bg-pink-500/10"
+                  }`}
+                  title="用第三方档案（biliplus / jijidown）与本地分P标题尝试找回已失效内容的标题与封面。恢复结果会直接覆盖到本页。需要手动点击，不会自动运行"
+                >
+                  <Wand2 className={`h-4 w-4 ${isRecovering ? "animate-pulse" : ""}`} />
+                  {isRecovering ? "恢复中…" : "恢复失效内容"}
+                </button>
+
+                {/* 本地即可算出的诊断数字，无需开控制台就能判断有没有可恢复的内容 */}
+                <span className="text-xs text-gray-400 dark:text-neutral-500">
+                  已失效 {recoveryStats.invalid} 条
+                  {recoveryStats.invalid > 0 ? (
+                    <>
+                      {" · "}已有本地数据 {recoveryStats.intact} 条
+                      {" · "}
+                      <span
+                        className={
+                          recoveryStats.pending > 0
+                            ? "font-medium text-pink-500 dark:text-pink-400"
+                            : ""
+                        }
+                      >
+                        待恢复 {recoveryStats.pending} 条
+                      </span>
+                    </>
+                  ) : null}
+                  {recoveryResult ? ` · 上轮查询 ${recoveryResult.attempted}、恢复 ${recoveryResult.recovered}` : ""}
+                  {recoveryStats.pending > 0 && !isRecovering && !recoveryResult ? (
+                    <span className="ml-1 font-medium text-[#fb7299]">
+                      ← 点左侧按钮开始恢复（不会自动运行）
+                    </span>
+                  ) : null}
+                </span>
               </div>
 
               <div className="relative w-full md:max-w-xl group flex items-center bg-gray-50 dark:bg-neutral-800 border border-gray-200 dark:border-neutral-700 rounded-full transition-all duration-300 shadow-sm hover:shadow-md focus-within:bg-white dark:focus-within:bg-neutral-800 focus-within:ring-2 focus-within:ring-blue-100 dark:focus-within:ring-blue-500/20 focus-within:border-blue-400 dark:focus-within:border-blue-500">
@@ -716,60 +826,109 @@ export const Favorites = () => {
             ) : (
               <>
                 <div className="grid grid-cols-[repeat(auto-fill,minmax(240px,1fr))] gap-6">
-                  {currentResources.map((item) => (
-                    <div
-                      key={item.id}
-                      className="border border-gray-200 dark:border-neutral-800 rounded-lg overflow-hidden flex flex-col bg-white dark:bg-neutral-900 hover:shadow-md transition-shadow"
-                    >
-                      <a
-                        href={`https://www.bilibili.com/video/${item.bvid}`}
-                        target="_blank"
-                        rel="noopener noreferrer"
-                        className="no-underline text-inherit flex flex-col h-full"
+                  {currentResources.map((item) => {
+                    const state = resolveFavResourceState(item);
+                    const invalidated = state !== "normal";
+                    return (
+                      <div
+                        key={item.id}
+                        className="border border-gray-200 dark:border-neutral-800 rounded-lg overflow-hidden flex flex-col bg-white dark:bg-neutral-900 hover:shadow-md transition-shadow"
                       >
-                        <div>
-                          <div className="relative w-full aspect-video">
-                            <img
-                              src={`${item.cover.replace("http:", "https:")}@760w_428h_1c.avif`}
-                              alt={item.title}
-                              className="w-full h-full object-cover"
-                              loading="lazy"
-                            />
-                          </div>
-                          <div className="p-3 flex-1 flex flex-col">
-                            <div className="flex items-start justify-between gap-2">
-                              <h3
-                                className="m-0 text-sm leading-[1.4] h-10 overflow-hidden line-clamp-2 flex-1"
-                                title={item.title}
-                              >
-                                {item.title}
-                              </h3>
-                            </div>
-                            <div className="flex justify-between items-center text-gray-500 dark:text-neutral-400 text-xs mt-2">
-                              <span
-                                onClick={(e) => {
-                                  e.preventDefault();
-                                  e.stopPropagation();
-                                  window.open(
-                                    `https://space.bilibili.com/${item.upper?.mid}`,
-                                    "_blank",
-                                  );
+                        <a
+                          href={`https://www.bilibili.com/video/${item.bvid}`}
+                          target="_blank"
+                          rel="noopener noreferrer"
+                          className="no-underline text-inherit flex flex-col h-full"
+                        >
+                          <div>
+                            <div className="relative w-full aspect-video">
+                              <img
+                                src={`${item.cover.replace("http:", "https:")}@760w_428h_1c.avif`}
+                                alt={item.title}
+                                className={`w-full h-full object-cover ${
+                                  state === "broken" ? "opacity-70" : ""
+                                }`}
+                                loading="lazy"
+                                onError={(event) => {
+                                  const image = event.currentTarget;
+                                  const fallback = `https://i0.hdslb.com${PLACEHOLDER_COVER_PATH}@760w_428h_1c.avif`;
+                                  if (!image.src.startsWith(fallback)) image.src = fallback;
                                 }}
-                                className="hover:text-[#fb7299] transition-colors cursor-pointer truncate mr-2"
-                              >
-                                {item.upper?.name}
-                              </span>
-                              <span className="shrink-0">
-                                {new Date(
-                                  (item.fav_time || item.ctime) * 1000,
-                                ).toLocaleDateString()}
-                              </span>
+                              />
+                              {invalidated ? (
+                                <span
+                                  className={`absolute left-2 top-2 rounded px-1.5 py-0.5 text-xs text-white ${
+                                    state === "broken" ? "bg-gray-500/90" : "bg-emerald-500/90"
+                                  }`}
+                                  title={resolveFavResourceHint(item)}
+                                >
+                                  {resolveFavResourceBadge(item)}
+                                </span>
+                              ) : null}
+                              {/* 时长压在封面右下角。它是"基本不变"的元数据，
+                                  比标题更能说明这是哪条内容——标题会被占位文案顶掉 */}
+                              {formatInteractionDuration(item.duration) ? (
+                                <span className="absolute bottom-1.5 right-1.5 rounded bg-black/70 px-1.5 py-0.5 text-xs tabular-nums text-white">
+                                  {formatInteractionDuration(item.duration)}
+                                </span>
+                              ) : null}
+                            </div>
+                            <div className="p-3 flex-1 flex flex-col">
+                              <div className="flex items-start justify-between gap-2">
+                                <h3
+                                  className={`m-0 text-sm leading-[1.4] h-10 overflow-hidden line-clamp-2 flex-1 ${
+                                    state === "broken"
+                                      ? "line-through text-gray-400 dark:text-neutral-500"
+                                      : state === "repaired"
+                                        ? "line-through text-gray-600 dark:text-neutral-300"
+                                        : ""
+                                  }`}
+                                  title={item.title}
+                                >
+                                  {item.title}
+                                </h3>
+                              </div>
+                              <div className="flex justify-between items-center text-gray-500 dark:text-neutral-400 text-xs mt-2">
+                                <span
+                                  onClick={(e) => {
+                                    e.preventDefault();
+                                    e.stopPropagation();
+                                    window.open(
+                                      `https://space.bilibili.com/${item.upper?.mid}`,
+                                      "_blank",
+                                    );
+                                  }}
+                                  className="hover:text-[#fb7299] transition-colors cursor-pointer truncate mr-2"
+                                >
+                                  {item.upper?.name}
+                                </span>
+                                <span className="flex shrink-0 items-center gap-1.5">
+                                  <span>
+                                    {new Date(
+                                      (item.fav_time || item.ctime) * 1000,
+                                    ).toLocaleDateString()}
+                                  </span>
+                                  <button
+                                    type="button"
+                                    title="复制这条收藏的完整信息"
+                                    aria-label="复制这条收藏的完整信息"
+                                    onClick={(event) => {
+                                      event.preventDefault();
+                                      event.stopPropagation();
+                                      void handleCopyResource(item);
+                                    }}
+                                    className="rounded p-1 text-gray-400 transition-colors hover:bg-gray-100 hover:text-[#fb7299] dark:text-neutral-500 dark:hover:bg-neutral-800"
+                                  >
+                                    <Copy className="h-3.5 w-3.5" />
+                                  </button>
+                                </span>
+                              </div>
                             </div>
                           </div>
-                        </div>
-                      </a>
-                    </div>
-                  ))}
+                        </a>
+                      </div>
+                    );
+                  })}
                   {currentResources.length === 0 && (
                     <div className="col-span-full text-center py-10 text-gray-400 dark:text-neutral-500">
                       这个收藏夹是空的

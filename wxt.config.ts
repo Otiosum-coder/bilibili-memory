@@ -4,14 +4,16 @@ import { defineConfig } from "wxt";
 export default defineConfig({
   modules: ["@wxt-dev/module-react"],
   manifest: {
-    name: "Bilibili 无限历史记录",
-    description: "不限制数量的保存你的bilibili历史记录",
+    name: "Bilibili Memory",
+    description:
+      "本地永久保存 B 站观看历史、收藏夹、关注列表与点赞/投币记录，防止内容消失后无从追溯。",
     permissions: [
       "unlimitedStorage",
       "storage",
       "tabs",
       "cookies",
       "alarms",
+      "notifications",
       "declarativeNetRequest",
     ],
     declarative_net_request: {

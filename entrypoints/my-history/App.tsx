@@ -7,18 +7,17 @@ import Settings from "../../pages/Settings";
 import ScrollToTopButton from "../../components/ScrollToTopButton";
 import toast, { Toaster } from "react-hot-toast";
 import Feedback from "../../pages/Feedback";
-import CloudSync from "../../pages/CloudSync";
 import WebDavSync from "../../pages/WebDavSync";
-import SearchMusic from "../../pages/music/SearchMusic";
-import LikedMusic from "../../pages/music/LikedMusic";
 import { Favorites } from "../../pages/Favorites";
 import Welcome from "../../pages/Welcome";
-import AISearch from "../../pages/AISearch";
-import Reward from "../../pages/Reward";
 import { UpdateNoticeModal } from "../../components/UpdateNoticeModal";
 import { DataBackupReminderModal } from "../../components/DataBackupReminderModal";
 import { FirstRunGuideModal } from "../../components/FirstRunGuideModal";
 import SubscribedCollections from "../../pages/SubscribedCollections";
+import Following from "../../pages/Following";
+import Interactions from "../../pages/Interactions";
+import Dashboard from "../../pages/Dashboard";
+import Vanished from "../../pages/Vanished";
 import {
   BACKUP_REMINDER_LAST_DISMISSED_AT,
   FIRST_RUN_GUIDE_COMPLETED,
@@ -240,18 +239,20 @@ const App = () => {
         <div>
           <Routes>
             <Route path="/welcome" element={<Welcome />} />
-            <Route path="/" element={<History />} />
+            {/* 首页 = 总览；历史记录移到 /history */}
+            <Route path="/" element={<Dashboard />} />
+            <Route path="/history" element={<History />} />
             <Route path="/about" element={<About />} />
             <Route path="/settings" element={<Settings />} />
             <Route path="/feedback" element={<Feedback />} />
-            <Route path="/cloud-sync" element={<CloudSync />} />
             <Route path="/webdav-sync" element={<WebDavSync />} />
-            <Route path="/reward" element={<Reward />} />
             <Route path="/favorites" element={<Favorites />} />
+            <Route path="/following" element={<Following />} />
+            <Route path="/interactions" element={<Interactions />} />
+            <Route path="/vanished" element={<Vanished />} />
+            {/* 旧地址保留：总览改做首页后，/dashboard 重定向到 / */}
+            <Route path="/dashboard" element={<Navigate to="/" replace />} />
             <Route path="/collections" element={<SubscribedCollections />} />
-            <Route path="/ai-search" element={<AISearch />} />
-            <Route path="/music/search" element={<SearchMusic />} />
-            <Route path="/music/liked" element={<LikedMusic />} />
             <Route path="*" element={<Navigate to="/" replace />} />
           </Routes>
         </div>

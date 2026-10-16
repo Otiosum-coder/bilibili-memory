@@ -20,7 +20,6 @@ import {
 } from "lucide-react";
 import { Pagination } from "../components/Pagination";
 import {
-  DATE_SELECTION_MODE,
   GRID_COLUMNS,
   HISTORY_DISPLAY_MODE,
   HISTORY_LOAD_MODE,
@@ -68,7 +67,6 @@ export const History: React.FC = () => {
   const [hasMore, setHasMore] = useState(true);
   const [isLoading, setIsLoading] = useState(false);
   const [totalHistoryCount, setTotalHistoryCount] = useState(0);
-  const [dateSelectionMode, setDateSelectionMode] = useState<"range" | "single">("range");
   const [gridColumns, setGridColumns] = useState<number | "auto">(4);
   const [displayMode, setDisplayMode] = useState<HistoryDisplayMode>("content");
   // null means the stored value is not loaded yet
@@ -92,22 +90,21 @@ export const History: React.FC = () => {
   }, [history]);
 
   useEffect(() => {
-    getStorageValue(DATE_SELECTION_MODE, "range").then((mode) => {
-      setDateSelectionMode(mode as "range" | "single");
-    });
-    getStorageValue<number | "auto">(GRID_COLUMNS, 4).then((cols) => {
+    // 4 个键用一次批量读取拿回来。分成 5 个独立的 get 各自 await 的话，
+    // 它们可能落在不同的提交里，就会出现"用中间态的默认值先查了一次"。
+    void Promise.all([
+      getStorageValue<number | "auto">(GRID_COLUMNS, 4),
+      getStorageValue<number>(HISTORY_PAGE_SIZE, DEFAULT_PAGE_SIZE),
+      getStorageValue<"pagination" | "scroll">(HISTORY_LOAD_MODE, "pagination"),
+      getStorageValue<HistoryDisplayMode>(HISTORY_DISPLAY_MODE, "content"),
+      getStorageValue<boolean>(HISTORY_TOOLBAR_EXPANDED, true),
+    ]).then(([cols, size, mode, storedDisplayMode, toolbarExpanded]) => {
       setGridColumns(cols);
-    });
-    getStorageValue<number>(HISTORY_PAGE_SIZE, DEFAULT_PAGE_SIZE).then((size) => {
       setPageSize(size);
+      setLoadMode(mode === "scroll" ? "scroll" : "pagination");
+      setDisplayMode(storedDisplayMode === "visit" ? "visit" : "content");
+      setIsToolbarExpanded(toolbarExpanded);
     });
-    getStorageValue(HISTORY_LOAD_MODE, "pagination").then((mode) => {
-      setLoadMode(mode as "pagination" | "scroll");
-    });
-    getStorageValue<HistoryDisplayMode>(HISTORY_DISPLAY_MODE, "content").then((mode) => {
-      setDisplayMode(mode === "visit" ? "visit" : "content");
-    });
-    getStorageValue(HISTORY_TOOLBAR_EXPANDED, true).then(setIsToolbarExpanded);
   }, []);
 
   useEffect(() => {
@@ -133,9 +130,12 @@ export const History: React.FC = () => {
   ];
 
   const loadHistory = async (isAppend: boolean = false) => {
+    // 追加加载在上一笔请求返回前直接跳过（观察者会被内容变化再次触发）；
+    // 重置型加载不能被丢弃，用 requestId 让"后来者优先"，过期的响应自己退出。
     if (isAppend && isLoadingRef.current) {
       return false;
     }
+    const requestId = (requestIdRef.current += 1);
 
     try {
       setIsLoading(true);
@@ -162,6 +162,10 @@ export const History: React.FC = () => {
         displayMode,
       );
 
+      if (requestId !== requestIdRef.current) {
+        return false;
+      }
+
       if (isAppend) {
         setHistory((prev) => [...prev, ...items]);
       } else {
@@ -174,11 +178,16 @@ export const History: React.FC = () => {
       return true;
     } catch (error) {
       console.error("Failed to load history:", error);
-      setLoadError("历史记录加载失败，请检查本地数据后重试。");
+      if (requestId === requestIdRef.current) {
+        setLoadError("历史记录加载失败，请检查本地数据后重试。");
+      }
       return false;
     } finally {
-      setIsLoading(false);
-      isLoadingRef.current = false;
+      // 只有最新一笔结束时才解除 loading：被取代的旧请求提前收尾会把转圈关掉
+      if (requestId === requestIdRef.current) {
+        setIsLoading(false);
+        isLoadingRef.current = false;
+      }
     }
   };
 
@@ -188,9 +197,13 @@ export const History: React.FC = () => {
 
   // offset-based page load for pagination mode
   const loadPage = async (page: number) => {
-    if (isLoadingRef.current) {
+    // loadMode 读到之前不要加载：那时 pageSize 也还没读回来，
+    // 否则会先用默认条数查一次、再用真实条数查一次。
+    if (loadMode === null) {
       return false;
     }
+    const requestId = (requestIdRef.current += 1);
+
     try {
       setIsLoading(true);
       isLoadingRef.current = true;
@@ -206,6 +219,10 @@ export const History: React.FC = () => {
         displayMode,
       );
 
+      if (requestId !== requestIdRef.current) {
+        return false;
+      }
+
       setHistory(items);
       window.scrollTo({ top: 0, behavior: "smooth" });
       setTotalFiltered(total);
@@ -213,40 +230,96 @@ export const History: React.FC = () => {
       return true;
     } catch (error) {
       console.error("Failed to load history:", error);
-      setLoadError("历史记录加载失败，请检查本地数据后重试。");
+      if (requestId === requestIdRef.current) {
+        setLoadError("历史记录加载失败，请检查本地数据后重试。");
+      }
       return false;
     } finally {
-      setIsLoading(false);
-      isLoadingRef.current = false;
+      if (requestId === requestIdRef.current) {
+        setIsLoading(false);
+        isLoadingRef.current = false;
+      }
     }
   };
 
-  const reload = () => {
+  /**
+   * 重新加载。`page` 省略时用当前页码（翻页），显式传 1 表示"筛选变了要回到第一页"。
+   *
+   * **重置型加载永不丢弃**：用户的筛选/关键词一变，新请求就必须发出去，
+   * 由 `requestIdRef` 让旧请求的响应自己作废。以前这里是 `if (isLoadingRef.current) return`，
+   * 结果是"上一次查询很慢时，新筛选被静默吞掉"，列表停在中间那次结果上且不会自愈。
+   */
+  const requestLoad = (page?: number) => {
     if (loadMode === "pagination") {
-      return loadPage(1);
+      return loadPage(page ?? currentPage);
     }
     if (loadMode === "scroll") {
+      // 下拉加载没有页码概念，重置列表时从头取
       return loadHistory(false);
     }
     return Promise.resolve(false);
   };
 
-  useEffect(() => {
-    // wait until the stored load mode is resolved to avoid a duplicated first load
-    if (loadMode === null) {
-      return;
-    }
-    void reload();
-  }, [
+  const reload = () => requestLoad(1);
+
+  // 保持最新的 reload 引用：加载相关的 effect 依赖一堆筛选状态，
+  // 用 ref 调用可以避免把 reload 塞进依赖数组后每次渲染都重新加载。
+  const reloadRef = useRef(reload);
+  reloadRef.current = reload;
+
+  /** 请求序号：每次发起加载都自增，只有最新一笔的响应允许落地（后来者优先） */
+  const requestIdRef = useRef(0);
+
+  /** 上一次"页码 + 筛选 + 加载方式"的快照，用来判断这次变化属于翻页还是筛选变更 */
+  const previousLoadKeyRef = useRef<{ page: number; filter: string; loader: string } | null>(null);
+
+  // 失效键：页码、筛选、加载方式与每页条数
+  const filterKey = [
     debouncedKeyword,
     startDate,
     endDate,
     selectedType,
     searchType,
-    loadMode,
-    pageSize,
     displayMode,
-  ]);
+  ].join("\u0000");
+
+  /**
+   * 唯一的加载入口。
+   *
+   * 键（页码 / 筛选 / 加载方式 / 每页条数）任一变化就加载一次：
+   * - **只有页码单独变化**才是翻页，用新页码；
+   * - 其余变化一律回到第 1 页——包括筛选项，以前它们不重置页码，
+   *   于是"页 3 上搜一个词"会去查第 3 页，而分页器还高亮着第 3 页；
+   * - 加载方式与每页条数变化时先把 `currentPage` 归 1，下一次提交再加载，
+   *   确保用的是新的每页条数与加载方式；只改"每行列数"（不在这个键里）不会触发任何加载，
+   *   页码也不会被无意义地归零。
+   *
+   * 挂载后第一次用 storage 里的最终值加载（`previous === null` 那一支），
+   * 避免先用默认值查一次、再用真实设置查一次。
+   */
+  useEffect(() => {
+    if (loadMode === null) return;
+
+    const previous = previousLoadKeyRef.current;
+    const current = { page: currentPage, filter: filterKey, loader: `${loadMode}|${pageSize}` };
+    previousLoadKeyRef.current = current;
+
+    // 首次：storage 刚读回来，直接用最终值加载一次
+    if (previous === null) {
+      void requestLoad(1);
+      return;
+    }
+
+    const loaderChanged = previous.loader !== current.loader;
+    if (loaderChanged && currentPage !== 1) {
+      setCurrentPage(1);
+      return;
+    }
+
+    const pageOnly = previous.page !== currentPage && previous.filter === current.filter;
+    void requestLoad(pageOnly ? currentPage : 1);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [currentPage, filterKey, loadMode, pageSize]);
 
   useEffect(() => {
     void getTotalCount().catch((error) => {
@@ -285,12 +358,17 @@ export const History: React.FC = () => {
     ]);
     setLoadMode(settings.loadMode);
     setGridColumns(settings.gridColumns);
+    // 换了加载方式就从头开始：下拉加载没有页码概念，分页模式也不该沿用切换前的页码。
+    // **只在真的换了加载方式时才归 1**：只改"每行列数"时列表内容没变，
+    // 把页码归 1 会让分页器显示第 1 页、网格却还是第 N 页的内容。
+    if (settings.loadMode !== loadMode) setCurrentPage(1);
   };
 
   const handleDisplayModeChange = async (mode: HistoryDisplayMode) => {
     if (mode === displayMode) return;
     await setStorageValue(HISTORY_DISPLAY_MODE, mode);
-    setCurrentPage(1);
+    // displayMode 是加载键的一部分，加载 effect 会自己回到第 1 页重新取数，
+    // 这里不预设页码（预设会与 effect 的加载撞成两次请求）。
     setHistory([]);
     historyRef.current = [];
     setDisplayMode(mode);
@@ -643,7 +721,6 @@ export const History: React.FC = () => {
                       setStartDate(start);
                       setEndDate(end);
                     }}
-                    mode={dateSelectionMode}
                   />
                 </div>
               </div>
@@ -729,6 +806,8 @@ export const History: React.FC = () => {
           pageSize={pageSize}
           onPageChange={loadPage}
           onPageSizeChange={(size) => {
+            // 只改条数，页码归 1 交给加载 effect 统一处理（它会把这次变化
+            // 判定为"加载方式变了"，先归 1 再用新条数加载）。
             setPageSize(size);
             void setStorageValue(HISTORY_PAGE_SIZE, size);
           }}
