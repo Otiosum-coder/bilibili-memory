@@ -6,7 +6,12 @@ const Welcome = () => {
 
   return (
     <div className="flex flex-col items-center min-h-[80vh] bg-white p-6 rounded-xl shadow-sm m-4 max-w-[800px] mx-auto">
-      <h1 className="text-3xl font-bold text-gray-800 mb-2">欢迎使用哔哩哔哩记忆</h1>
+      {/* 品牌 lockup：首次打开时的第一印象。图片已含图标 + 「bilibili memory」艺术字 + 标语 */}
+      <img
+        src="/brand/lockup.png"
+        alt="哔哩哔哩记忆 · 留住你在 B 站的每一份喜欢"
+        className="mb-6 w-full max-w-[420px]"
+      />
 
       <button
         onClick={() => navigate("/")}

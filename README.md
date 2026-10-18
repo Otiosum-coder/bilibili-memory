@@ -1,7 +1,5 @@
 <div align="center">
-  <img src="public/icon/128.png" alt="哔哩哔哩记忆" width="120" />
-
-  <h1>哔哩哔哩记忆 · Bilibili Memory</h1>
+  <img src="public/brand/lockup.png" alt="哔哩哔哩记忆 · Bilibili Memory" width="440" />
 
   <p>
     <b>把 B 站的观看历史、收藏夹、订阅合集、关注列表与点赞/投币记录存在本地</b>

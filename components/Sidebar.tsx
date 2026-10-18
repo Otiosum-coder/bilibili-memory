@@ -201,19 +201,55 @@ export const Sidebar = () => {
           ))}
       </nav>
 
-      <div className="absolute bottom-2 left-2 right-2 flex items-center justify-between">
-        <p className="text-gray-600 dark:text-neutral-400 text-base leading-none">
-          {version ? `v${version}` : ""}
-        </p>
+      <div className="absolute bottom-3 left-2 right-2 flex flex-col gap-2">
+        {/* 主题切换：整行按钮 + 右侧开关。
+            原来只是一个孤零零的图标靠右，左边空一大块；而且和品牌位挤在同一行时
+            两者都被压小。做成占满宽度的行，既是明确的可点击区域，也不再留空白。 */}
         <button
           type="button"
           onClick={handleToggleTheme}
           title={isDark ? "切换到白天模式" : "切换到黑夜模式"}
           aria-label={isDark ? "切换到白天模式" : "切换到黑夜模式"}
-          className="inline-flex items-center justify-center w-8 h-8 rounded-md text-gray-600 hover:bg-gray-200 dark:text-neutral-300 dark:hover:bg-neutral-800 transition-colors"
+          className="flex w-full items-center justify-between rounded-lg px-2 py-1.5 text-sm text-gray-600 transition-colors hover:bg-gray-200 dark:text-neutral-300 dark:hover:bg-neutral-800"
         >
-          {isDark ? <Sun className="w-4 h-4" /> : <Moon className="w-4 h-4" />}
+          <span className="flex min-w-0 items-center gap-2">
+            {isDark ? (
+              <Sun className="h-4 w-4 shrink-0" />
+            ) : (
+              <Moon className="h-4 w-4 shrink-0" />
+            )}
+            <span className="truncate">{isDark ? "浅色模式" : "深色模式"}</span>
+          </span>
+          <span
+            className={`relative h-4 w-7 shrink-0 rounded-full transition-colors ${
+              isDark ? "bg-pink-500" : "bg-gray-300"
+            }`}
+          >
+            <span
+              className={`absolute top-0.5 h-3 w-3 rounded-full bg-white transition-all ${
+                isDark ? "left-3.5" : "left-0.5"
+              }`}
+            />
+          </span>
         </button>
+
+        {/* 品牌位：图标 + 名称/版本两行，占满宽度。
+            侧边栏只有 160px，放不下右侧艺术字，所以这里只用图标；完整 lockup 在关于页与欢迎页。 */}
+        <div className="flex items-center gap-2 px-1">
+          <img
+            src="/icon/96.png"
+            alt="哔哩哔哩记忆"
+            className="h-8 w-8 shrink-0 rounded-lg"
+          />
+          <div className="min-w-0">
+            <p className="truncate text-xs font-medium leading-tight text-gray-700 dark:text-neutral-200">
+              哔哩哔哩记忆
+            </p>
+            <p className="text-[11px] leading-tight text-gray-500 dark:text-neutral-400">
+              {version ? `v${version}` : ""}
+            </p>
+          </div>
+        </div>
       </div>
     </div>
   );

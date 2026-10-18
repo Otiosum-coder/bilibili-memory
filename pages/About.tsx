@@ -22,9 +22,20 @@ export const About: React.FC = () => {
 
   return (
     <div className="max-w-[800px] mx-auto p-6">
-      <h1 className="text-3xl font-bold mb-6">
-        关于哔哩哔哩记忆{version ? ` v${version}` : ""}
-      </h1>
+      {/* 品牌 lockup：图标 + 「bilibili memory」艺术字 + 标语，右侧配版本号。
+          侧边栏只有 160px 放不下艺术字，所以完整组合放在这里。 */}
+      <div className="mb-6 flex flex-wrap items-center gap-4">
+        <img
+          src="/brand/lockup.png"
+          alt="哔哩哔哩记忆 · 留住你在 B 站的每一份喜欢"
+          className="w-full max-w-[420px]"
+        />
+        {version ? (
+          <span className="rounded-full border border-gray-200 bg-gray-50 px-2.5 py-1 text-sm text-gray-500 dark:border-neutral-700 dark:bg-neutral-800 dark:text-neutral-400">
+            v{version}
+          </span>
+        ) : null}
+      </div>
 
       <div className="space-y-6">
         <section>
