@@ -40,6 +40,8 @@ import {
   resolveFavResourceState,
 } from "../utils/favResourceInfo";
 import { PLACEHOLDER_COVER_PATH } from "../utils/imageUrl";
+import { getStorageValue } from "../utils/storage";
+import { FAV_RECOVERY_PROGRESS } from "../utils/constants";
 import { formatInteractionDuration } from "../utils/interactionQuery";
 import { FavoriteFolderSyncModal } from "../components/FavoriteFolderSyncModal";
 import { AllFavoriteFoldersSyncModal } from "../components/AllFavoriteFoldersSyncModal";
@@ -60,6 +62,41 @@ export const Favorites = () => {
   const [clearTargetFolder, setClearTargetFolder] = useState<FavoriteFolder | null>(null);
   const [isClearingFolder, setIsClearingFolder] = useState(false);
   const [isRecovering, setIsRecovering] = useState(false);
+  /** 恢复进度。后台每处理完一批就写一次 storage，页面轮询显示，避免长时间无反馈 */
+  const [recoveryProgress, setRecoveryProgress] = useState<{
+    done: number;
+    total: number;
+    recovered: number;
+  } | null>(null);
+
+  // 恢复期间轮询进度。500ms 足够顺滑，也只读一个 storage 键，不会给后台压力
+  useEffect(() => {
+    if (!isRecovering) {
+      setRecoveryProgress(null);
+      return;
+    }
+    let active = true;
+    const tick = async () => {
+      const stored = await getStorageValue<{
+        status: string;
+        done: number;
+        total: number;
+        recovered: number;
+      } | null>(FAV_RECOVERY_PROGRESS, null);
+      if (!active || !stored || !stored.total) return;
+      setRecoveryProgress({
+        done: stored.done ?? 0,
+        total: stored.total ?? 0,
+        recovered: stored.recovered ?? 0,
+      });
+    };
+    void tick();
+    const timer = window.setInterval(() => void tick(), 500);
+    return () => {
+      active = false;
+      window.clearInterval(timer);
+    };
+  }, [isRecovering]);
   const [recoveryResult, setRecoveryResult] = useState<{
     attempted: number;
     recovered: number;
@@ -702,8 +739,39 @@ export const Favorites = () => {
                   title="用第三方档案（biliplus / jijidown）与本地分P标题尝试找回已失效内容的标题与封面。恢复结果会直接覆盖到本页。需要手动点击，不会自动运行"
                 >
                   <Wand2 className={`h-4 w-4 ${isRecovering ? "animate-pulse" : ""}`} />
-                  {isRecovering ? "恢复中…" : "恢复失效内容"}
+                  {isRecovering
+                    ? recoveryProgress
+                      ? `恢复中 ${recoveryProgress.done}/${recoveryProgress.total}`
+                      : "恢复中…"
+                    : "恢复失效内容"}
                 </button>
+
+                {/* 恢复是长耗时操作（分批请求第三方档案），必须给出可见进度，
+                    否则用户只看到按钮文字变了，分不清是卡死还是慢 */}
+                {isRecovering ? (
+                  <div className="mt-2 w-full">
+                    <div className="h-1.5 w-full overflow-hidden rounded-full bg-gray-200 dark:bg-neutral-700">
+                      <div
+                        className="h-full rounded-full bg-[#fb7299] transition-[width] duration-300"
+                        style={{
+                          width: `${
+                            recoveryProgress && recoveryProgress.total > 0
+                              ? Math.min(
+                                  100,
+                                  Math.round((recoveryProgress.done / recoveryProgress.total) * 100),
+                                )
+                              : 5
+                          }%`,
+                        }}
+                      />
+                    </div>
+                    <p className="mt-1 text-xs text-gray-400 dark:text-neutral-500">
+                      {recoveryProgress
+                        ? `已查询 ${recoveryProgress.done}/${recoveryProgress.total} 条，成功找回 ${recoveryProgress.recovered} 条`
+                        : "正在准备…"}
+                    </p>
+                  </div>
+                ) : null}
 
                 {/* 本地即可算出的诊断数字，无需开控制台就能判断有没有可恢复的内容 */}
                 <span className="text-xs text-gray-400 dark:text-neutral-500">

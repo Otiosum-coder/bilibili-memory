@@ -22,6 +22,7 @@ import {
   FOLLOWING_SYNC_PROGRESS,
   FOLLOWING_AVATAR_ARCHIVE_PROGRESS,
   FAV_COVER_ARCHIVE_PROGRESS,
+  FAV_RECOVERY_PROGRESS,
   FAVORITES_AUTO_SYNC_ENABLED,
   FAVORITES_SYNC_INTERVAL,
   FAVORITES_LAST_SYNC,
@@ -2832,6 +2833,20 @@ export default defineBackground(() => {
       );
       if (candidates.length === 0) return result;
 
+      // 实时进度：页面轮询这个键来显示「已查 X / 共 Y」。
+      // 之前整个流程没有任何反馈，用户只能盯着一个「恢复中…」干等，分不清是卡住还是慢。
+      const progressState = {
+        status: "running" as "running" | "completed",
+        total: candidates.length,
+        done: 0,
+        recovered: 0,
+        startedAt: Date.now(),
+      };
+      const flushProgress = async () => {
+        await setStorageValue(FAV_RECOVERY_PROGRESS, { ...progressState }).catch(() => undefined);
+      };
+      await flushProgress();
+
       // 诊断：确认收藏夹接口到底有没有把分P信息存进来。
       // 分P标题还原是零请求路径，若它一直为 0，说明 `pages` 不在本地记录里。
       const sample = candidates[0];
@@ -2913,6 +2928,10 @@ export default defineBackground(() => {
         );
 
         for (const chunk of chunks) {
+          progressState.done += chunk.length;
+          progressState.recovered = result.recovered;
+          await flushProgress();
+
           const batch = await fetchBiliplusAidInfoWithRetry(chunk, {
             onWait: (waitMs, status) => {
               console.log(

@@ -104,6 +104,8 @@ export const FOLLOWING_AVATAR_ARCHIVE_PROGRESS = "followingAvatarArchiveProgress
 export const FAV_COVER_ARCHIVE_PROGRESS = "favCoverArchiveProgress";
 /** 订阅合集内容的封面归档进度。与收藏封面共用 `assets` 的 cover 类型 */
 export const COLLECTION_COVER_ARCHIVE_PROGRESS = "collectionCoverArchiveProgress";
+/** 失效收藏恢复的实时进度。页面据此轮询显示「已查 X / 共 Y」。 */
+export const FAV_RECOVERY_PROGRESS = "favRecoveryProgress";
 /** 关注/收藏发生变动时是否弹系统通知。默认开启 */
 export const CHANGE_NOTIFICATION_ENABLED = "changeNotificationEnabled";
 

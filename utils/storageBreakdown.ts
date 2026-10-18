@@ -113,7 +113,6 @@ export const buildStorageBreakdown = async (
       note: "阻止已删除的记录在同步时复活，只增不减",
     },
     { label: "收藏消失档案", count: vanished.count, bytes: vanished.bytes },
-    { label: "喜欢的音乐", count: likedMusic.count, bytes: likedMusic.bytes },
   ];
 
   return {

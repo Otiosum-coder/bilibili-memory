@@ -133,7 +133,14 @@ export const runFollowingSync = async (
     const [existing, hadBaseline] = await Promise.all([deps.loadExisting(), deps.hasBaseline()]);
 
     const { next, events } = diffFollowing(existing, collected, {
-      hasBaseline: hadBaseline,
+      // 基线标记为真、但本地**一条记录都没有**时，仍然按"首次建立基线"处理。
+      //
+      // 为什么必须这样：`HAS_FULL_FOLLOWING_SYNC` 只说明"以前同步过"，
+      // 一旦本地 `following` 表因为迁移/清理/扩容变成空的，而标记还在，
+      // 上一行逻辑就会把这批账号全部当成 `isNew` → 一次性刷出成百上千条
+      // 「新增关注」假事件（实测出现过 1132 条）。有基线标记但没基线数据，
+      // 本质上就是没有基线，不该产生事件。
+      hasBaseline: hadBaseline && existing.length > 0,
       syncStartedAt: startedAt,
       // 出错或超限时这里为 false，取关判定会被双重护栏挡住
       fullScanCompleted,
