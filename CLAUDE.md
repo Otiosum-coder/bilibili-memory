@@ -46,8 +46,9 @@ WXT 按目录约定生成多入口 manifest，所有入口共享同一份 Indexe
 | [content.ts](entrypoints/content.ts)                                           | content script (`*.bilibili.com`, `document_start`) | 注入 `injected.js`、转发 `window.postMessage` 到 background、为 history 页面提供 `deleteHistory` RPC（需要 `bili_jct` + `SESSDATA`）                        |
 | [injected.ts](entrypoints/injected.ts)                                         | unlisted page script                                | 重写 `window.fetch` 拦截 `api.bilibili.com/x/v2/history/delete`，把删除事件 `postMessage` 给 content script，从而实现 "B 站网页端删除 → 同步删除插件历史"   |
 | [my-history/](entrypoints/my-history/)                                         | extension page                                      | 主 UI（`my-history.html`），用 `HashRouter` 承载 [pages/](pages/) 下所有页面（详见下方路由表）                                                              |
-| [popup/](entrypoints/popup/)                                                   | browser action popup                                | 触发同步、跳转主页面                                                                                                                                        |
 | [about/](entrypoints/about/), [webdav-tutorial/](entrypoints/webdav-tutorial/) | extension page                                      | 独立的关于页 / WebDAV 教程页                                                                                                                                |
+
+> fork **已移除上游的 `popup/` 入口**：现在点工具栏图标直接打开 `my-history.html`（见 `background.ts` 的 `action.onClicked`）。
 
 manifest 在 [wxt.config.ts](wxt.config.ts) 声明，关键权限：`storage / tabs / cookies / alarms / declarativeNetRequest`，并通过 `referrer.json` 的 DNR 规则改写 Referer 让图片资源（B 站防盗链）能在扩展页面里加载。
 
@@ -65,7 +66,7 @@ manifest 在 [wxt.config.ts](wxt.config.ts) 声明，关键权限：`storage / t
 
 ### 数据层（[utils/db.ts](utils/db.ts)）
 
-单一文件管理整套 IndexedDB（DB `bilibiliHistory`，当前 `version: 10`）。共有 13 个 store：
+单一文件管理整套 IndexedDB（DB `bilibiliHistory`，当前 `version: 11`）。共有 14 个 store：
 
 - `history` (keyPath `id`，最近观看投影；索引 `view_at` / `[view_at, id]`)
 - `historyEvents` (keyPath `event_id`，每次被同步观测到的观看事件)
@@ -80,8 +81,9 @@ manifest 在 [wxt.config.ts](wxt.config.ts) 声明，关键权限：`storage / t
 - `assets` (keyPath `id`，索引 `kind`) — 头像/封面图片字节，**只存本地、不进备份**
 - `vanishedFavResources` (复合 keyPath `[folder_id, id]`，索引 `vanishedAt` / `vanishReason`) — 收藏消失档案
 - `interactions` (keyPath `id` = `${type}:${bvid}`，索引 `type` / `bvid` / `state` / `observed_at` / `[type, observed_at]`) — 点赞 / 投币记录
+- `vanishArchive` (keyPath `id` = `${kind}:${sourceId}`，索引 `kind` / `source` / `vanishedAt` / `reason`) — **统一消失档案**（v11）：收藏 / 订阅合集 / 关注 / 互动的"查不到了"都存这里，每条带消失瞬间的完整快照
 
-后 5 个是 fork 新增（v9 的四个 + v10 的 `interactions`）。判定逻辑（改名/取关/注销、互动消失）一律放在纯函数模块如 `utils/followingDiff.ts` / `utils/interactionDiff.ts` 里，`utils/db.ts` 只做存取，便于单测不依赖 IndexedDB。
+后 6 个是 fork 新增（v9 的四个 + v10 的 `interactions` + v11 的 `vanishArchive`）。判定逻辑（改名/取关/注销、互动消失、档案构造与合并）一律放在纯函数模块如 `utils/followingDiff.ts` / `utils/interactionDiff.ts` / `utils/vanishArchive.ts` 里，`utils/db.ts` 只做存取，便于单测不依赖 IndexedDB。
 
 **改 schema 必须 bump `DB_CONFIG.version` 并在 `onupgradeneeded` 里写迁移分支**。历史写入必须走 `upsertHistorySnapshots()`，同时维护最近投影和观看事件；不能绕开它直接 `put`。当前实现里有兜底 `if (!db.objectStoreNames.contains(...))` 用来修复历史版本里 else-if 互斥导致的 store 缺失，新加 store 时也要补到这段兜底里。`smartMerge*` 系列是 WebDAV 双向同步的合并基元。
 
@@ -93,8 +95,8 @@ manifest 在 [wxt.config.ts](wxt.config.ts) 声明，关键权限：`storage / t
 
 ### 前端（[pages/](pages/) + [components/](components/)）
 
-- 路由由 [entrypoints/my-history/App.tsx](entrypoints/my-history/App.tsx) 用 `HashRouter` 定义：`/`(总览) `/history` `/welcome` `/about` `/settings` `/feedback` `/webdav-sync` `/favorites` `/collections` `/following` `/interactions`。`/welcome` 不显示侧边栏。
-  （fork 已移除上游的 `/reward` 赞赏页、`/cloud-sync` 云同步页，以及 `/ai-search` AI 探索、`/music/*` 听歌、`/vanished` 消失档案页）
+- 路由由 [entrypoints/my-history/App.tsx](entrypoints/my-history/App.tsx) 用 `HashRouter` 定义：`/`(总览) `/history` `/welcome` `/about` `/settings` `/feedback` `/webdav-sync` `/favorites` `/collections` `/following` `/interactions` `/vanished`。`/welcome` 不显示侧边栏。
+  （fork 已移除上游的 `/reward` 赞赏页、`/cloud-sync` 云同步页，以及 `/ai-search` AI 探索、`/music/*` 听歌）
 - 侧边栏菜单在 [components/Sidebar.tsx](components/Sidebar.tsx) 写死，可被 `HIDDEN_MENUS` 隐藏；新增页面要同时改 App.tsx 的 `<Route>` 和 Sidebar 的 `menuList`。
 - 状态管理：除页面本地 `useState` + `browser.storage.local` 外无全局状态库（fork 已移除上游的 zustand `utils/store.ts`，用户身份改为直接读本地 B 站登录态）。
 - 图标统一 `lucide-react`，路径别名 `@/` 指向项目根（见 [tsconfig.json](tsconfig.json) 继承的 `.wxt/tsconfig.json`）。
@@ -115,15 +117,24 @@ fork **已删除**上游的云同步相关代码（`services/`、`utils/apiClien
 上游的 `/music/search` 与 `/music/liked` 页面、`components/SongItem.tsx`、`components/LikedMusicItem.tsx`
 均**已删除**，备份项里的 `likedMusic` 仍保留（数据仍在库里，且旧备份仍可导入）。
 
-### 消失档案页（已移除）
+### 消失档案（[pages/Vanished.tsx](pages/Vanished.tsx) + [utils/vanishArchive.ts](utils/vanishArchive.ts)）
 
-`pages/Vanished.tsx` 与 `/vanished` 路由**已删除**，但**底层机制完整保留**：
+**这是本 fork 最核心的功能**：收藏、订阅合集、关注、互动四处「内容已经查不到」的统一留档页。
 
-- `syncFavoriteFolderResources` 仍然「先留档再移除」，绝不硬删除在线消失的收藏
-- `vanishedFavResources` store、`utils/favVanishedDiff.ts`、备份项都还在
-- `smartMergeFavResources` 的防复活逻辑也还在
+- **只增不删**：写入后即使源记录恢复可访问，档案条目也保留（除非用户主动清理）
+- **每条存完整快照**（`item` 字段）：快照就是「恢复」要写回原 store 的内容，没有快照就无法恢复
+- **读时派生**：页面除读 `vanishArchive` 与旧的 `vanishedFavResources` 外，还会用
+  `collectLiveVanishArchive()` 把源记录里"已失效 / 已注销 / 稿件已删"的条目实时汇出来——
+  否则用户本地明明有这些内容，页面却是空的
+- **合并规则**（`mergeVanishArchive`）：`vanishedAt` 取更早、`duration` 与快照取**有值/更丰富**的一边、
+  `invalidationUnproven` 一边为真即为真
+- **默认进备份**（`DEFAULT_*_BACKUP_ITEMS` 里 `vanishArchive: true`）：它是内容消失后的唯一副本，
+  与可再抓的图片缓存性质相反
+- **恢复**：`restoreVanishArchiveItems()` 按 `kind` 把快照写回 `favResources` /
+  `subscribedCollectionResources` / `following` / `interactions`，一个事务内完成，任一条失败整体回滚
 
-也就是说页面没了，但「收藏消失时数据不会被抹掉」这条保护依然生效。数据可在数据面板或备份文件中查看。
+底层的留存保护也仍然生效：`syncFavoriteFolderResources` 依旧「先留档再移除」，
+`smartMergeFavResources` 会跳过已在档案里的记录（防止远端备份把已消失的收藏"复活"回来）。
 
 ## 风格约定
 
