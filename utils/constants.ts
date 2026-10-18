@@ -95,7 +95,7 @@ export const DEFAULT_FAV_SYNC_INTERVAL_MINUTES = 60 * 12;
 export const DEFAULT_FAV_FULL_SYNC_INTERVAL_MINUTES = 60 * 24 * 7;
 
 // 注销前名字：第三方曾用名查询（aicu.cc）。
-// 默认关闭、仅用户主动触发、仅限名字已是占位文案的账号。见 docs/following-tracker-design.md 4.1
+// 默认关闭、仅用户主动触发、仅限名字已是占位文案的账号。
 export const THIRD_PARTY_NAME_LOOKUP_ENABLED = "thirdPartyNameLookupEnabled";
 export const DEFAULT_THIRD_PARTY_NAME_LOOKUP_ENABLED = false;
 

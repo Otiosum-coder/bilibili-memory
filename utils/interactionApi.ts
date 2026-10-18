@@ -8,7 +8,7 @@ import type { InteractionType, RawInteractionEntry } from "./types";
 /**
  * 点赞 / 投币列表与探测的接口层。
  *
- * ## 实测结论（匿名可复现，详见 docs/interaction-tracker-design.md）
+ * ## 实测结论（匿名可复现）
  *
  * - `x/space/like/video` 返回 `data.list`，元素是完整稿件详情；
  *   `x/space/coin/video` 的 `data` **直接是数组**。两者形状不同，本层负责抹平。

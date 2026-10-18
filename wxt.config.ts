@@ -10,7 +10,7 @@ export default defineConfig({
     // 就会变成另一个扩展——IndexedDB 与 storage.local 全部按 ID 隔离，看起来像数据丢了。
     // 写死公钥后 ID 恒定，与路径、机器都无关。
     //
-    // 私钥不要提交（只有上架商店签名才需要），备份在本地 docs/extension-key.md 有说明。
+    // 私钥不要提交（只有上架商店签名才需要），请另行离线备份。
     key: "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAu111GTqYb7XKFWcDaAloxx4EN6SMHdJ6zijaLwBBioSSUdGUI893iQg8ShYYaoX51bPe2rC9iGU6yvLqaJblEqE1fsNHSRSk0TE1z7qeLXl4qD9+nRND2dE7XrxTlwkd3Jp7/uqhGyErzMe/0MeLba3xuF52U/1WOU3t4Mzks+twcKUFGYsd7aQlrUc+BadN3Wgnr3rwbYnBngW6K5XPWBoyH4ybUqGUj/1m1RcBoEjoLhVPkGs4Pytp9RIyODLU/tCJiYW+4yfq/EBHXvd12qeiMR2lRQ08Wh2CRyJO3ApkIY/HNc/bxSIS+A4lALTqzuTB5+qXSmE0tWaxXKBHlwIDAQAB",
     name: "Bilibili Memory",
     description:

@@ -15,6 +15,27 @@ stats-*.json
 .wxt
 # web-ext.config.ts
 
+# 环境变量与本地配置（防止以后误建）
+.env
+.env.*
+*.local
+
+# 开发过程文档：不随仓库发布
+# - CLAUDE.md 是给 AI 助手看的项目说明，含内部评审过程
+# - docs/ 是开发期的设计文档与排障记录
+CLAUDE.md
+docs/
+
+# 品牌素材的中间产物：都能由 branding/*.py 从品牌源图重新生成
+# （只保留 wordmark.png —— 它是重拼 lockup 的输入，源图里没有独立文件）
+branding/assets/icon-source.png
+branding/assets/lockup-full.png
+branding/assets/icon-512.png
+
+# 构建缓存
+*.tsbuildinfo
+coverage
+
 # Editor directories and files
 .vscode/*
 !.vscode/extensions.json
