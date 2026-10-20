@@ -56,6 +56,16 @@ export default defineConfig({
         gecko: {
           id: "bilibili-memory@otiosum-coder",
           strict_min_version: "128.0",
+          // AMO 自 2025-11-03 起强制要求：新提交的扩展必须声明收集/传输哪些数据。
+          // 缺这个字段，上传时会直接报
+          //   The "data_collection_permissions" property is missing.
+          //
+          // 为什么填 none：本扩展默认不向任何服务器传输数据，所有内容只写进本机 IndexedDB。
+          // WebDAV 同步是可选的、由用户自己填写服务器地址并主动触发的「导出到自己的服务器」，
+          // 不属于扩展在收集数据。该行为已在 PRIVACY.md 与 AMO 提交说明里明确披露。
+          data_collection_permissions: {
+            required: ["none"],
+          },
         },
       },
     }),
