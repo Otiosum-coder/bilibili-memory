@@ -64,43 +64,47 @@ export const UpdateNoticeModal = ({ onOpenChange, onReady }: UpdateNoticeModalPr
   }
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm px-4 animate-in fade-in duration-200">
-      <div className="relative w-full max-w-md rounded-xl border border-transparent bg-white p-6 shadow-xl dark:border-neutral-800 dark:bg-neutral-900">
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm px-4 py-6 animate-in fade-in duration-200">
+      {/* 更新日志可能很长，所以整张卡片限高 + 只有内容区滚动，
+          底部「我知道了」按钮永远可见——之前整卡不限高，条目一多按钮就被顶到屏幕外。 */}
+      <div className="relative flex max-h-full w-full max-w-md flex-col rounded-xl border border-transparent bg-white p-6 shadow-xl dark:border-neutral-800 dark:bg-neutral-900">
         <button
           type="button"
           onClick={handleClose}
-          className="absolute right-4 top-4 inline-flex h-8 w-8 items-center justify-center rounded-md text-gray-400 transition-colors hover:bg-gray-100 hover:text-gray-700 dark:text-neutral-500 dark:hover:bg-neutral-800 dark:hover:text-neutral-200"
+          className="absolute right-4 top-4 z-10 inline-flex h-8 w-8 items-center justify-center rounded-md text-gray-400 transition-colors hover:bg-gray-100 hover:text-gray-700 dark:text-neutral-500 dark:hover:bg-neutral-800 dark:hover:text-neutral-200"
           aria-label="关闭更新提示"
         >
           <X className="h-4 w-4" />
         </button>
 
-        <div className="pr-10">
-          <p className="mb-2 text-sm font-medium text-pink-500 dark:text-pink-600">版本更新</p>
-          <h2 className="text-xl font-bold text-gray-900 dark:text-neutral-100">
-            v{latestUpdate.version}
-          </h2>
-          <p className="mt-1 text-sm text-gray-500 dark:text-neutral-400">{latestUpdate.date}</p>
-        </div>
+        <div className="min-h-0 flex-1 overflow-y-auto">
+          <div className="pr-10">
+            <p className="mb-2 text-sm font-medium text-pink-500 dark:text-pink-600">版本更新</p>
+            <h2 className="text-xl font-bold text-gray-900 dark:text-neutral-100">
+              v{latestUpdate.version}
+            </h2>
+            <p className="mt-1 text-sm text-gray-500 dark:text-neutral-400">{latestUpdate.date}</p>
+          </div>
 
-        <div className="mt-5 rounded-lg bg-gray-50 p-4 dark:bg-neutral-800/70">
-          <ul className="space-y-2">
-            {latestUpdate.changes.map((change) => (
-              <li
-                key={change}
-                className="flex gap-2 text-sm leading-relaxed text-gray-700 dark:text-neutral-200"
-              >
-                <span className="mt-2 h-1.5 w-1.5 flex-shrink-0 rounded-full bg-pink-500" />
-                <span>{change}</span>
-              </li>
-            ))}
-          </ul>
+          <div className="mt-5 rounded-lg bg-gray-50 p-4 dark:bg-neutral-800/70">
+            <ul className="space-y-2">
+              {latestUpdate.changes.map((change) => (
+                <li
+                  key={change}
+                  className="flex gap-2 text-sm leading-relaxed text-gray-700 dark:text-neutral-200"
+                >
+                  <span className="mt-2 h-1.5 w-1.5 flex-shrink-0 rounded-full bg-pink-500" />
+                  <span>{change}</span>
+                </li>
+              ))}
+            </ul>
+          </div>
         </div>
 
         <button
           type="button"
           onClick={handleClose}
-          className="mt-6 w-full rounded-lg bg-pink-500 dark:bg-pink-600 px-4 py-2.5 text-sm font-medium text-white shadow-sm transition-colors hover:bg-pink-600"
+          className="mt-4 w-full shrink-0 rounded-lg bg-pink-500 dark:bg-pink-600 px-4 py-2.5 text-sm font-medium text-white shadow-sm transition-colors hover:bg-pink-600"
         >
           我知道了
         </button>

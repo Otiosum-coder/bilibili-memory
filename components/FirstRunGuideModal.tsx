@@ -257,11 +257,13 @@ export const FirstRunGuideModal = ({ open, onComplete, onNavigate }: FirstRunGui
         aria-labelledby="first-run-guide-title"
         tabIndex={-1}
         style={{ left: popoverPosition.left, top: popoverPosition.top, width: POPOVER_WIDTH }}
-        className={`fixed z-[63] max-h-[calc(100vh-2rem)] max-w-[calc(100vw-2rem)] overflow-y-auto rounded-xl border border-gray-200 bg-white shadow-2xl outline-none dark:border-neutral-700 dark:bg-neutral-900 ${
+        className={`fixed z-[63] flex max-h-[calc(100vh-2rem)] max-w-[calc(100vw-2rem)] flex-col rounded-xl border border-gray-200 bg-white shadow-2xl outline-none dark:border-neutral-700 dark:bg-neutral-900 ${
           isPositionReady ? "visible opacity-100" : "invisible opacity-0"
         }`}
       >
-        <div className="border-b border-gray-100 p-5 dark:border-neutral-800">
+        {/* 只有内容区滚动，「跳过 / 上一步 / 下一步」这一行固定在底部。
+            之前整卡 overflow-y-auto，内容一长按钮就被滚出视口。 */}
+        <div className="min-h-0 flex-1 overflow-y-auto border-b border-gray-100 p-5 dark:border-neutral-800">
           <button
             type="button"
             onClick={onComplete}
@@ -291,7 +293,7 @@ export const FirstRunGuideModal = ({ open, onComplete, onNavigate }: FirstRunGui
           </p>
         </div>
 
-        <div className="flex items-center justify-between gap-3 bg-gray-50 px-5 py-4 dark:bg-neutral-950/50">
+        <div className="flex shrink-0 items-center justify-between gap-3 bg-gray-50 px-5 py-4 dark:bg-neutral-950/50">
           <span className="text-xs text-gray-500 dark:text-neutral-400">
             {step + 1} / {steps.length}
           </span>
