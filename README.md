@@ -9,7 +9,7 @@
 
   <p>
     <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-green?style=flat-square" alt="License" /></a>
-    <img src="https://img.shields.io/badge/Chrome-支持-blue?style=flat-square" alt="Chrome" />
+    <a href="https://chromewebstore.google.com/detail/jdmogkkaendjkakjipamlnhinmjpolkl"><img src="https://img.shields.io/badge/Chrome-商店安装-blue?style=flat-square" alt="Chrome Web Store" /></a>
     <img src="https://img.shields.io/badge/Edge-支持-blue?style=flat-square" alt="Edge" />
     <img src="https://img.shields.io/badge/Firefox-支持-orange?style=flat-square" alt="Firefox" />
   </p>
@@ -92,7 +92,19 @@ B 站的很多东西**默认都是会消失的**：
 
 ## 安装
 
-本项目未上架任何浏览器商店，需要以「已解压扩展」方式加载：
+### 从浏览器商店安装（推荐）
+
+| 浏览器 | 安装 |
+| --- | --- |
+| **Chrome** | <https://chromewebstore.google.com/detail/jdmogkkaendjkakjipamlnhinmjpolkl> |
+| **Edge** | 上架审核中 |
+| **Firefox** | 上架审核中 |
+
+商店版会自动更新，推荐优先使用。
+
+### 手动安装（开发者模式）
+
+如果你用的浏览器不在上面，或想用未上架的最新构建：
 
 ```bash
 pnpm install
@@ -113,6 +125,8 @@ npm run build
 3. 点「加载已解压的扩展程序」，选择 `.output/chrome-mv3`
 
 Firefox 用 `pnpm build:firefox`，选择 `.output/firefox-mv2`（或 `firefox-mv3`）。
+
+> 手动安装的扩展与商店版是**两个独立实例**（扩展 ID 不同），数据互不相通。选定一种方式后建议保持一致。
 
 ## 使用方法
 
