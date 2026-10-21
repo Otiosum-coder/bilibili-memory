@@ -10,7 +10,7 @@
   <p>
     <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-green?style=flat-square" alt="License" /></a>
     <a href="https://chromewebstore.google.com/detail/jdmogkkaendjkakjipamlnhinmjpolkl"><img src="https://img.shields.io/badge/Chrome-商店安装-blue?style=flat-square" alt="Chrome Web Store" /></a>
-    <img src="https://img.shields.io/badge/Edge-审核中-blue?style=flat-square" alt="Edge" />
+    <a href="https://microsoftedge.microsoft.com/addons/detail/mokkmblpfodpmmkndmbfjnmiknmlokah"><img src="https://img.shields.io/badge/Edge-商店安装-blue?style=flat-square" alt="Edge Add-ons" /></a>
     <img src="https://img.shields.io/badge/Firefox-手动安装-orange?style=flat-square" alt="Firefox" />
   </p>
 </div>
@@ -97,7 +97,7 @@ B 站的很多东西**默认都是会消失的**：
 | 浏览器 | 安装 |
 | --- | --- |
 | **Chrome** | <https://chromewebstore.google.com/detail/jdmogkkaendjkakjipamlnhinmjpolkl> |
-| **Edge** | 上架审核中（审核通过后会更新链接） |
+| **Edge** | <https://microsoftedge.microsoft.com/addons/detail/mokkmblpfodpmmkndmbfjnmiknmlokah> |
 | **Firefox** | 暂未上架，请按下方「手动安装」使用 |
 
 商店版会自动更新，推荐优先使用。
