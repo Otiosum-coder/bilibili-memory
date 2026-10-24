@@ -36,6 +36,14 @@ branding/assets/icon-512.png
 *.tsbuildinfo
 coverage
 
+# 本地曾用名数据：从第三方快照切片而来，只在本机使用，绝不提交
+# - local-data/ 是切片脚本的输出目录（tools/hname-build.mjs）
+# - *.tsv 是原始数据文件（放在仓库外，这里兜底防误加）
+# - hname-*.json 覆盖切片及其可能的临时产物
+local-data/
+*.tsv
+hname-*.json
+
 # Editor directories and files
 .vscode/*
 !.vscode/extensions.json

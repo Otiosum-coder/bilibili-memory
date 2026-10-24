@@ -89,6 +89,8 @@ import {
   SubscribedCollection,
 } from "@/utils/types";
 import { LocalHistoryBackupPanel } from "@/components/LocalHistoryBackupPanel";
+import { NameArchivePanel } from "@/components/NameArchivePanel";
+import { NAME_ARCHIVE_ENABLED } from "@/utils/nameArchive";
 import { BackupItemsPicker } from "@/components/BackupItemsPicker";
 import { buildBackupPreview, formatBackupPreview } from "@/utils/backupPreview";
 import {
@@ -189,6 +191,18 @@ const DATA_ITEMS: DataItemDef[] = [
     merge: smartMergeVanishArchive,
   },
 ];
+
+/**
+ * 备份/同步内容选择器里展示的数据项。
+ *
+ * `vanishedFavResources` 是旧版 store：它的数据在写入 `vanishArchive` 时已被合并，
+ * 继续作为独立可选项只会让界面出现两个同名「消失档案」。所以从选择器里隐藏，
+ * 但仍然保留在 `DATA_ITEMS` 中——旧备份文件的导入/合并按 JSON 字段名直接处理，
+ * 不依赖这个列表，删掉会破坏对老数据的兼容。
+ */
+const SELECTABLE_DATA_ITEMS = DATA_ITEMS.filter(
+  (item) => item.key !== "vanishedFavResources",
+);
 
 const HISTORY_V2_FILE = "history-v2.json";
 
@@ -1039,6 +1053,27 @@ const WebDavSync = () => {
                 <LocalHistoryBackupPanel />
               </div>
             </section>
+            {/*
+              本地曾用名存档：只在本地开发/自用构建出现（NAME_ARCHIVE_ENABLED）。
+              商店构建里这一整段被编译期常量裁掉，面板不会渲染。
+            */}
+            {NAME_ARCHIVE_ENABLED ? (
+              <section className="space-y-3" aria-labelledby="name-archive-heading">
+                <div>
+                  <h2
+                    id="name-archive-heading"
+                    className="text-base font-semibold text-gray-950 dark:text-neutral-100"
+                  >
+                    曾用名存档
+                  </h2>
+                  <p className="mt-1 text-sm text-gray-600 dark:text-neutral-400">
+                    导入本机切片后，关注列表的卡片会显示曾用名；数据只存在本机，不参与同步与备份。
+                  </p>
+                </div>
+
+                <NameArchivePanel />
+              </section>
+            ) : null}
             <section className="space-y-3" aria-labelledby="json-heading">
               <div>
                 <h2
@@ -1074,14 +1109,16 @@ const WebDavSync = () => {
                       备份内容
                     </p>
                     <BackupItemsPicker
-                      options={DATA_ITEMS.map((item) => ({ key: item.key, label: item.label }))}
+                      options={SELECTABLE_DATA_ITEMS.map((item) => ({
+                        key: item.key,
+                        label: item.label,
+                      }))}
                       value={manualBackupItems}
                       onChange={(next) => {
                         setManualBackupItems(next);
                         void setStorageValue(MANUAL_BACKUP_ITEMS, next);
                       }}
                       scopeHint="只影响这里下载的 JSON 备份文件，不影响本地目录与 WebDAV。归档图片不在其中——它们只随本地目录备份写进 images/ 目录。"
-                      hints={{ vanishedFavResources: "整条从收藏夹消失的记录" }}
                     />
                   </div>
 
@@ -1471,14 +1508,16 @@ const WebDavSync = () => {
                         之前它被放在"手动备份"一侧、只写"同步内容"，用户改完这里会
                         连带改掉自动同步的范围，界面上完全看不出来。 */}
                     <BackupItemsPicker
-                      options={DATA_ITEMS.map((item) => ({ key: item.key, label: item.label }))}
+                      options={SELECTABLE_DATA_ITEMS.map((item) => ({
+                        key: item.key,
+                        label: item.label,
+                      }))}
                       value={selectedKeys}
                       onChange={(next) => {
                         setSelectedKeys(next);
                         void setStorageValue(WEBDAV_SYNC_ITEMS, next);
                       }}
                       scopeHint="自动同步与手动同步共用这份选择，改动会同时生效。归档图片不在备份内容里——它们只随本地目录备份写进 images/ 目录。"
-                      hints={{ vanishedFavResources: "整条从收藏夹消失的记录" }}
                     />
                   </div>
 
