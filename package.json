@@ -23,6 +23,8 @@
     "zip:firefox": "wxt --mode production zip -b firefox",
     "test": "vitest run",
     "compile": "tsc --noEmit",
+    "hname:build": "node tools/hname-build.mjs",
+    "check:private-data": "node tools/hname-guard.mjs",
     "format": "prettier --write .",
     "format:check": "prettier --check .",
     "postinstall": "wxt prepare"

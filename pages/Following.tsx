@@ -6,6 +6,7 @@ import { NameHistoryPopover } from "../components/NameHistoryPopover";
 import { createAssetObjectUrl } from "../utils/assetArchive";
 import { FOLLOWING_LAST_SYNC, FOLLOWING_SYNC_PROGRESS } from "../utils/constants";
 import { getAllFollowing } from "../utils/db";
+import { applyArchiveNames, loadNameArchive, NAME_ARCHIVE_ENABLED } from "../utils/nameArchive";
 import {
   FOLLOWING_STATUS_LABEL,
   buildFollowingStats,
@@ -248,6 +249,12 @@ export const Following = () => {
   const [syncing, setSyncing] = useState(false);
   const [lastSyncAt, setLastSyncAt] = useState<number | null>(null);
   const [progress, setProgress] = useState<FollowingSyncProgress | null>(null);
+  /**
+   * 本地曾用名存档（只有本地构建会加载）。导入后：
+   * - 卡片上的「曾用名 N」徽章与浮层的「第三方存档」区块自动出现；
+   * - 搜索框按旧名也能搜到人（queryFollowing 本来就匹配 thirdPartyNames）。
+   */
+  const [archiveEntries, setArchiveEntries] = useState<Map<number, string[]> | null>(null);
 
   const load = useCallback(async () => {
     setLoading(true);
@@ -272,7 +279,34 @@ export const Following = () => {
     void load();
   }, [load]);
 
-  const stats = useMemo(() => buildFollowingStats(items), [items]);
+  useEffect(() => {
+    if (!NAME_ARCHIVE_ENABLED) return;
+    let cancelled = false;
+    void loadNameArchive()
+      .then((archive) => {
+        if (!cancelled) setArchiveEntries(archive?.entries ?? null);
+      })
+      .catch((error) => {
+        console.warn("加载曾用名存档失败:", error);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  /**
+   * 把存档名字叠加到渲染用的数据上。没有存档时直接用原数组，
+   * 避免对上千条记录做无意义的复制。
+   */
+  const displayItems = useMemo(
+    () =>
+      archiveEntries
+        ? items.map((item) => applyArchiveNames(item, archiveEntries.get(item.mid)))
+        : items,
+    [items, archiveEntries],
+  );
+
+  const stats = useMemo(() => buildFollowingStats(displayItems), [displayItems]);
 
   const filterOptions = useMemo(
     () => [
@@ -285,8 +319,8 @@ export const Following = () => {
   );
 
   const filtered = useMemo(
-    () => queryFollowing({ items, keyword, filter, sort }),
-    [items, keyword, filter, sort],
+    () => queryFollowing({ items: displayItems, keyword, filter, sort }),
+    [displayItems, keyword, filter, sort],
   );
 
   const page = useMemo(

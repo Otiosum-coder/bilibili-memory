@@ -99,6 +99,10 @@ export const DEFAULT_FAV_FULL_SYNC_INTERVAL_MINUTES = 60 * 24 * 7;
 export const THIRD_PARTY_NAME_LOOKUP_ENABLED = "thirdPartyNameLookupEnabled";
 export const DEFAULT_THIRD_PARTY_NAME_LOOKUP_ENABLED = false;
 
+// 本地曾用名存档（仅本地构建启用）：由 tools/hname-build.mjs 生成的切片，
+// 导入后只写 storage.local，不上传、不进备份、不随扩展包分发。见 utils/nameArchive.ts。
+export const NAME_ARCHIVE_DATA = "nameArchiveData";
+
 // 图片字节归档（头像 / 收藏封面）。字节只存本地，不进 WebDAV 与本地目录备份
 export const FOLLOWING_AVATAR_ARCHIVE_PROGRESS = "followingAvatarArchiveProgress";
 export const FAV_COVER_ARCHIVE_PROGRESS = "favCoverArchiveProgress";
