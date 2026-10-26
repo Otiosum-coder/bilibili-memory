@@ -60,16 +60,16 @@ export default defineConfig({
           // 缺这个字段，上传时会直接报
           //   The "data_collection_permissions" property is missing.
           //
-          // 为什么填 none：本扩展默认不向任何服务器传输数据，所有内容只写进本机 IndexedDB。
-          // WebDAV 同步是可选的、由用户自己填写服务器地址并主动触发的「导出到自己的服务器」，
-          // 不属于扩展在收集数据。该行为已在 PRIVACY.md 与 AMO 提交说明里明确披露。
-          //
-          // ⚠️ 注意（发版前核对）：v0.4 起新增「关注列表曾用名查询」——用户在设置页开启并
-          // 点击查询时，会把该关注用户的 UID 发送到第三方 api.aicu.cc（默认关闭、需知情同意、
-          // 逐条限速、可随时停止）。这不属于扩展"收集"数据，但确实会向第三方传输一个标识符；
-          // 提交 AMO / Chrome 商店时需在隐私说明里同步披露，若审核方要求，需重新评估这里的取值。
+          // 本版取值说明（v0.4.0）：
+          // - required: ["none"] —— 扩展默认不向任何服务器传输数据，所有内容只写进本机；
+          // - optional: ["personallyIdentifyingInfo"] —— 「关注列表曾用名查询」由用户在设置页
+          //   显式开启并同意后才可用，查询时会把**关注用户的 UID**（个人标识符）发送到
+          //   第三方档案 api.aicu.cc。它是可选项，因此放在 optional，而不是 required。
+          // WebDAV 同步仍是用户自己填地址、主动触发的导出，不计入这里。
+          // 提交 AMO 时需在隐私说明中同步披露该可选传输行为。
           data_collection_permissions: {
             required: ["none"],
+            optional: ["personallyIdentifyingInfo"],
           },
         },
       },

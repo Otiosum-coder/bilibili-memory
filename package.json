@@ -2,7 +2,7 @@
   "name": "bilibili-memory",
   "description": "本地永久保存 B 站观看历史、收藏夹、订阅合集、关注列表与点赞/投币记录，并在内容查不到时留下完整快照，防止无从追溯。",
   "private": true,
-  "version": "0.3.1",
+  "version": "0.4.0",
   "author": "Otiosum-coder",
   "license": "MIT",
   "repository": {
