@@ -1,17 +1,23 @@
 import { defineConfig } from "wxt";
 
+// 商店包（wxt zip）里**不能**带写死的 `key`：
+// Chrome Web Store 会用商店条目自己的公钥校验，包里带一个不同的 key 会直接报
+// 「清单中 "key" 字段的值与当前内容不符」。0.3.1 的商店包同样没有 key。
+// 只在开发/普通构建里保留 key，保证本地自用扩展 ID 恒定（baadkghamjpcngkgcjfhjoniflnakple）。
+const IS_STORE_PACKAGE =
+  process.argv.includes("zip") || process.env.npm_lifecycle_event === "zip";
+
 // See https://wxt.dev/api/config.html
 export default defineConfig({
   modules: ["@wxt-dev/module-react"],
   manifest: ({ browser }) => ({
-    // 固定的扩展 ID = `baadkghamjpcngkgcjfhjoniflnakple`
-    //
-    // 为什么需要它：未打包扩展的 ID 由**绝对路径**的 SHA256 算出，于是"换个文件夹名"
-    // 就会变成另一个扩展——IndexedDB 与 storage.local 全部按 ID 隔离，看起来像数据丢了。
-    // 写死公钥后 ID 恒定，与路径、机器都无关。
-    //
-    // 私钥不要提交（只有上架商店签名才需要），请另行离线备份。
-    key: "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAu111GTqYb7XKFWcDaAloxx4EN6SMHdJ6zijaLwBBioSSUdGUI893iQg8ShYYaoX51bPe2rC9iGU6yvLqaJblEqE1fsNHSRSk0TE1z7qeLXl4qD9+nRND2dE7XrxTlwkd3Jp7/uqhGyErzMe/0MeLba3xuF52U/1WOU3t4Mzks+twcKUFGYsd7aQlrUc+BadN3Wgnr3rwbYnBngW6K5XPWBoyH4ybUqGUj/1m1RcBoEjoLhVPkGs4Pytp9RIyODLU/tCJiYW+4yfq/EBHXvd12qeiMR2lRQ08Wh2CRyJO3ApkIY/HNc/bxSIS+A4lALTqzuTB5+qXSmE0tWaxXKBHlwIDAQAB",
+    // 写死公钥后，未打包扩展的 ID 恒定，与路径、机器无关（数据不会"看似丢失"）。
+    // 注意：商店打包（zip）会自动省略这个字段，见上方 IS_STORE_PACKAGE。
+    ...(IS_STORE_PACKAGE
+      ? {}
+      : {
+          key: "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAu111GTqYb7XKFWcDaAloxx4EN6SMHdJ6zijaLwBBioSSUdGUI893iQg8ShYYaoX51bPe2rC9iGU6yvLqaJblEqE1fsNHSRSk0TE1z7qeLXl4qD9+nRND2dE7XrxTlwkd3Jp7/uqhGyErzMe/0MeLba3xuF52U/1WOU3t4Mzks+twcKUFGYsd7aQlrUc+BadN3Wgnr3rwbYnBngW6K5XPWBoyH4ybUqGUj/1m1RcBoEjoLhVPkGs4Pytp9RIyODLU/tCJiYW+4yfq/EBHXvd12qeiMR2lRQ08Wh2CRyJO3ApkIY/HNc/bxSIS+A4lALTqzuTB5+qXSmE0tWaxXKBHlwIDAQAB",
+        }),
     name: "Bilibili Memory",
     description:
       "本地永久保存 B 站观看历史、收藏夹、订阅合集、关注列表与点赞/投币记录；内容被删除、下架或账号注销后仍可追溯，并可随时恢复到原页面。",
