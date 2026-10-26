@@ -39,6 +39,7 @@ import {
   resolveFavResourceHint,
   resolveFavResourceState,
 } from "../utils/favResourceInfo";
+import { FavResourceHoverPanel } from "../components/FavResourceHoverPanel";
 import { PLACEHOLDER_COVER_PATH } from "../utils/imageUrl";
 import { getStorageValue } from "../utils/storage";
 import { FAV_RECOVERY_PROGRESS } from "../utils/constants";
@@ -47,6 +48,51 @@ import { FavoriteFolderSyncModal } from "../components/FavoriteFolderSyncModal";
 import { AllFavoriteFoldersSyncModal } from "../components/AllFavoriteFoldersSyncModal";
 import { ClearFavoriteFolderModal } from "../components/ClearFavoriteFolderModal";
 import { DeleteFavoriteFolderModal } from "../components/DeleteFavoriteFolderModal";
+
+/**
+ * storage 里的恢复进度超过这个时间没有心跳，就认为任务已经随 Service Worker
+ * 重启而消失（旧版本结束时只写 running、不写完成，会留下"僵尸进度"）。
+ */
+const FAV_RECOVERY_STALE_MS = 120_000;
+
+/** 恢复流水线的阶段名。页面据此显示「正在 biliplus 查询 20/83」而不是一个不动的数字 */
+const RECOVERY_PHASE_LABEL: Record<string, string> = {
+  local: "本地比对",
+  biliplus: "biliplus 查询",
+  public: "公开接口补全",
+  jijidown: "jijidown 补全",
+  archiving: "归档封面",
+  done: "收尾",
+};
+
+interface RecoveryProgressView {
+  done: number;
+  total: number;
+  recovered: number;
+  phase?: string;
+  phaseDone?: number;
+  phaseTotal?: number;
+}
+
+const recoveryPercent = (progress: RecoveryProgressView | null): number => {
+  if (!progress) return 5;
+  if (progress.phaseTotal && progress.phaseTotal > 0) {
+    return Math.min(100, Math.round(((progress.phaseDone ?? 0) / progress.phaseTotal) * 100));
+  }
+  if (progress.total > 0) {
+    return Math.min(100, Math.round((progress.done / progress.total) * 100));
+  }
+  return 5;
+};
+
+const recoveryProgressText = (progress: RecoveryProgressView | null): string => {
+  if (!progress) return "正在准备…";
+  const label = progress.phase ? RECOVERY_PHASE_LABEL[progress.phase] : undefined;
+  if (label && progress.phaseTotal) {
+    return `${label} ${progress.phaseDone ?? 0}/${progress.phaseTotal} · 已恢复 ${progress.recovered} 条`;
+  }
+  return `已查询 ${progress.done}/${progress.total} 条，成功找回 ${progress.recovered} 条`;
+};
 
 export const Favorites = () => {
   const [folders, setFolders] = useState<FavoriteFolder[]>([]);
@@ -62,12 +108,69 @@ export const Favorites = () => {
   const [clearTargetFolder, setClearTargetFolder] = useState<FavoriteFolder | null>(null);
   const [isClearingFolder, setIsClearingFolder] = useState(false);
   const [isRecovering, setIsRecovering] = useState(false);
+  /** 悬停失效卡片封面时展示的详情浮层 */
+  const [hoverResource, setHoverResource] = useState<{
+    resource: FavoriteResource;
+    rect: DOMRect;
+  } | null>(null);
+  /**
+   * 当前是否只是"附加"到后台已有的恢复任务上（而不是本页发起的）。
+   * 附加模式没有 sendMessage 的返回值可等，只能靠进度里的 status 收尾。
+   */
+  const recoveryAttachedRef = useRef(false);
+  /** 本页发起恢复的时间点：用来忽略上一轮遗留的旧进度，避免刚点就被判"已完成" */
+  const recoveryStartRef = useRef(0);
   /** 恢复进度。后台每处理完一批就写一次 storage，页面轮询显示，避免长时间无反馈 */
   const [recoveryProgress, setRecoveryProgress] = useState<{
     done: number;
     total: number;
     recovered: number;
+    /** 当前阶段 + 阶段内进度（biliplus / 公开接口 / jijidown / 归档封面） */
+    phase?: string;
+    phaseDone?: number;
+    phaseTotal?: number;
   } | null>(null);
+
+  // 打开页面时如果后台已有恢复任务在跑，自动附加上去（否则用户会看到一个
+  // "恢复任务正在进行中"的错误提示，却没有任何进度）。
+  // 先问后台任务是否真实存在：storage 里的 running 可能是上一轮留下的僵尸记录。
+  useEffect(() => {
+    let cancelled = false;
+    void (async () => {
+      const stored = await getStorageValue<{
+        status?: string;
+        total?: number;
+        startedAt?: number;
+        updatedAt?: number;
+      } | null>(FAV_RECOVERY_PROGRESS, null);
+      if (cancelled || !stored || stored.status !== "running" || !stored.total) return;
+
+      let actuallyRunning = false;
+      try {
+        const state = await browser.runtime.sendMessage({ action: "getRecoveryTaskState" });
+        actuallyRunning = Boolean(state?.running);
+      } catch {
+        actuallyRunning = false;
+      }
+      if (cancelled) return;
+
+      if (actuallyRunning) {
+        recoveryAttachedRef.current = true;
+        setIsRecovering(true);
+        return;
+      }
+
+      // 僵尸进度：任务已经不存在了，直接收尾，别让用户永远看到一个不会动的进度条
+      await setStorageValue(FAV_RECOVERY_PROGRESS, {
+        ...stored,
+        status: "completed",
+        updatedAt: Date.now(),
+      }).catch(() => undefined);
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   // 恢复期间轮询进度。500ms 足够顺滑，也只读一个 storage 键，不会给后台压力
   useEffect(() => {
@@ -78,17 +181,50 @@ export const Favorites = () => {
     let active = true;
     const tick = async () => {
       const stored = await getStorageValue<{
-        status: string;
+        status?: string;
         done: number;
         total: number;
         recovered: number;
+        startedAt?: number;
+        updatedAt?: number;
+        phase?: string;
+        phaseDone?: number;
+        phaseTotal?: number;
       } | null>(FAV_RECOVERY_PROGRESS, null);
-      if (!active || !stored || !stored.total) return;
-      setRecoveryProgress({
-        done: stored.done ?? 0,
-        total: stored.total ?? 0,
-        recovered: stored.recovered ?? 0,
-      });
+      if (!active || !stored) return;
+      // 本页刚发起的任务：忽略上一轮遗留的旧进度，否则点击瞬间就会被判"已完成"，
+      // 进度条一闪而过（用户看到的就是"点击没反应、刷新才有"）。
+      if (
+        recoveryStartRef.current > 0 &&
+        typeof stored.startedAt === "number" &&
+        stored.startedAt < recoveryStartRef.current - 1000
+      ) {
+        return;
+      }
+      if (stored.status === "running") {
+        if (!stored.total) return;
+        setRecoveryProgress({
+          done: stored.done ?? 0,
+          total: stored.total ?? 0,
+          recovered: stored.recovered ?? 0,
+          phase: typeof stored.phase === "string" ? stored.phase : undefined,
+          phaseDone: typeof stored.phaseDone === "number" ? stored.phaseDone : undefined,
+          phaseTotal: typeof stored.phaseTotal === "number" ? stored.phaseTotal : undefined,
+        });
+        return;
+      }
+      // 任务已结束：附加模式下没有 sendMessage 返回可等，靠这里收尾
+      active = false;
+      const attached = recoveryAttachedRef.current;
+      recoveryAttachedRef.current = false;
+      setIsRecovering(false);
+      setRecoveryProgress(null);
+      if (attached) {
+        toast.success("失效内容恢复已完成");
+        if (selectedFolderId) {
+          void loadResources(selectedFolderId, { resetSearch: false });
+        }
+      }
     };
     void tick();
     const timer = window.setInterval(() => void tick(), 500);
@@ -96,7 +232,7 @@ export const Favorites = () => {
       active = false;
       window.clearInterval(timer);
     };
-  }, [isRecovering]);
+  }, [isRecovering, selectedFolderId]);
   const [recoveryResult, setRecoveryResult] = useState<{
     attempted: number;
     recovered: number;
@@ -284,6 +420,9 @@ export const Favorites = () => {
    * 所以恢复数量可能是 0，那是数据源的限制而不是故障。
    */
   const handleRecoverInvalid = async () => {
+    // 记录发起时间：轮询据此忽略上一轮遗留的旧进度
+    recoveryStartRef.current = Date.now();
+    recoveryAttachedRef.current = false;
     setIsRecovering(true);
     try {
       const response = await browser.runtime.sendMessage({ action: "recoverInvalidFavorites" });
@@ -308,9 +447,44 @@ export const Favorites = () => {
         await loadResources(selectedFolderId, { resetSearch: false });
       }
     } catch (error) {
-      toast.error(error instanceof Error ? error.message : "恢复失效内容失败");
+      const message = error instanceof Error ? error.message : "恢复失效内容失败";
+      // 后台已经有一个恢复任务在跑（例如页面刷新/重开过）：不要报错，
+      // 把本页附加到那个任务的进度上；但如果后台根本没有任务，就清理僵尸进度。
+      if (message.includes("正在进行中")) {
+        const stored = await getStorageValue<{ status?: string; total?: number } | null>(
+          FAV_RECOVERY_PROGRESS,
+          null,
+        );
+        let actuallyRunning = false;
+        try {
+          const state = await browser.runtime.sendMessage({ action: "getRecoveryTaskState" });
+          actuallyRunning = Boolean(state?.running);
+        } catch {
+          actuallyRunning = false;
+        }
+        if (actuallyRunning && stored?.status === "running" && stored.total) {
+          recoveryStartRef.current = 0;
+          recoveryAttachedRef.current = true;
+          setIsRecovering(true);
+          toast("恢复任务已在后台进行，已显示进度");
+          return;
+        }
+        // 僵尸进度（任务只剩 storage 里一条 running 记录）：直接收尾
+        await setStorageValue(FAV_RECOVERY_PROGRESS, {
+          ...(stored ?? {}),
+          status: "completed",
+          updatedAt: Date.now(),
+        }).catch(() => undefined);
+        toast("上次恢复已中断，进度已重置，可重新点击恢复");
+        return;
+      }
+      toast.error(message);
     } finally {
-      setIsRecovering(false);
+      // 附加模式不能在这里关掉进度：任务还在后台跑，进度靠轮询收尾
+      if (!recoveryAttachedRef.current) {
+        recoveryStartRef.current = 0;
+        setIsRecovering(false);
+      }
     }
   };
 
@@ -709,6 +883,14 @@ export const Favorites = () => {
                   <span className="whitespace-nowrap rounded-full border border-gray-100 bg-gray-50 px-2 py-1 text-sm font-normal text-gray-500 dark:border-neutral-700 dark:bg-neutral-800 dark:text-neutral-400">
                     {filteredResources.length} 个内容
                   </span>
+                  {selectedFolder && selectedFolder.media_count > resources.length ? (
+                    <span
+                      className="whitespace-nowrap rounded-full bg-amber-50 px-2 py-1 text-[11px] font-normal text-amber-600 dark:bg-amber-500/10 dark:text-amber-400"
+                      title={`在线收藏夹共 ${selectedFolder.media_count} 条，本地已有 ${resources.length} 条；执行一次全量同步会尝试补全被隐藏/漏掉的条目`}
+                    >
+                      在线 {selectedFolder.media_count} 条
+                    </span>
+                  ) : null}
                 </h1>
                 <button
                   type="button"
@@ -741,7 +923,7 @@ export const Favorites = () => {
                   <Wand2 className={`h-4 w-4 ${isRecovering ? "animate-pulse" : ""}`} />
                   {isRecovering
                     ? recoveryProgress
-                      ? `恢复中 ${recoveryProgress.done}/${recoveryProgress.total}`
+                      ? `恢复中 ${recoveryPercent(recoveryProgress)}%`
                       : "恢复中…"
                     : "恢复失效内容"}
                 </button>
@@ -753,22 +935,11 @@ export const Favorites = () => {
                     <div className="h-1.5 w-full overflow-hidden rounded-full bg-gray-200 dark:bg-neutral-700">
                       <div
                         className="h-full rounded-full bg-[#fb7299] transition-[width] duration-300"
-                        style={{
-                          width: `${
-                            recoveryProgress && recoveryProgress.total > 0
-                              ? Math.min(
-                                  100,
-                                  Math.round((recoveryProgress.done / recoveryProgress.total) * 100),
-                                )
-                              : 5
-                          }%`,
-                        }}
+                        style={{ width: `${recoveryPercent(recoveryProgress)}%` }}
                       />
                     </div>
                     <p className="mt-1 text-xs text-gray-400 dark:text-neutral-500">
-                      {recoveryProgress
-                        ? `已查询 ${recoveryProgress.done}/${recoveryProgress.total} 条，成功找回 ${recoveryProgress.recovered} 条`
-                        : "正在准备…"}
+                      {recoveryProgressText(recoveryProgress)}
                     </p>
                   </div>
                 ) : null}
@@ -909,7 +1080,18 @@ export const Favorites = () => {
                           className="no-underline text-inherit flex flex-col h-full"
                         >
                           <div>
-                            <div className="relative w-full aspect-video">
+                            <div
+                              className="relative w-full aspect-video"
+                              onMouseEnter={(event) => {
+                                if (invalidated) {
+                                  setHoverResource({
+                                    resource: item,
+                                    rect: event.currentTarget.getBoundingClientRect(),
+                                  });
+                                }
+                              }}
+                              onMouseLeave={() => setHoverResource(null)}
+                            >
                               <img
                                 src={`${item.cover.replace("http:", "https:")}@760w_428h_1c.avif`}
                                 alt={item.title}
@@ -972,9 +1154,11 @@ export const Favorites = () => {
                                 </span>
                                 <span className="flex shrink-0 items-center gap-1.5">
                                   <span>
-                                    {new Date(
-                                      (item.fav_time || item.ctime) * 1000,
-                                    ).toLocaleDateString()}
+                                    {item.fav_time || item.ctime
+                                      ? new Date(
+                                          (item.fav_time || item.ctime) * 1000,
+                                        ).toLocaleDateString()
+                                      : "时间未知"}
                                   </span>
                                   <button
                                     type="button"
@@ -1045,6 +1229,13 @@ export const Favorites = () => {
         }}
         onConfirm={handleDeleteFavoriteFolder}
       />
+      {hoverResource ? (
+        <FavResourceHoverPanel
+          resource={hoverResource.resource}
+          anchor={hoverResource.rect}
+          onClose={() => setHoverResource(null)}
+        />
+      ) : null}
     </div>
   );
 };

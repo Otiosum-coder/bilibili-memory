@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   ArrowDownUp,
   BadgeCheck,
@@ -23,6 +23,7 @@ import {
   getAllInteractions,
   getAllVanishArchive,
   getAllVanishedFavResources,
+  patchFollowingItems,
   restoreVanishArchiveItems,
 } from "../utils/db";
 import { isInvalidatedResource } from "../utils/favVanishedDiff";
@@ -32,6 +33,7 @@ import { PLACEHOLDER_COVER_PATH } from "../utils/imageUrl";
 import {
   FOLLOWING_STATUS_LABEL,
   buildLocalNameTimeline,
+  resolveDisplayNameInfo,
 } from "../utils/followingQuery";
 import {
   VANISH_ARCHIVE_REASON_LABEL,
@@ -39,8 +41,10 @@ import {
   VANISH_SOURCE_LABEL,
   buildVanishArchiveStats,
   collectLiveVanishArchive,
+  enrichArchiveFromLive,
   mergeArchiveWithLegacy,
   mergeVanishArchive,
+  normalizeArchiveReasons,
   queryVanishArchive,
   type VanishArchiveFilter,
 } from "../utils/vanishArchive";
@@ -61,6 +65,7 @@ const REASONS: VanishArchiveReason[] = [
   "content_hidden",
   "collection_removed",
   "unfavorited",
+  "account_gone",
   "renamed",
   "unknown",
 ];
@@ -82,6 +87,8 @@ const REASON_BADGE_CLASS: Record<VanishArchiveReason, string> = {
   unknown: "bg-amber-500/90 text-white",
   // 改过曾用名 ≠ 消失。用中性灰蓝，避免和"内容没了"的暖色混淆
   renamed: "bg-indigo-500/90 text-white",
+  // 账号注销也是明确状态，用中性灰，与「原因不明」的琥珀色区分
+  account_gone: "bg-gray-500/90 text-white",
 };
 
 /**
@@ -648,6 +655,8 @@ const VanishedFollowingRow = ({
   following,
   managing,
   selected,
+  selectedFormerNameIndex,
+  onSelectFormerName,
   onToggleSelect,
   onOpen,
 }: {
@@ -655,6 +664,9 @@ const VanishedFollowingRow = ({
   following?: FollowingItem;
   managing: boolean;
   selected: boolean;
+  /** 卡片当前展示第几个曾用名（仅已注销账号可切换） */
+  selectedFormerNameIndex?: number;
+  onSelectFormerName?: (index: number) => void;
   onToggleSelect: () => void;
   onOpen: () => void;
 }) => {
@@ -687,7 +699,10 @@ const VanishedFollowingRow = ({
   const source = following ?? snapshotAsFollowing(item) ?? undefined;
   const formerNames = Math.max(0, (source?.nameHistory?.length ?? 0) - 1);
   const status = source?.status ?? "gone";
-  const name = item.title?.trim() || "（从未记到昵称）";
+  // 名字和关注列表页用同一套解析：当前名 → 第三方曾用名 → UID 兜底。
+  // 之前直接用归档时的 `item.title`，注销账号常常是空的，才会显示「（从未记到昵称）」。
+  const displayInfo = source ? resolveDisplayNameInfo(source) : null;
+  const name = displayInfo?.name || item.title?.trim() || `UID ${item.sourceId}（名字未知）`;
   const sign = (source?.sign ?? "").trim();
   const avatar = assetUrl ?? (item.cover ? item.cover.replace(/^http:/, "https:") : "");
   // 曾用名**直接铺在卡片上**，不做浮层也不要点详情——
@@ -715,15 +730,11 @@ const VanishedFollowingRow = ({
 
   return (
     <article
-      // 整卡可点即「详情」——不再挂一个方框按钮，省掉一行视觉噪音。
-      // 管理模式下的点击留给勾选，避免误触。
-      onClick={managing ? undefined : onOpen}
       className={`relative flex gap-3 rounded-xl border bg-white p-3 transition-shadow hover:shadow-md dark:bg-neutral-900 ${
         selected
           ? "border-pink-400 ring-2 ring-pink-400/40 dark:border-pink-500"
           : "border-gray-200 dark:border-neutral-800"
-      } ${managing ? "" : "cursor-pointer"}`}
-      title={managing ? undefined : "查看这条档案的完整内容"}
+      }`}
     >
       {managing ? (
         <button
@@ -804,8 +815,17 @@ const VanishedFollowingRow = ({
             {item.reason === "renamed" ? "改过曾用名" : FOLLOWING_STATUS_LABEL[status]}
           </span>
           {/* 曾用名用**与关注列表页同一个组件**：只显示数量，点击展开浮层看名字。
-              之前自己写的"直接铺在卡片上"会让行高参差，也和关注列表页不一致。 */}
-          {source ? <NameHistoryPopover item={source} /> : null}
+              已注销账号可以直接在浮层里点选，把卡片名字切换成曾用名。 */}
+          {source ? (
+            <NameHistoryPopover
+              item={source}
+              selectedFormerNameIndex={
+                selectedFormerNameIndex ??
+                (displayInfo?.inferred ? displayInfo.candidateIndex : undefined)
+              }
+              onSelectFormerName={status === "gone" ? onSelectFormerName : undefined}
+            />
+          ) : null}
           {/* 认证图标：与关注列表页一致，用一个固定 14px 的图标表示，
               完整头衔放悬停提示（文字长度不可控，放徽章会把整行挤换行） */}
           {source?.officialVerifyDesc ? (
@@ -826,10 +846,19 @@ const VanishedFollowingRow = ({
 
         {/* 时间行的位置、字号、句式都与「关注列表」页一致（`日期 + 说明`，左对齐）。
             之前放在右下角、还按类型换文案，同一列里会同时出现三种写法。 */}
-        <p className="mt-1.5 text-xs text-gray-400 dark:text-neutral-500">
-          {formatDateTime(item.vanishedAt)}{" "}
-          {item.reason === "renamed" ? "最近改名" : "检测到注销"}
-        </p>
+        <div className="mt-1.5 flex items-center justify-between gap-2">
+          <p className="text-xs text-gray-400 dark:text-neutral-500">
+            {formatDateTime(item.vanishedAt)}{" "}
+            {item.reason === "renamed" ? "最近改名" : "检测到注销"}
+          </p>
+          <button
+            type="button"
+            onClick={onOpen}
+            className="shrink-0 rounded-md border border-gray-200 px-2 py-0.5 text-[11px] text-gray-500 transition-colors hover:border-pink-300 hover:text-pink-500 dark:border-neutral-700 dark:text-neutral-400 dark:hover:border-pink-500/50 dark:hover:text-pink-400"
+          >
+            查看详情
+          </button>
+        </div>
       </div>
     </article>
   );
@@ -858,9 +887,13 @@ const Vanished = () => {
   const [following, setFollowing] = useState<FollowingItem[]>([]);
   const [loading, setLoading] = useState(true);
   const [keyword, setKeyword] = useState("");
-  const [source, setSource] = useState<VanishArchiveSource | "all">("all");
+  // 「全部」视图会同时渲染关注卡片与视频卡片（两套排版），已移除；默认只看收藏夹。
+  const [source, setSource] = useState<VanishArchiveSource>("favorites");
   const [reason, setReason] = useState<VanishArchiveReason | "all">("all");
   const [sort, setSort] = useState<SortKey>("vanished_desc");
+  const initialSourcePickedRef = useRef(false);
+  /** 档案快照里没有对应关注记录时，名字切换只在本地生效（key = 档案 id） */
+  const [archiveNameOverrides, setArchiveNameOverrides] = useState<Record<string, number>>({});
   const [visibleCount, setVisibleCount] = useState(VANISH_PAGE_SIZE);
   const [managing, setManaging] = useState(false);
   const [selected, setSelected] = useState<string[]>([]);
@@ -901,18 +934,31 @@ const Vanished = () => {
       // 两层来源合并。第二层是"读时派生"：源记录里已经查不到、但还没写进档案的内容。
       // 没有它，用户本地明明有已失效收藏 / 已注销关注 / 稿件已删的互动，页面却是空的。
       const persisted = mergeArchiveWithLegacy(stored, legacy);
-      setArchive(
-        mergeVanishArchive(
-          persisted,
-          collectLiveVanishArchive({
-            favorites,
-            collections: [],
-            following: followingList,
-            interactions,
-            isInvalidated: isInvalidatedResource,
-          }),
+      const merged = normalizeArchiveReasons(
+        enrichArchiveFromLive(
+          mergeVanishArchive(
+            persisted,
+            collectLiveVanishArchive({
+              favorites,
+              collections: [],
+              following: followingList,
+              interactions,
+              isInvalidated: isInvalidatedResource,
+            }),
+          ),
+          favorites,
         ),
       );
+      setArchive(merged);
+
+      // 默认只看收藏夹；若收藏夹档案为空，自动切到第一个有内容的来源
+      if (!initialSourcePickedRef.current) {
+        initialSourcePickedRef.current = true;
+        if (!merged.some((item) => item.source === "favorites")) {
+          const first = SOURCES.find((value) => merged.some((item) => item.source === value));
+          if (first) setSource(first);
+        }
+      }
       setFollowing(followingList);
     } catch (error) {
       console.error("读取消失档案失败:", error);
@@ -931,6 +977,31 @@ const Vanished = () => {
     () => new Map(following.map((item) => [item.mid, item])),
     [following],
   );
+
+  /**
+   * 在曾用名浮层里点选名字，切换卡片显示名。
+   * - 还有当前关注记录：写回 `formerNameDisplayIndex`（和关注列表页一致）；
+   * - 只剩档案快照：只更新本页状态，不伪造关注记录。
+   */
+  const handleSelectArchiveFormerName = async (item: VanishArchiveItem, index: number) => {
+    const mid = Number(item.sourceId);
+    const live = followingByMid.get(mid);
+    if (!live) {
+      setArchiveNameOverrides((current) => ({ ...current, [item.id]: index }));
+      return;
+    }
+    try {
+      await patchFollowingItems([mid], { formerNameDisplayIndex: index });
+      setFollowing((current) =>
+        current.map((entry) =>
+          entry.mid === mid ? { ...entry, formerNameDisplayIndex: index } : entry,
+        ),
+      );
+    } catch (error) {
+      console.error("切换显示名失败:", error);
+      toast.error("切换显示名失败");
+    }
+  };
 
   const filtered = useMemo(() => {
     const filter: VanishArchiveFilter = { keyword, source, reason };
@@ -1054,10 +1125,9 @@ const Vanished = () => {
     }
   };
 
-  const hasFilter = source !== "all" || reason !== "all" || keyword.trim() !== "";
+  const hasFilter = reason !== "all" || keyword.trim() !== "";
   const clearFilters = () => {
     setKeyword("");
-    setSource("all");
     setReason("all");
     resetPaging();
   };
@@ -1108,17 +1178,6 @@ const Vanished = () => {
           <p className="px-3 pb-1 pt-2 text-xs font-medium text-gray-400 dark:text-neutral-500">
             来源
           </p>
-          <button
-            type="button"
-            onClick={() => {
-              setSource("all");
-              resetPaging();
-            }}
-            className={filterButtonClass(source === "all")}
-          >
-            <span>全部</span>
-            <span className="text-xs text-gray-400 dark:text-neutral-500">{stats.total}</span>
-          </button>
           {SOURCES.map((value) => (
             <button
               key={value}
@@ -1207,7 +1266,7 @@ const Vanished = () => {
 
           <div className="mb-6 flex flex-col justify-between gap-4 rounded-xl border border-gray-100 bg-white p-4 shadow-sm md:flex-row md:items-center dark:border-neutral-800 dark:bg-neutral-900">
             <h1 className="flex items-center gap-2 text-xl font-bold text-gray-900 dark:text-neutral-100">
-              {source === "all" ? "消失档案" : VANISH_SOURCE_LABEL[source]}
+              {VANISH_SOURCE_LABEL[source]}
               <span className="whitespace-nowrap rounded-full border border-gray-100 bg-gray-50 px-2 py-1 text-sm font-normal text-gray-500 dark:border-neutral-700 dark:bg-neutral-800 dark:text-neutral-400">
                 {filtered.length} 条
               </span>
@@ -1327,6 +1386,10 @@ const Vanished = () => {
                       item={item}
                       managing={managing}
                       selected={selected.includes(item.id)}
+                      selectedFormerNameIndex={archiveNameOverrides[item.id]}
+                      onSelectFormerName={(index) =>
+                        void handleSelectArchiveFormerName(item, index)
+                      }
                       onToggleSelect={() => toggleSelect(item.id)}
                       onOpen={() => setDetailItem(item)}
                       following={followingByMid.get(Number(item.sourceId))}

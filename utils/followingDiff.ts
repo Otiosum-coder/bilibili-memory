@@ -202,6 +202,7 @@ export const diffFollowing = (
       nameSource: realName !== "" ? "api" : previous?.nameSource,
       thirdPartyNames: previous?.thirdPartyNames,
       thirdPartyQueriedAt: previous?.thirdPartyQueriedAt,
+      formerNameDisplayIndex: previous?.formerNameDisplayIndex,
     });
   }
 

@@ -89,8 +89,6 @@ import {
   SubscribedCollection,
 } from "@/utils/types";
 import { LocalHistoryBackupPanel } from "@/components/LocalHistoryBackupPanel";
-import { NameArchivePanel } from "@/components/NameArchivePanel";
-import { NAME_ARCHIVE_ENABLED } from "@/utils/nameArchive";
 import { BackupItemsPicker } from "@/components/BackupItemsPicker";
 import { buildBackupPreview, formatBackupPreview } from "@/utils/backupPreview";
 import {
@@ -1053,27 +1051,6 @@ const WebDavSync = () => {
                 <LocalHistoryBackupPanel />
               </div>
             </section>
-            {/*
-              本地曾用名存档：只在本地开发/自用构建出现（NAME_ARCHIVE_ENABLED）。
-              商店构建里这一整段被编译期常量裁掉，面板不会渲染。
-            */}
-            {NAME_ARCHIVE_ENABLED ? (
-              <section className="space-y-3" aria-labelledby="name-archive-heading">
-                <div>
-                  <h2
-                    id="name-archive-heading"
-                    className="text-base font-semibold text-gray-950 dark:text-neutral-100"
-                  >
-                    曾用名存档
-                  </h2>
-                  <p className="mt-1 text-sm text-gray-600 dark:text-neutral-400">
-                    导入本机切片后，关注列表的卡片会显示曾用名；数据只存在本机，不参与同步与备份。
-                  </p>
-                </div>
-
-                <NameArchivePanel />
-              </section>
-            ) : null}
             <section className="space-y-3" aria-labelledby="json-heading">
               <div>
                 <h2

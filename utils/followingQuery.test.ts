@@ -8,6 +8,7 @@ import {
   paginateFollowing,
   queryFollowing,
   resolveDisplayName,
+  resolveDisplayNameInfo,
 } from "./followingQuery";
 import type { FollowingItem } from "./types";
 
@@ -41,6 +42,32 @@ describe("resolveDisplayName", () => {
 
   it("名字是占位文案时同样兜底", () => {
     expect(resolveDisplayName(makeItem(456, { name: "账号已注销" }))).toBe("UID 456（名字未知）");
+  });
+});
+
+describe("resolveDisplayNameInfo", () => {
+  it("没有真实名字时用第三方存档最后一个名字兜底，并标记 inferred", () => {
+    const item = makeItem(789, { name: "账号已注销", thirdPartyNames: ["旧名A", "旧名B"] });
+    expect(resolveDisplayNameInfo(item)).toEqual({
+      name: "旧名B",
+      inferred: true,
+      candidateCount: 2,
+      candidateIndex: 1,
+    });
+  });
+
+  it("尊重用户手动切换的下标，越界时回退到最后一个", () => {
+    const base = makeItem(790, { name: "", thirdPartyNames: ["甲", "乙", "丙"] });
+    expect(resolveDisplayNameInfo({ ...base, formerNameDisplayIndex: 0 }).name).toBe("甲");
+    expect(resolveDisplayNameInfo({ ...base, formerNameDisplayIndex: 99 }).name).toBe("丙");
+  });
+
+  it("有真实名字时永远优先真名，不用第三方存档", () => {
+    const info = resolveDisplayNameInfo(
+      makeItem(1, { name: "真名", thirdPartyNames: ["旧名"] }),
+    );
+    expect(info.name).toBe("真名");
+    expect(info.inferred).toBe(false);
   });
 });
 

@@ -8,7 +8,8 @@ import type {
   VanishArchiveSource,
   VanishedFavResource,
 } from "./types";
-import { resolveInvalidatedKind } from "./favVanishedDiff";
+import { INVALIDATED_TITLE_RE, resolveInvalidatedKind } from "./favVanishedDiff";
+import { isPlaceholderImage } from "./imageUrl";
 
 /**
  * 统一消失档案的**纯逻辑**（可单测，不碰 IndexedDB）。
@@ -47,7 +48,20 @@ export const VANISH_ARCHIVE_REASON_LABEL: Record<VanishArchiveReason, string> = 
   removed_by_uploader: "UP 主删除/退回",
   removed_by_other: "其他原因删除",
   renamed: "改过曾用名",
+  account_gone: "账号注销",
 };
+
+/**
+ * 历史数据归一化：早期版本把已注销账号的 reason 写成 `unknown`，
+ * 读取时统一改成 `account_gone`，避免被算进「原因不明」。
+ * 只影响展示，不重写数据库。
+ */
+export const normalizeArchiveReasons = (items: VanishArchiveItem[]): VanishArchiveItem[] =>
+  items.map((item) =>
+    item.kind === "following" && item.reason === "unknown"
+      ? { ...item, reason: "account_gone" }
+      : item,
+  );
 
 /** 档案条目的稳定主键 */
 export const vanishArchiveId = (kind: VanishArchiveKind, sourceId: string): string =>
@@ -333,7 +347,7 @@ export const collectLiveVanishArchive = (input: {
     // 只有标题占位文案命中、`attr` 与 `invalidatedKind` 都说不出所以然的，
     // 标成"未经证实"——这类记录仍保留，但界面要如实说明我们没有证据
     if (kind === null || kind === "other") archiveItem.invalidationUnproven = true;
-    items.push(archiveItem);
+    items.push({ ...archiveItem, liveDerived: true });
   }
 
   // 订阅合集：资源本身不带失效标记，能进档案的都在同步时留档，这里无需派生
@@ -343,9 +357,10 @@ export const collectLiveVanishArchive = (input: {
   for (const item of input.following) {
     if (item.status === "gone") {
       if (!isWorthArchiving(item)) continue;
-      items.push(
-        buildFollowingArchiveItem(item, "unknown", item.goneDetectedAt ?? item.lastSeenAt),
-      );
+      items.push({
+        ...buildFollowingArchiveItem(item, "account_gone", item.goneDetectedAt ?? item.lastSeenAt),
+        liveDerived: true,
+      });
       continue;
     }
 
@@ -354,7 +369,7 @@ export const collectLiveVanishArchive = (input: {
     const history = item.nameHistory ?? [];
     if (history.length > 1) {
       const lastRenameAt = history[history.length - 1]?.seenAt ?? item.lastSeenAt;
-      items.push(buildFollowingArchiveItem(item, "renamed", lastRenameAt));
+      items.push({ ...buildFollowingArchiveItem(item, "renamed", lastRenameAt), liveDerived: true });
     }
   }
 
@@ -363,9 +378,10 @@ export const collectLiveVanishArchive = (input: {
   for (const item of input.interactions) {
     const reason = resolveInteractionArchiveReason(item);
     if (!reason) continue;
-    items.push(
-      buildInteractionArchiveItem(item, reason, item.endedDetectedAt ?? item.lastSeenAt),
-    );
+    items.push({
+      ...buildInteractionArchiveItem(item, reason, item.endedDetectedAt ?? item.lastSeenAt),
+      liveDerived: true,
+    });
   }
 
   return items;
@@ -450,6 +466,7 @@ const emptyReasonCounts = (): Record<VanishArchiveReason, number> => ({
   removed_by_uploader: 0,
   removed_by_other: 0,
   renamed: 0,
+  account_gone: 0,
 });
 
 export const buildVanishArchiveStats = (items: VanishArchiveItem[]): VanishArchiveStats => {
@@ -492,6 +509,31 @@ const snapshotDurationOf = (snapshot: unknown): number => {
  *   读时派生的那份才是完整的
  * - `invalidationUnproven` 有一边为真就为真：警示信息不能被较新的观测抹掉
  */
+/**
+ * 快照质量评分：**标题/封面是否真实内容**远比时长重要。
+ *
+ * 之前按 duration 选"更丰富"的一边，结果"有时长但标题是占位"的旧快照会盖掉
+ * "标题真实但时长为 0"的新记录——档案里显示「已失效视频」，收藏夹里却是正常标题。
+ */
+const snapshotQuality = (snapshot: unknown): number => {
+  if (!snapshot || typeof snapshot !== "object") return 0;
+  const record = snapshot as Partial<FavoriteResource>;
+  let score = 0;
+  const title = typeof record.title === "string" ? record.title.trim() : "";
+  if (title && !INVALIDATED_TITLE_RE.test(title)) score += 4;
+  if (typeof record.cover === "string" && record.cover.trim() && !isPlaceholderImage(record.cover)) {
+    score += 2;
+  }
+  if (typeof record.duration === "number" && record.duration > 0) score += 1;
+  return score;
+};
+
+const isRealTitle = (title: string | undefined | null): boolean =>
+  Boolean(title && title.trim() && !INVALIDATED_TITLE_RE.test(title));
+
+const isRealCover = (cover: string | undefined | null): boolean =>
+  Boolean(cover && cover.trim() && !isPlaceholderImage(cover));
+
 export const mergeVanishArchive = (
   base: VanishArchiveItem[],
   incoming: VanishArchiveItem[],
@@ -505,12 +547,30 @@ export const mergeVanishArchive = (
     }
     const earlier = item.vanishedAt < existing.vanishedAt ? item : existing;
     const later = item.vanishedAt < existing.vanishedAt ? existing : item;
-    const richerSnapshot =
-      snapshotDurationOf(later.item) >= snapshotDurationOf(earlier.item)
-        ? later.item
-        : earlier.item;
+    // **按字段分别择优**：标题和封面可能分别存在于两边。
+    // 之前整份挑"更丰富的一边"，会出现"选中真实标题那一边 → 封面被换成空"，
+    // 表现就是有些封面丢失（老记录尤其明显，因为另一边才有封面）。
+    const titleSource = isRealTitle(later.title)
+      ? later
+      : isRealTitle(earlier.title)
+        ? earlier
+        : later;
+    const coverSource = isRealCover(later.cover)
+      ? later
+      : isRealCover(earlier.cover)
+        ? earlier
+        : titleSource;
+    const richerSnapshot = snapshotQuality(later.item) >= snapshotQuality(earlier.item)
+      ? later.item
+      : earlier.item;
     merged.set(item.id, {
       ...later,
+      title: titleSource.title,
+      cover: coverSource.cover,
+      bvid: titleSource.bvid ?? later.bvid,
+      aid: titleSource.aid ?? later.aid,
+      authorName: titleSource.authorName ?? later.authorName,
+      authorMid: titleSource.authorMid ?? later.authorMid,
       vanishedAt: earlier.vanishedAt,
       item: richerSnapshot,
       duration:
@@ -520,7 +580,73 @@ export const mergeVanishArchive = (
         undefined,
       coverAssetId: earlier.coverAssetId ?? later.coverAssetId,
       invalidationUnproven: earlier.invalidationUnproven || later.invalidationUnproven,
+      resolvedLocally: earlier.resolvedLocally || later.resolvedLocally,
+      liveDerived: Boolean(earlier.liveDerived && later.liveDerived),
     });
   }
   return [...merged.values()];
+};
+
+/**
+ * 标记"本地仍存在"的档案条目：同 id 的源记录还在本地库里，说明它并没有真的消失，
+ * 属于误归档。页面据此把条目标签成「已恢复」并默认折叠，但不删除档案。
+ */
+export const markLocallyResolved = (
+  items: VanishArchiveItem[],
+  input: {
+    favorites: FavoriteResource[];
+    collections: SubscribedCollectionResource[];
+    following: FollowingItem[];
+    interactions: InteractionItem[];
+  },
+): VanishArchiveItem[] => {
+  const favoriteKeys = new Set(input.favorites.map((item) => `${item.folder_id}:${item.id}`));
+  const collectionIds = new Set(input.collections.map((item) => String(item.id)));
+  const followingMids = new Set(input.following.map((item) => String(item.mid)));
+  const interactionIds = new Set(input.interactions.map((item) => item.id));
+
+  return items.map((item) => {
+    // 读时派生的条目本来就和源记录同时存在，不能据此判成"误归档"
+    if (item.liveDerived) return item;
+    let resolved = false;
+    if (item.kind === "favorite") resolved = favoriteKeys.has(item.sourceId);
+    else if (item.kind === "collection") resolved = collectionIds.has(item.sourceId);
+    else if (item.kind === "following") resolved = followingMids.has(item.sourceId);
+    else resolved = interactionIds.has(item.sourceId);
+    return resolved ? { ...item, resolvedLocally: true } : item;
+  });
+};
+
+/**
+ * 用本地收藏记录补全档案条目的展示字段（**只用本地数据，不请求 B 站**）。
+ *
+ * 误归档的条目可能同时还在 `favResources` 里且带着真实标题/封面，但档案里的
+ * 持久快照是占位文案。这里在读取时把真实字段补到顶层展示字段上，
+ * 不写库、不删除档案。
+ */
+export const enrichArchiveFromLive = (
+  items: VanishArchiveItem[],
+  favorites: FavoriteResource[],
+): VanishArchiveItem[] => {
+  const byKey = new Map(favorites.map((item) => [`${item.folder_id}:${item.id}`, item]));
+  return items.map((item) => {
+    if (item.kind !== "favorite") return item;
+    const live = byKey.get(item.sourceId);
+    if (!live) return item;
+    // 同样按字段补：本地记录可能只有封面、档案快照只有标题（或反过来）。
+    const title = isRealTitle(live.title) ? live.title : item.title;
+    const cover = isRealCover(live.cover) ? live.cover : item.cover;
+    const snapshot = snapshotQuality(live) > snapshotQuality(item.item) ? live : item.item;
+    if (title === item.title && cover === item.cover && snapshot === item.item) return item;
+    return {
+      ...item,
+      title,
+      cover,
+      bvid: live.bvid || live.bv_id || item.bvid,
+      aid: live.id ?? item.aid,
+      authorName: live.upper?.name ?? item.authorName,
+      authorMid: live.upper?.mid ?? item.authorMid,
+      item: snapshot,
+    };
+  });
 };

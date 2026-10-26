@@ -49,8 +49,9 @@ const REQUEST_TIMEOUT_MS = 15_000;
 export const PUBLIC_FAV_PAGE_SIZE = 20;
 /** 翻页之间的间隔 */
 export const PUBLIC_FAV_PAGE_DELAY_MS = 2_500;
-/** 单次恢复最多请求多少页，防止意外翻完整个收藏夹 */
-export const PUBLIC_FAV_MAX_PAGES_PER_RUN = 40;
+/** 单次恢复最多请求多少页，防止意外翻完整个收藏夹。
+ *  40 页 × 2.5s 会让恢复末尾静默等 100 秒，降到 20 页（500 条覆盖）后仍有兜底作用 */
+export const PUBLIC_FAV_MAX_PAGES_PER_RUN = 20;
 
 export interface PublicFavMedia {
   id: number;

@@ -44,6 +44,7 @@ import {
   DEFAULT_INTERACTIONS_AUTO_SYNC_ENABLED,
   DEFAULT_INTERACTIONS_SYNC_INTERVAL_MINUTES,
   DEFAULT_INTERACTIONS_PAGE_TRIGGER_GAP_MINUTES,
+  THIRD_PARTY_NAME_LOOKUP_PROGRESS,
 } from "../utils/constants";
 import {
   deleteHistoryContent,
@@ -51,7 +52,6 @@ import {
   replaceFavFolders,
   saveFavResources,
   getFavResources,
-  moveFavResourcesToVanished,
   applyFavResourceRecovery,
   applySubscribedCollectionCoverAssets,
   getAllHistory,
@@ -123,11 +123,20 @@ import {
 } from "../utils/types";
 import type { VanishArchiveItem, VanishArchiveReason } from "../utils/types";
 import {
-  buildVanishedRecord,
   buildVanishCandidates,
   classifyViewProbe,
+  isInvalidatedResource,
+  resolveInvalidatedKind,
 } from "../utils/favVanishedDiff";
-import { probeFavoriteResource, VANISH_PROBE_DELAY_MS } from "../utils/favRepairProbe";
+import { probeFavoriteResource } from "../utils/favRepairProbe";
+import {
+  fetchThirdPartyFormerNames,
+  pickFormerNameCandidates,
+  THIRD_PARTY_LOOKUP_INTERVAL_MS,
+  THIRD_PARTY_LOOKUP_MAX_CONSECUTIVE_FAILURES,
+  type FormerNameBatchResult,
+  type FormerNameLookupProgress,
+} from "../utils/thirdPartyNameLookup";
 import {
   buildCollectionArchiveItem,
   buildFavoriteArchiveItem,
@@ -1507,6 +1516,19 @@ export default defineBackground(() => {
     } else if (message.action === "recoverInvalidFavorites") {
       handleFavRecovery(sendResponse);
       return true;
+    } else if (message.action === "getRecoveryTaskState") {
+      // storage 里的进度可能是上一轮留下的僵尸记录；页面要先问后台"真的还在跑吗"
+      sendResponse({ success: true, running: Boolean(favRecoveryPromise) });
+      return true;
+    } else if (message.action === "getFormerNameTaskState") {
+      sendResponse({ success: true, running: Boolean(formerNameBatchPromise) });
+      return true;
+    } else if (message.action === "lookupFormerNames") {
+      handleFormerNameBatch(message as { mids?: number[] }, sendResponse);
+      return true;
+    } else if (message.action === "cancelFormerNames") {
+      handleCancelFormerNames(sendResponse);
+      return true;
     }
   });
 
@@ -1747,6 +1769,9 @@ export default defineBackground(() => {
 
       try {
         const response = await fetch(
+          // 保持原有参数：之前加过 keyword/order/type/tid/platform=web，
+          // 实测返回条数一样（隐藏条目仍要 spaceDetail 补），但可能改变字段语义，
+          // 已恢复原样，避免把 fav_time/ctime 这类日期字段弄丢。
           `https://api.bilibili.com/x/v3/fav/resource/list?media_id=${folder.id}&pn=${page}&ps=20`,
           {
             headers: { Cookie: `SESSDATA=${sessdata}` },
@@ -1823,6 +1848,170 @@ export default defineBackground(() => {
     );
   }
 
+  /**
+   * 补全「收藏夹里有、但列表接口没有返回」的条目。
+   *
+   * 背景：文件夹信息的 `media_count`（如 845）是真实总数，但 `x/v3/fav/resource/list`
+   * 可能只返回 824 条——差额通常是被 UP 主设为「仅自己可见」的隐藏视频，网页端表现为
+   * 「收藏夹缺一格」。参考社区脚本的做法：用 `medialist/gateway/base/spaceDetail`
+   * 再拉一遍（登录态下能拿到这些条目），把本地缺的 id 补进库里。
+   *
+   * 失败只记日志、不抛错：补全失败不能拖垮整次同步。
+   */
+  async function fetchFavoriteFolderSupplementPage(
+    folder: FavoriteFolder,
+    page: number,
+    sessdata: string,
+  ): Promise<{ medias: any[]; hasMore: boolean }> {
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 30_000);
+    try {
+      const response = await fetch(
+        `https://api.bilibili.com/medialist/gateway/base/spaceDetail?media_id=${folder.id}&pn=${page}&ps=20&keyword=&order=mtime&type=0&tid=0&jsonp=jsonp`,
+        {
+          headers: { Cookie: `SESSDATA=${sessdata}` },
+          signal: controller.signal,
+        },
+      );
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+      const data = await response.json();
+      if (data.code !== 0) throw new Error(data.message || `code=${data.code}`);
+      return {
+        medias: data.data?.medias || [],
+        hasMore: Boolean(data.data?.has_more),
+      };
+    } finally {
+      clearTimeout(timeoutId);
+    }
+  }
+
+  async function supplementMissingFavorites(
+    folder: FavoriteFolder,
+    sessdata: string,
+    onlineResourceIds: Set<number>,
+    beforeCount: number,
+  ): Promise<void> {
+    const expected = folder.media_count;
+    if (!expected || onlineResourceIds.size >= expected) return;
+
+    let added = 0;
+    // 列表接口返回的 id 集合快照；不在里面、但 spaceDetail 能返回的 = 被隐藏的条目。
+    const listIds = new Set(onlineResourceIds);
+    const existingResources = await getFavResources(folder.id);
+    const existingById = new Map<number, FavoriteResource>(
+      existingResources.map((item) => [item.id, item]),
+    );
+    const indexById = new Map<number, number>(
+      existingResources.map((item) => [item.id, item.index]),
+    );
+
+    // 一页页翻到底：实测「默认收藏夹」前两页全是已知条目、隐藏条目在很后面，
+    // 所以不能用"连续两页没新条目"提前收手；只有遇到空页或分页参数被忽略
+    // （连续两页返回完全相同的 id 列表）才停。
+    let previousSignature = "";
+    const maxPages = Math.ceil(expected / 20) + 5;
+    for (let page = 1; page <= maxPages; page++) {
+      let pageData: { medias: any[]; hasMore: boolean };
+      try {
+        pageData = await fetchFavoriteFolderSupplementPage(folder, page, sessdata);
+      } catch (error) {
+        console.warn(`收藏夹「${folder.title}」补全接口失败（第 ${page} 页）:`, error);
+        break;
+      }
+      const medias = pageData.medias;
+      if (medias.length === 0) break;
+
+      const signature = medias.map((media) => Number(media?.id)).join(",");
+      if (signature === previousSignature) break; // 接口忽略了 pn，继续翻只会拿到同一页
+      previousSignature = signature;
+
+      const toSave: FavoriteResource[] = [];
+      for (let position = 0; position < medias.length; position += 1) {
+        const media = medias[position];
+        const id = Number(media?.id);
+        // 只处理"不在列表接口里"的隐藏条目；正常条目由主同步负责，日期/顺序都正确
+        if (!Number.isSafeInteger(id) || id <= 0 || listIds.has(id)) continue;
+
+        // 在同一页里找前后最近的条目，按位置比例插值出 index。
+        // 列表按收藏时间倒序返回，位置相邻 = 顺序相邻，不需要日期参与。
+        let prevPosition = -1;
+        let prevIndex: number | null = null;
+        for (let i = position - 1; i >= 0; i -= 1) {
+          const candidate = indexById.get(Number(medias[i]?.id));
+          if (typeof candidate === "number" && Number.isFinite(candidate)) {
+            prevPosition = i;
+            prevIndex = candidate;
+            break;
+          }
+        }
+        let nextPosition = medias.length;
+        let nextIndex: number | null = null;
+        for (let i = position + 1; i < medias.length; i += 1) {
+          const candidate = indexById.get(Number(medias[i]?.id));
+          if (typeof candidate === "number" && Number.isFinite(candidate)) {
+            nextPosition = i;
+            nextIndex = candidate;
+            break;
+          }
+        }
+
+        let index: number;
+        if (prevIndex !== null && nextIndex !== null) {
+          index =
+            prevIndex +
+            (nextIndex - prevIndex) * ((position - prevPosition) / (nextPosition - prevPosition));
+        } else if (prevIndex !== null) {
+          index = prevIndex + 0.01 * (position - prevPosition);
+        } else if (nextIndex !== null) {
+          index = Math.max(0, nextIndex - 0.01 * (nextPosition - position));
+        } else {
+          index = beforeCount + 0.5 + position * 0.01;
+        }
+        indexById.set(id, index);
+        onlineResourceIds.add(id);
+
+        const existing = existingById.get(id);
+        if (existing) {
+          // 历史遗留修复：日期来自不可信的 spaceDetail（曾把所有条目变成同一天），
+          // 重置成"时间未知"；index 用邻居位置重新插值，修掉整夹乱序。
+          existingById.set(id, { ...existing, index, fav_time: 0, ctime: 0 });
+          toSave.push({ ...existing, index, fav_time: 0, ctime: 0 });
+        } else {
+          const resource: FavoriteResource = {
+            ...media,
+            folder_id: folder.id,
+            id,
+            index,
+            bv_id: media.bv_id || media.bvid,
+            // 宁可显示"时间未知"，也不要用 spaceDetail 的不可信日期
+            fav_time: 0,
+            ctime: 0,
+          };
+          existingById.set(id, resource);
+          toSave.push(resource);
+          added += 1;
+        }
+      }
+      if (toSave.length > 0) await saveFavResources(toSave);
+
+      await new Promise((resolve) => setTimeout(resolve, 400));
+    }
+
+    // spaceDetail 也没补全时只记日志，**不再插入占位记录**：
+    // 只有 id 没有标题/封面的假记录会把排序和列表内容搞乱，
+    // 不如把差额明确报出来，让用户决定是否等待后续接口修复。
+    if (onlineResourceIds.size < expected) {
+      console.warn(
+        `收藏夹「${folder.title}」仍缺 ${expected - onlineResourceIds.size} 条（列表与补全接口都没有返回）`,
+      );
+    }
+
+    console.log(
+      `收藏夹「${folder.title}」补全：在线 ${expected} 条，列表接口返回 ${beforeCount} 条，` +
+        `spaceDetail 新增 ${added} 条，本地总量 ${onlineResourceIds.size} 条`,
+    );
+  }
+
   async function syncFavoriteFolderResources(
     folder: FavoriteFolder,
     sessdata: string,
@@ -1842,9 +2031,26 @@ export default defineBackground(() => {
   ): Promise<void> {
     console.log(`正在同步收藏夹: ${folder.title} (${isFullSync ? "全量" : "增量"})`);
 
-    const localResources = await getFavResources(folder.id);
+    let localResources = await getFavResources(folder.id);
+    // 清理历史版本遗留的"占位记录"：B站 avid 不可能大于 1e12，
+    // 这些是之前用 ids 兜底插入的假记录（只有 id、没有标题/封面），会把排序和内容搞乱。
+    if (isFullSync) {
+      const bogusIds = localResources
+        .filter(
+          (item) => !Number.isSafeInteger(item.id) || item.id <= 0 || item.id > 1_000_000_000_000,
+        )
+        .map((item) => item.id);
+      if (bogusIds.length > 0) {
+        await deleteFavResources(folder.id, bogusIds);
+        const bogusIdSet = new Set(bogusIds);
+        localResources = localResources.filter((item) => !bogusIdSet.has(item.id));
+        console.log(`收藏夹「${folder.title}」：清理 ${bogusIds.length} 条无效占位记录`);
+      }
+    }
     const existingResourceIds = new Set(localResources.map((item) => item.id));
     const onlineResourceIds = new Set<number>(checkpoint?.onlineResourceIds ?? []);
+
+    const existingById = new Map(localResources.map((item) => [item.id, item]));
 
     let page = Math.max(1, checkpoint?.nextPage ?? 1);
     let allPagesFetched = false;
@@ -1886,13 +2092,20 @@ export default defineBackground(() => {
         existingResourceIds.has(resourceIds[0]) &&
         existingResourceIds.has(resourceIds[resourceIds.length - 1]);
 
-      const resources = medias.map((media: any, index: number) => ({
-        ...media,
-        folder_id: folder.id,
-        index: (page - 1) * 20 + index,
-        id: resourceIds[index],
-        bv_id: media.bv_id || media.bvid,
-      }));
+      const resources = medias.map((media: any, index: number) => {
+        const previous = existingById.get(resourceIds[index]);
+        return {
+          ...media,
+          folder_id: folder.id,
+          index: (page - 1) * 20 + index,
+          id: resourceIds[index],
+          bv_id: media.bv_id || media.bvid,
+          // 接口偶尔会缺日期字段：已有记录保留旧值，避免整夹日期被清空
+          fav_time: media.fav_time || previous?.fav_time || 0,
+          ctime: media.ctime || previous?.ctime || 0,
+          pubtime: media.pubtime || previous?.pubtime || 0,
+        };
+      });
       await saveFavResources(resources);
       processedItems += resources.length;
       await reportProgress?.({
@@ -1916,52 +2129,78 @@ export default defineBackground(() => {
       await new Promise((resolve) => setTimeout(resolve, pageDelay));
     }
 
+    // 全量同步后如果本地条目数仍少于文件夹真实总数，尝试用补全接口把隐藏/漏掉的条目拉回来。
+    // 必须在"消失判定"之前，否则这些条目会被误判成在线消失并转进消失档案。
+    if (isFullSync) {
+      const beforeSupplementCount = onlineResourceIds.size;
+      await supplementMissingFavorites(
+        folder,
+        sessdata,
+        onlineResourceIds,
+        beforeSupplementCount,
+      );
+    }
+
     if (isFullSync) {
       if (!allPagesFetched) {
         throw new Error(`收藏夹「${folder.title}」未完整同步，已跳过本地清理`);
       }
 
-      // 在线消失的条目**先转入消失档案再移除**，绝不直接删除。
-      //
-      // 原实现在这里直接 deleteFavResources，但它无法区分两种完全不同的原因：
-      // 你主动取消收藏（删掉合理）与内容被 UP 主删除/下架（删掉等于销毁证据）。
-      // B 站接口不返回消失原因，所以只能保守留档。代价是"取消收藏"的记录也会进档案，
-      // 这是已确认接受的取舍 —— 宁可多留，也不能把被删内容的记录抹掉。
-      const candidates = buildVanishCandidates({
-        localResources,
-        onlineResourceIds,
-        isFullSync,
-        allPagesFetched,
-      });
+      // 消失档案的设计用意：内容在 B 站查不到之后，本地快照就是唯一副本。
+      // 所以判定必须保守：**只有这次同步完整覆盖了整个收藏夹**（补全后达到 media_count）
+      // 才允许判定"消失"；否则列表接口漏掉隐藏条目时会把仍在收藏夹里的内容误归档。
+      const coverageComplete = onlineResourceIds.size >= folder.media_count;
+      if (!coverageComplete) {
+        console.warn(
+          `收藏夹「${folder.title}」在线 ${folder.media_count} 条，本次仅覆盖 ${onlineResourceIds.size} 条，` +
+            `已跳过消失判定（避免把隐藏条目误归档）`,
+        );
+      } else {
+        const candidates = buildVanishCandidates({
+          localResources,
+          onlineResourceIds,
+          isFullSync,
+          allPagesFetched,
+        });
 
-      if (candidates.length > 0) {
-        const probed = await archiveVanishedResources(candidates, sessdata);
+        // **只归档"本地已有失效证据"的条目**（attr / invalidatedKind / 占位标题）。
+        // 正常元数据却不在列表里的，多半是隐藏条目或接口漏页——保留在收藏夹，
+        // 不能因为"这次没返回"就判定它消失。
+        const provenCandidates = candidates.filter(
+          (resource) => isInvalidatedResource(resource) || resource.invalidatedKind != null,
+        );
 
-        // **你手动取消的收藏不进档案**（用户明确要求）：探测到稿件仍可访问
-        // （`unfavorited`）说明内容好端端在 B 站，只是你不想留着它了——
-        // 这种记录归档只是噪音，与"内容消失"是完全不同的两件事。
-        // 它们照常从本地移除（那是用户的意愿），只是不写进档案。
-        const archived = probed.filter((item) => item.vanishReason !== "unfavorited");
-        const unarchived = probed.filter((item) => item.vanishReason === "unfavorited");
+        if (provenCandidates.length > 0) {
+          // 归档内容全部取自本地记录（标题/封面/UP 主/时长/attr/invalidatedKind），
+          // **不再调用 B 站接口探测**：原因能推断就写，推不出就标"原因不明/未证实"。
+          const now = Date.now();
+          const archived: VanishArchiveItem[] = provenCandidates.map((resource) => {
+            const kind = resource.invalidatedKind ?? resolveInvalidatedKind(resource.attr);
+            const reason: VanishArchiveReason =
+              kind === "removed_by_uploader"
+                ? "removed_by_uploader"
+                : kind === "removed_by_other"
+                  ? "removed_by_other"
+                  : "unknown";
+            const record = buildFavoriteArchiveItem(resource, reason, now);
+            if (kind === null || kind === "other") record.invalidationUnproven = true;
+            return record;
+          });
 
-        if (unarchived.length > 0) {
-          // 取消收藏的：从收藏夹移除即可，不写档案、不发通知
-          await deleteFavResources(
-            folder.id,
-            unarchived.map((item) => item.id),
-          );
-          console.log(`收藏夹「${folder.title}」：${unarchived.length} 项是你取消的收藏，已移除但不归档`);
-        }
-
-        if (archived.length > 0) {
-          // 内容真的消失了：同一事务内"写档案 + 移出收藏夹"，绝不直接删
-          await moveFavResourcesToVanished(folder.id, archived);
+          // **只写档案，不再从收藏夹移除**：宁可档案里多一条，也不动用户收藏夹。
+          // 之后是否清理由用户决定。
+          await putVanishArchive(archived);
           console.log(
-            `收藏夹「${folder.title}」：${archived.length} 项在线消失，已转入消失档案（未删除）`,
+            `收藏夹「${folder.title}」：${archived.length} 项已写入消失档案（保留在收藏夹，无额外请求）`,
           );
+          if (candidates.length > provenCandidates.length) {
+            console.log(
+              `收藏夹「${folder.title}」：另有 ${candidates.length - provenCandidates.length} 项只是本次没返回，` +
+                `本地无失效证据，已保留在收藏夹`,
+            );
+          }
 
-          // 内容真的丢了就告知用户，而不是等他某天自己打开插件发现
-          const notification = buildVanishedNotification(archived);
+          const notification = buildVanishedNotification(archived as any);
           if (notification) await sendChangeNotification(notification);
         }
       }
@@ -1978,30 +2217,6 @@ export default defineBackground(() => {
    * 探测**从不抛错**：任何失败都归类为"原因不明"，但条目**依然留档**。
    * 探测失败绝不能等价于"可以安全删除"。
    */
-  async function archiveVanishedResources(
-    candidates: FavoriteResource[],
-    sessdata: string,
-  ): Promise<VanishedFavResource[]> {
-    const now = Date.now();
-    const records: VanishedFavResource[] = [];
-    const reasonCounts: Record<string, number> = {};
-
-    for (const resource of candidates) {
-      const probe = await probeFavoriteResource(resource, sessdata);
-      const reason = classifyViewProbe(probe);
-      reasonCounts[reason] = (reasonCounts[reason] ?? 0) + 1;
-
-      records.push(
-        buildVanishedRecord(resource, reason, now, probe.ok ? undefined : probe.message ?? undefined),
-      );
-
-      await new Promise((resolve) => setTimeout(resolve, VANISH_PROBE_DELAY_MS));
-    }
-
-    console.log("消失档案分类结果:", reasonCounts);
-    return records;
-  }
-
   async function syncFavoriteFolderById(
     folderId: number,
     isFullSync: boolean,
@@ -2124,7 +2339,7 @@ export default defineBackground(() => {
           if (gone.length > 0) {
             const now = Date.now();
             await putVanishArchive(
-              gone.map((item) => buildFollowingArchiveItem(item, "unknown", now)),
+              gone.map((item) => buildFollowingArchiveItem(item, "account_gone", now)),
             );
             console.log(`关注列表：${gone.length} 个账号已注销，已汇入消失档案`);
           }
@@ -2835,14 +3050,22 @@ export default defineBackground(() => {
 
       // 实时进度：页面轮询这个键来显示「已查 X / 共 Y」。
       // 之前整个流程没有任何反馈，用户只能盯着一个「恢复中…」干等，分不清是卡住还是慢。
+      // `phase` 让页面知道当前在哪一阶段，避免 biliplus 跑完后进度条停着不动。
+      type RecoveryPhase = "local" | "biliplus" | "public" | "jijidown" | "archiving" | "done";
       const progressState = {
         status: "running" as "running" | "completed",
         total: candidates.length,
         done: 0,
         recovered: 0,
         startedAt: Date.now(),
+        /** 心跳：页面用它判断任务是活着还是已经随 SW 重启消失了 */
+        updatedAt: Date.now(),
+        phase: "local" as RecoveryPhase,
+        phaseDone: 0,
+        phaseTotal: candidates.length,
       };
       const flushProgress = async () => {
+        progressState.updatedAt = Date.now();
         await setStorageValue(FAV_RECOVERY_PROGRESS, { ...progressState }).catch(() => undefined);
       };
       await flushProgress();
@@ -2912,11 +3135,23 @@ export default defineBackground(() => {
           result.recovered += 1;
           result.recoveredLocal += 1;
           result.sources.bilibili_pages = (result.sources.bilibili_pages ?? 0) + 1;
-        } else {
-          unresolved.push(resource);
         }
       }
       console.log(`分P标题还原：${result.recoveredLocal}/${candidates.length} 条（无网络请求）`);
+
+      // 本地两步跑完后**重新统一判断**：标题被猜出来、但封面还是占位的条目，
+      // 必须继续走 biliplus/jijidown —— 它们一次返回 title + pic，封面和标题同时补。
+      // 早先"标题猜出来就不进 unresolved"导致这类条目永远补不到封面。
+      for (const resource of candidates) {
+        const current = working.get(resource.id)!;
+        if (needsRecovery(current)) unresolved.push(current);
+      }
+      progressState.phase = "local";
+      progressState.phaseDone = candidates.length;
+      progressState.phaseTotal = candidates.length;
+      progressState.done = candidates.length - unresolved.length;
+      progressState.recovered = result.recovered;
+      await flushProgress();
 
       // 第二步：biliplus 批量。一次请求可查多个 aid，是覆盖面主力（但对本用户实测 0 命中）。
       let stillUnresolved: FavoriteResource[] = [];
@@ -2927,10 +3162,13 @@ export default defineBackground(() => {
           BILIPLUS_BATCH_SIZE,
         );
 
-        for (const chunk of chunks) {
-          progressState.done += chunk.length;
-          progressState.recovered = result.recovered;
-          await flushProgress();
+        progressState.phase = "biliplus";
+        progressState.phaseDone = 0;
+        progressState.phaseTotal = unresolved.length;
+        await flushProgress();
+
+        for (let chunkIndex = 0; chunkIndex < chunks.length; chunkIndex += 1) {
+          const chunk = chunks[chunkIndex];
 
           const batch = await fetchBiliplusAidInfoWithRetry(chunk, {
             onWait: (waitMs, status) => {
@@ -2975,7 +3213,13 @@ export default defineBackground(() => {
             stillUnresolved.push(...chunk.map((aid) => byAid.get(aid)).filter(Boolean) as FavoriteResource[]);
           }
 
-          await new Promise((resolve) => setTimeout(resolve, BILIPLUS_BATCH_DELAY_MS));
+          // 进度：biliplus 阶段处理完的条数（最后一批不再空等 3 秒）
+          progressState.phaseDone += chunk.length;
+          progressState.recovered = result.recovered;
+          await flushProgress();
+          if (chunkIndex < chunks.length - 1) {
+            await new Promise((resolve) => setTimeout(resolve, BILIPLUS_BATCH_DELAY_MS));
+          }
         }
       }
 
@@ -2994,7 +3238,13 @@ export default defineBackground(() => {
         let matched = 0;
         let improved = 0;
 
-        for (const task of pageTasks) {
+        progressState.phase = "public";
+        progressState.phaseDone = 0;
+        progressState.phaseTotal = pageTasks.length;
+        await flushProgress();
+
+        for (let taskIndex = 0; taskIndex < pageTasks.length; taskIndex += 1) {
+          const task = pageTasks[taskIndex];
           const page = await fetchPublicFavPage(task.folderId, task.page);
           pagesRequested += 1;
 
@@ -3023,7 +3273,12 @@ export default defineBackground(() => {
             }
           }
 
-          await new Promise((resolve) => setTimeout(resolve, PUBLIC_FAV_PAGE_DELAY_MS));
+          progressState.phaseDone += 1;
+          progressState.recovered = result.recovered;
+          await flushProgress();
+          if (taskIndex < pageTasks.length - 1) {
+            await new Promise((resolve) => setTimeout(resolve, PUBLIC_FAV_PAGE_DELAY_MS));
+          }
         }
 
         console.log(
@@ -3049,6 +3304,11 @@ export default defineBackground(() => {
           const retryNext: FavoriteResource[] = [];
           let hit = 0;
           let miss = 0;
+
+          progressState.phase = "jijidown";
+          progressState.phaseDone = 0;
+          progressState.phaseTotal = pendingJijidown.length;
+          await flushProgress();
 
           for (let index = 0; index < pendingJijidown.length; index += 1) {
             const resource = pendingJijidown[index];
@@ -3081,12 +3341,18 @@ export default defineBackground(() => {
                 result.recovered += 1;
                 result.sources.jijidown = (result.sources.jijidown ?? 0) + 1;
                 hit += 1;
+                progressState.phaseDone += 1;
+                progressState.recovered = result.recovered;
+                await flushProgress();
                 await new Promise((resolve) => setTimeout(resolve, JIJIDOWN_ITEM_DELAY_MS));
                 continue;
               }
             }
 
             miss += 1;
+            progressState.phaseDone += 1;
+            progressState.recovered = result.recovered;
+            await flushProgress();
             await new Promise((resolve) => setTimeout(resolve, JIJIDOWN_ITEM_DELAY_MS));
           }
 
@@ -3121,13 +3387,21 @@ export default defineBackground(() => {
 
       // 恢复拿到的封面**同样是"还能抓到"的时机**，顺手把字节归档下来。
       // 否则只是记了个 URL，等它再次失效就彻底没了。
+      // 这一段是逐条下载图片，可能耗时几十秒：单独算一个阶段并显示进度，不再静默等待。
+      progressState.phase = "archiving";
+      progressState.phaseDone = 0;
+      progressState.phaseTotal = changedResources.length;
+      await flushProgress();
       const finalResources: FavoriteResource[] = [];
       for (const resource of changedResources) {
         if (resource.coverAssetId) {
           finalResources.push(resource);
-          continue;
+        } else {
+          finalResources.push(await archiveRecoveredCover(resource));
         }
-        finalResources.push(await archiveRecoveredCover(resource));
+        progressState.phaseDone += 1;
+        progressState.recovered = result.recovered;
+        await flushProgress();
       }
 
       if (finalResources.length > 0) {
@@ -3135,6 +3409,11 @@ export default defineBackground(() => {
       }
 
       result.remaining = Math.max(0, stats.pending - result.recovered);
+      // 标记完成：页面可能在任务开始后才打开/刷新，需要靠 storage 判断"还在跑"还是"已结束"。
+      // 只写 running 的话，重新进入页面的用户会永远看到一个不会消失的进度条。
+      progressState.phase = "done";
+      progressState.status = "completed";
+      await flushProgress();
       console.log("失效收藏恢复结束:", result);
       return result;
     })();
@@ -3173,6 +3452,191 @@ export default defineBackground(() => {
         error: error instanceof Error ? error.message : "失效收藏恢复失败",
       });
     }
+  };
+
+  // ---------------------------------------------------------------------------
+  // 第三方曾用名查询（aicu.cc）。详见 utils/thirdPartyNameLookup.ts。
+  //
+  // 硬约束：
+  // - 只在用户点击时运行，绝不进定时任务；
+  // - 同一时间只允许一个任务（单飞），可随时取消；
+  // - 逐条 1.5s 间隔，连续失败 3 次就停（接口变了/限流，继续打只会更糟）；
+  // - 已查过的人靠 `thirdPartyQueriedAt` 跳过，天然断点续查；
+  // - 失败的**不写**时间戳，下次还能重试。
+  // ---------------------------------------------------------------------------
+  let formerNameBatchPromise: Promise<FormerNameBatchResult> | null = null;
+  let formerNameBatchCancelled = false;
+
+  const startFormerNameBatch = (
+    limit?: number,
+    scopeMids?: number[],
+  ): Promise<FormerNameBatchResult> | null => {
+    if (formerNameBatchPromise) return null;
+    formerNameBatchCancelled = false;
+
+    const task = (async (): Promise<FormerNameBatchResult> => {
+      const all = await getAllFollowing();
+      // 页面只查"当前筛选/搜索结果"里的 UP 主：传入 mids 时按这个范围收窄，
+      // 避免用户只想查「已注销」却把全部关注都打一遍第三方接口。
+      const scope =
+        scopeMids === undefined
+          ? all
+          : (() => {
+              const wanted = new Set(scopeMids.map(Number));
+              return all.filter((item) => wanted.has(item.mid));
+            })();
+      const candidates = pickFormerNameCandidates(scope, limit);
+      const result: FormerNameBatchResult = {
+        scanned: all.length,
+        total: candidates.length,
+        done: 0,
+        found: 0,
+        failed: 0,
+        cancelled: false,
+      };
+
+      const progress = {
+        status: "running" as "running" | "completed" | "cancelled" | "failed",
+        total: candidates.length,
+        done: 0,
+        found: 0,
+        failed: 0,
+        startedAt: Date.now(),
+        updatedAt: Date.now(),
+        completedAt: undefined as number | undefined,
+        message: undefined as string | undefined,
+      };
+      const flushProgress = async () => {
+        progress.updatedAt = Date.now();
+        await setStorageValue(THIRD_PARTY_NAME_LOOKUP_PROGRESS, { ...progress }).catch(
+          () => undefined,
+        );
+      };
+      await flushProgress();
+      console.log(`第三方曾用名查询：关注 ${all.length} 人，本轮待查 ${candidates.length} 人`);
+      if (candidates.length === 0) {
+        progress.status = "completed";
+        await flushProgress();
+        return result;
+      }
+
+      let consecutiveFailures = 0;
+      for (const item of candidates) {
+        if (formerNameBatchCancelled) {
+          result.cancelled = true;
+          break;
+        }
+
+        const lookup = await fetchThirdPartyFormerNames(item.mid);
+        if (lookup.ok) {
+          await patchFollowingItems([item.mid], {
+            thirdPartyNames: lookup.names,
+            thirdPartyQueriedAt: Date.now(),
+          }).catch((error) => {
+            console.warn(`写入曾用名缓存失败（${item.mid}）:`, error);
+          });
+          consecutiveFailures = 0;
+          if (lookup.names.length > 0) result.found += 1;
+        } else {
+          // 失败不写时间戳，下次还能重试；只累计用于判断是否该停
+          result.failed += 1;
+          consecutiveFailures += 1;
+          console.warn(`查询曾用名失败（${item.mid}）: ${lookup.message ?? "未知错误"}`);
+          if (consecutiveFailures >= THIRD_PARTY_LOOKUP_MAX_CONSECUTIVE_FAILURES) {
+            progress.status = "failed";
+            progress.message = lookup.message ?? "连续查询失败";
+            break;
+          }
+        }
+
+        result.done += 1;
+        progress.done = result.done;
+        progress.found = result.found;
+        progress.failed = result.failed;
+        await flushProgress();
+
+        if (formerNameBatchCancelled) {
+          result.cancelled = true;
+          break;
+        }
+        await new Promise((resolve) => setTimeout(resolve, THIRD_PARTY_LOOKUP_INTERVAL_MS));
+      }
+
+      if (progress.status === "running") {
+        progress.status = result.cancelled ? "cancelled" : "completed";
+      }
+      progress.completedAt = Date.now();
+      await flushProgress();
+      console.log("第三方曾用名查询结束:", result);
+      return result;
+    })();
+
+    formerNameBatchPromise = task;
+    const clear = () => {
+      if (formerNameBatchPromise === task) formerNameBatchPromise = null;
+    };
+    task.then(clear, clear);
+    return task;
+  };
+
+  const handleFormerNameBatch = async (
+    message: { mids?: number[] },
+    sendResponse: (response: any) => void,
+  ) => {
+    console.log("收到第三方曾用名查询请求");
+    const task = startFormerNameBatch(
+      undefined,
+      Array.isArray(message?.mids) ? message.mids : undefined,
+    );
+    if (!task) {
+      sendResponse({ success: false, error: "已有一个查询任务在进行中" });
+      return;
+    }
+
+    try {
+      const result = await task;
+      const message = result.cancelled
+        ? `已停止：本轮查询 ${result.done} 人`
+        : result.total === 0
+          ? "所有关注都已查询过"
+          : `本轮查询 ${result.done} 人，${result.found} 人有曾用名` +
+            (result.failed > 0 ? `，${result.failed} 人失败` : "");
+      sendResponse({ success: true, ...result, message });
+    } catch (error) {
+      console.error("第三方曾用名查询失败:", error);
+      sendResponse({
+        success: false,
+        error: error instanceof Error ? error.message : "曾用名查询失败",
+      });
+    }
+  };
+
+  /**
+   * 停止批量查询。
+   *
+   * 如果后台已经没有任务（Service Worker 被浏览器休眠/重启过），任务本身就不存在了，
+   * 只设置标志没有任何效果——这时要把 storage 里残留的 `running` 进度改成已取消，
+   * 否则页面会永远停在「查询中」。
+   */
+  const handleCancelFormerNames = async (sendResponse: (response: any) => void) => {
+    formerNameBatchCancelled = true;
+    if (!formerNameBatchPromise) {
+      const stored = await getStorageValue<FormerNameLookupProgress | null>(
+        THIRD_PARTY_NAME_LOOKUP_PROGRESS,
+        null,
+      );
+      if (stored?.status === "running") {
+        const now = Date.now();
+        await setStorageValue(THIRD_PARTY_NAME_LOOKUP_PROGRESS, {
+          ...stored,
+          status: "cancelled",
+          completedAt: now,
+          updatedAt: now,
+          message: "已停止（上次查询已在后台中断）",
+        }).catch(() => undefined);
+      }
+    }
+    sendResponse({ success: true, message: "已请求停止" });
   };
 
   async function syncFavorites(isFullSync = false): Promise<void> {

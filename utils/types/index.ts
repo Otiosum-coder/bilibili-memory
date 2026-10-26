@@ -449,6 +449,12 @@ export interface FollowingItem {
    */
   thirdPartyNames?: string[];
   thirdPartyQueriedAt?: number;
+  /**
+   * 用户在卡片上手动切换后，希望优先展示的 `thirdPartyNames` 下标。
+   * 缺省时展示最后一个（最可能的注销前名字）；第三方存档顺序不保证，
+   * 所以允许用户自己挑一个熟悉的名字。只用于展示，不影响数据本身。
+   */
+  formerNameDisplayIndex?: number;
 }
 
 export type FollowingEventType = "followed" | "unfollowed" | "renamed" | "account_gone";
@@ -515,6 +521,13 @@ export type VanishArchiveReason =
   | "removed_by_uploader"
   /** B 站 `attr` 明确标注"其他原因删除" */
   | "removed_by_other"
+  /**
+   * 关注账号**已注销**（空间 404）。
+   *
+   * 与 `unknown` 分开：注销是明确状态，不是"原因不明"，侧栏统计与详情
+   * 都应该显示「账号注销」，否则会被误算进"原因不明"。
+   */
+  | "account_gone"
   /**
    * 关注账号**改过名**（人还在，内容没消失）。
    *
@@ -602,6 +615,13 @@ export interface VanishArchiveItem {
    * 把它当成"内容已消失"就是在说一件我们并没证实的事。
    */
   invalidationUnproven?: boolean;
+  /**
+   * 本地仍能查到同 id 的源记录 → 说明它其实没消失，属于误归档。
+   * 只用于界面折叠（"已恢复"），不删除档案；由页面读时计算，不持久化。
+   */
+  resolvedLocally?: boolean;
+  /** 读时从源记录临时派生的条目（不是持久档案）。误归档检测只针对持久档案 */
+  liveDerived?: boolean;
   /** 消失那一刻的完整原始记录。只读快照，不要再依赖它以外的上游数据 */
   item: unknown;
 }

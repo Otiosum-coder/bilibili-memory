@@ -1,32 +1,48 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import toast from "react-hot-toast";
-import { BadgeCheck, ChevronDown, RefreshCw, Search, Users, X } from "lucide-react";
+import { BadgeCheck, ChevronDown, RefreshCw, Search, Users, Wand2, X } from "lucide-react";
 import { Pagination } from "../components/Pagination";
 import { NameHistoryPopover } from "../components/NameHistoryPopover";
 import { createAssetObjectUrl } from "../utils/assetArchive";
-import { FOLLOWING_LAST_SYNC, FOLLOWING_SYNC_PROGRESS } from "../utils/constants";
-import { getAllFollowing } from "../utils/db";
-import { applyArchiveNames, loadNameArchive, NAME_ARCHIVE_ENABLED } from "../utils/nameArchive";
+import {
+  DEFAULT_THIRD_PARTY_NAME_LOOKUP_ENABLED,
+  FOLLOWING_LAST_SYNC,
+  FOLLOWING_SYNC_PROGRESS,
+  THIRD_PARTY_NAME_LOOKUP_ENABLED,
+  THIRD_PARTY_NAME_LOOKUP_PROGRESS,
+  THIRD_PARTY_NAME_LOOKUP_PROMPTED,
+} from "../utils/constants";
+import { getAllFollowing, patchFollowingItems } from "../utils/db";
+import {
+  fetchThirdPartyFormerNames,
+  isSuspiciousFormerNameTarget,
+  THIRD_PARTY_LOOKUP_BATCH_LIMIT,
+  THIRD_PARTY_LOOKUP_INTERVAL_MS,
+  THIRD_PARTY_LOOKUP_STALE_MS,
+  type FormerNameLookupProgress,
+} from "../utils/thirdPartyNameLookup";
 import {
   FOLLOWING_STATUS_LABEL,
   buildFollowingStats,
-  buildLocalNameTimeline,
-  buildThirdPartyNames,
   followTimeOf,
-  hasFormerNames,
-  isDeemphasized,
   paginateFollowing,
   queryFollowing,
-  resolveDisplayName,
+  resolveDisplayNameInfo,
   statusChangedAt,
   type FollowingFilter,
   type FollowingSort,
 } from "../utils/followingQuery";
-import { getStorageValue } from "../utils/storage";
+import { getStorageValue, setStorageValue } from "../utils/storage";
 import type { FollowingItem } from "../utils/types";
 import type { FollowingSyncProgress } from "../utils/followingSync";
 
 const PAGE_SIZE = 48;
+
+/** 后台任务是否已经失联：`running` 但超过阈值没有心跳（Service Worker 被休眠） */
+const isStaleLookupProgress = (progress: FormerNameLookupProgress | null): boolean =>
+  !!progress &&
+  progress.status === "running" &&
+  Date.now() - (progress.updatedAt ?? progress.startedAt) > THIRD_PARTY_LOOKUP_STALE_MS;
 
 /** UP 主没写简介时的占位文案。固定文案 + 固定两行高度，保证所有卡片的行位对齐 */
 const DEFAULT_SIGN = "这个人很神秘，什么都没有写";
@@ -107,9 +123,7 @@ const FollowingAvatar = ({ item, size = 64 }: { item: FollowingItem; size?: numb
         alt=""
         loading="lazy"
         style={{ width: size, height: size }}
-        className={`relative z-0 block rounded-full object-cover transition-transform duration-200 ease-out group-hover/avatar:z-20 group-hover/avatar:scale-150 group-hover/avatar:shadow-lg group-hover/avatar:ring-2 group-hover/avatar:ring-pink-300 motion-reduce:transition-none dark:group-hover/avatar:ring-pink-500/60 ${
-          isDeemphasized(item) ? "grayscale" : ""
-        }`}
+        className="relative z-0 block rounded-full object-cover transition-transform duration-200 ease-out group-hover/avatar:z-20 group-hover/avatar:scale-150 group-hover/avatar:shadow-lg group-hover/avatar:ring-2 group-hover/avatar:ring-pink-300 motion-reduce:transition-none dark:group-hover/avatar:ring-pink-500/60"
         onError={(event) => {
           const image = event.currentTarget;
           if (!image.src.endsWith("noface.jpg")) image.src = "/noface.jpg";
@@ -123,8 +137,21 @@ const FollowingAvatar = ({ item, size = 64 }: { item: FollowingItem; size?: numb
 // components/NameHistoryPopover.tsx —— 消失档案页也用同一份，
 // 避免同一份 nameHistory 在两个页面出现两种交互。
 
-const FollowingCard = ({ item }: { item: FollowingItem }) => {
-  const displayName = resolveDisplayName(item);
+const FollowingCard = ({
+  item,
+  lookupEnabled,
+  lookupBusy,
+  onLookupFormerName,
+  onSelectFormerName,
+}: {
+  item: FollowingItem;
+  lookupEnabled: boolean;
+  lookupBusy: boolean;
+  onLookupFormerName: (item: FollowingItem) => void;
+  onSelectFormerName: (item: FollowingItem, index: number) => void;
+}) => {
+  const displayInfo = resolveDisplayNameInfo(item);
+  const displayName = displayInfo.name;
   const spaceUrl = `https://space.bilibili.com/${item.mid}`;
   const disabled = item.status === "gone";
   const changedAt = statusChangedAt(item);
@@ -163,8 +190,8 @@ const FollowingCard = ({ item }: { item: FollowingItem }) => {
 
   return (
     <article
-      className={`flex gap-4 rounded-lg border border-gray-200 bg-white p-4 transition-shadow dark:border-neutral-800 dark:bg-neutral-900 ${
-        isDeemphasized(item) ? "opacity-60" : "hover:shadow-md"
+      className={`flex gap-4 rounded-lg border border-gray-200 bg-white p-4 transition-shadow hover:shadow-md dark:border-neutral-800 dark:bg-neutral-900 ${
+        item.status === "following" ? "" : "opacity-60"
       }`}
     >
       {/* 头像列：头像 + 下面的「复制 UID」按钮。
@@ -212,7 +239,46 @@ const FollowingCard = ({ item }: { item: FollowingItem }) => {
           {/* 曾用名徽章放昵称行：它讲的是"名字"，跟昵称是一件事。
               曾经它在卡片底部单独占一行，那是第 4 行孤岛，下面还会留一截空白。
               数量型文案保证行高恒定，具体名字在点击后的浮层里。 */}
-          <NameHistoryPopover item={item} />
+          <NameHistoryPopover
+            item={item}
+            selectedFormerNameIndex={
+              displayInfo.inferred ? displayInfo.candidateIndex : undefined
+            }
+            onSelectFormerName={
+              item.status === "gone" ? (index) => onSelectFormerName(item, index) : undefined
+            }
+          />
+          {/*
+            名字来自第三方存档时明确标出来，且放在昵称行最后，避免挤在名字和状态之间。
+            aicu 的 hname 没有时间戳、顺序不保证，这只是"最可能的注销前名字"。
+          */}
+          {displayInfo.inferred ? (
+            <span
+              className="shrink-0 rounded-full bg-gray-50 px-2 py-0.5 text-[11px] leading-4 text-gray-400 dark:bg-neutral-800/60 dark:text-neutral-500"
+              title="来自第三方存档（aicu.cc），无时间信息、顺序不保证，可能是曾用名之一"
+            >
+              第三方存档
+            </span>
+          ) : null}
+          {/*
+            按需查询入口只给「可疑账号」：已注销 / 名字未知 / 占位文案。
+            普通关注的查询走页面顶部的批量按钮，不在每张卡片上堆按钮。
+          */}
+          {lookupEnabled && isSuspiciousFormerNameTarget(item) && !item.thirdPartyQueriedAt && (item.thirdPartyNames?.length ?? 0) === 0 ? (
+            <button
+              type="button"
+              disabled={lookupBusy}
+              onClick={(event) => {
+                event.preventDefault();
+                event.stopPropagation();
+                onLookupFormerName(item);
+              }}
+              title="把该 UID 发送到第三方站点 aicu.cc 查询曾用名"
+              className="shrink-0 rounded-full border border-dashed border-gray-300 px-1.5 py-0.5 text-[11px] leading-4 text-gray-500 transition-colors hover:border-pink-300 hover:text-pink-500 disabled:cursor-not-allowed disabled:opacity-50 dark:border-neutral-600 dark:text-neutral-400 dark:hover:border-pink-500/50 dark:hover:text-pink-400"
+            >
+              {lookupBusy ? "查询中…" : "查曾用名"}
+            </button>
+          ) : null}
         </div>
 
         {/* 简介：没有简介时用默认文案，保证每张卡片都有这一行内容。
@@ -249,12 +315,18 @@ export const Following = () => {
   const [syncing, setSyncing] = useState(false);
   const [lastSyncAt, setLastSyncAt] = useState<number | null>(null);
   const [progress, setProgress] = useState<FollowingSyncProgress | null>(null);
-  /**
-   * 本地曾用名存档（只有本地构建会加载）。导入后：
-   * - 卡片上的「曾用名 N」徽章与浮层的「第三方存档」区块自动出现；
-   * - 搜索框按旧名也能搜到人（queryFollowing 本来就匹配 thirdPartyNames）。
-   */
-  const [archiveEntries, setArchiveEntries] = useState<Map<number, string[]> | null>(null);
+  /** 第三方曾用名查询（aicu.cc）：开关来自设置页，默认关闭 */
+  const [lookupEnabled, setLookupEnabled] = useState(DEFAULT_THIRD_PARTY_NAME_LOOKUP_ENABLED);
+  /** 首次同步后的批量提示是否已经关掉 */
+  const [lookupPrompted, setLookupPrompted] = useState(true);
+  const [lookupRunning, setLookupRunning] = useState(false);
+  const [lookupProgress, setLookupProgress] = useState<FormerNameLookupProgress | null>(null);
+  /** 卡片级单查的 loading：同一时间只允许点一个 */
+  const [lookupBusyMid, setLookupBusyMid] = useState<number | null>(null);
+  /** 本页发起的批量任务：由 sendMessage 的返回负责收尾，轮询不重复弹 toast */
+  const lookupStartedHereRef = useRef(false);
+  /** 本页发起查询的时间点：轮询据此忽略上一轮遗留的旧进度 */
+  const lookupStartRef = useRef(0);
 
   const load = useCallback(async () => {
     setLoading(true);
@@ -279,34 +351,124 @@ export const Following = () => {
     void load();
   }, [load]);
 
+  // 读取第三方查询的开关 / 首次提示状态 / 上次进度
   useEffect(() => {
-    if (!NAME_ARCHIVE_ENABLED) return;
     let cancelled = false;
-    void loadNameArchive()
-      .then((archive) => {
-        if (!cancelled) setArchiveEntries(archive?.entries ?? null);
-      })
-      .catch((error) => {
-        console.warn("加载曾用名存档失败:", error);
-      });
+    void (async () => {
+      const [enabled, prompted, storedProgress] = await Promise.all([
+        getStorageValue(THIRD_PARTY_NAME_LOOKUP_ENABLED, DEFAULT_THIRD_PARTY_NAME_LOOKUP_ENABLED),
+        getStorageValue(THIRD_PARTY_NAME_LOOKUP_PROMPTED, false),
+        getStorageValue<FormerNameLookupProgress | null>(THIRD_PARTY_NAME_LOOKUP_PROGRESS, null),
+      ]);
+
+      if (cancelled) return;
+      setLookupEnabled(Boolean(enabled));
+      setLookupPrompted(Boolean(prompted));
+      if (storedProgress?.status === "running") {
+        if (isStaleLookupProgress(storedProgress)) {
+          // 后台 Service Worker 可能已经被浏览器休眠：任务没了，进度还停在 running。
+          // 直接把残留进度收尾，否则页面会永远显示「查询中」。
+          const now = Date.now();
+          await setStorageValue(THIRD_PARTY_NAME_LOOKUP_PROGRESS, {
+            ...storedProgress,
+            status: "failed",
+            completedAt: now,
+            updatedAt: now,
+            message: "后台任务已中断（浏览器可能休眠了扩展）",
+          }).catch(() => undefined);
+          if (!cancelled) {
+            toast("上次曾用名查询已中断，已查完的结果已保留，可重新开始");
+          }
+        } else {
+          // storage 里的 running 可能是上一轮遗留的僵尸记录：先问后台任务是否真实存在
+          let actuallyRunning = false;
+          try {
+            const state = await browser.runtime.sendMessage({ action: "getFormerNameTaskState" });
+            actuallyRunning = Boolean(state?.running);
+          } catch {
+            actuallyRunning = false;
+          }
+          if (actuallyRunning) {
+            setLookupRunning(true);
+            setLookupProgress(storedProgress);
+          } else {
+            const now = Date.now();
+            await setStorageValue(THIRD_PARTY_NAME_LOOKUP_PROGRESS, {
+              ...storedProgress,
+              status: "failed",
+              completedAt: now,
+              updatedAt: now,
+              message: "上次查询已中断（后台任务已不存在）",
+            }).catch(() => undefined);
+          }
+        }
+      }
+    })().catch((error) => console.warn("读取曾用名查询配置失败:", error));
     return () => {
       cancelled = true;
     };
   }, []);
 
-  /**
-   * 把存档名字叠加到渲染用的数据上。没有存档时直接用原数组，
-   * 避免对上千条记录做无意义的复制。
-   */
-  const displayItems = useMemo(
-    () =>
-      archiveEntries
-        ? items.map((item) => applyArchiveNames(item, archiveEntries.get(item.mid)))
-        : items,
-    [items, archiveEntries],
-  );
+  // 批量查询期间轮询进度；不是本页发起的任务（例如刷新页面回来）由这里收尾
+  useEffect(() => {
+    if (!lookupRunning) return;
+    let active = true;
+    const tick = async () => {
+      const stored = await getStorageValue<FormerNameLookupProgress | null>(
+        THIRD_PARTY_NAME_LOOKUP_PROGRESS,
+        null,
+      );
+      if (!active || !stored) return;
+      // 本页刚发起：忽略上一轮遗留的旧进度，否则点击瞬间就会被判"已完成"、
+      // 进度条一闪而过（表现就是"点击没反应、刷新后才看到进度"）。
+      if (
+        lookupStartedHereRef.current &&
+        typeof stored.startedAt === "number" &&
+        stored.startedAt < lookupStartRef.current - 1000
+      ) {
+        return;
+      }
+      setLookupProgress(stored);
+      if (stored.status === "running") {
+        if (isStaleLookupProgress(stored)) {
+          active = false;
+          const now = Date.now();
+          await setStorageValue(THIRD_PARTY_NAME_LOOKUP_PROGRESS, {
+            ...stored,
+            status: "failed",
+            completedAt: now,
+            updatedAt: now,
+            message: "后台任务已中断（浏览器可能休眠了扩展）",
+          }).catch(() => undefined);
+          setLookupRunning(false);
+          await load();
+          if (!lookupStartedHereRef.current) {
+            toast.error("曾用名查询已中断；已查完的结果已保留，可重新开始");
+          }
+        }
+        return;
+      }
+      active = false;
+      setLookupRunning(false);
+      await load();
+      if (lookupStartedHereRef.current) return; // 本页发起的任务由 sendMessage 返回收尾
+      if (stored.status === "completed") {
+        toast.success(`曾用名查询完成：${stored.done} 人，${stored.found} 人有曾用名`);
+      } else if (stored.status === "cancelled") {
+        toast("已停止曾用名查询");
+      } else if (stored.status === "failed") {
+        toast.error(`曾用名查询中断：${stored.message ?? "接口异常"}`);
+      }
+    };
+    void tick();
+    const timer = window.setInterval(() => void tick(), 500);
+    return () => {
+      active = false;
+      window.clearInterval(timer);
+    };
+  }, [lookupRunning, load]);
 
-  const stats = useMemo(() => buildFollowingStats(displayItems), [displayItems]);
+  const stats = useMemo(() => buildFollowingStats(items), [items]);
 
   const filterOptions = useMemo(
     () => [
@@ -319,8 +481,8 @@ export const Following = () => {
   );
 
   const filtered = useMemo(
-    () => queryFollowing({ items: displayItems, keyword, filter, sort }),
-    [displayItems, keyword, filter, sort],
+    () => queryFollowing({ items, keyword, filter, sort }),
+    [items, keyword, filter, sort],
   );
 
   const page = useMemo(
@@ -344,6 +506,172 @@ export const Following = () => {
     }
   }, [load]);
 
+  /**
+   * 批量查询只针对「当前列表」：左侧筛选 + 搜索关键词之后的结果，
+   * 而不是全部关注。这样用户只想查「已注销」时不会把 1000+ 个关注都打一遍第三方接口。
+   */
+  const pendingLookupMids = useMemo(
+    () => filtered.filter((item) => !item.thirdPartyQueriedAt).map((item) => item.mid),
+    [filtered],
+  );
+  const pendingLookupCount = pendingLookupMids.length;
+
+  const dismissLookupPrompt = useCallback(() => {
+    setLookupPrompted(true);
+    void setStorageValue(THIRD_PARTY_NAME_LOOKUP_PROMPTED, true).catch(() => undefined);
+  }, []);
+
+  /** 批量查询：交给后台跑（单飞、限速、可中断），页面只负责进度和收尾 */
+  const startLookupBatch = useCallback(async () => {
+    // 点按钮至少要有反馈：早期版本这里直接 return，用户会以为"点了没反应"
+    if (lookupRunning) {
+      toast("查询正在进行中，请稍候");
+      return;
+    }
+    // 关注同步会整体重写 following 记录，和批量查询并发可能互相覆盖，先避开
+    if (syncing) {
+      toast("关注列表正在同步，请同步完成后再查询");
+      return;
+    }
+    if (pendingLookupCount === 0) {
+      toast("当前列表没有待查询的账号");
+      return;
+    }
+    lookupStartRef.current = Date.now();
+    dismissLookupPrompt();
+    lookupStartedHereRef.current = true;
+    setLookupRunning(true);
+    // 立即给一份"启动中"的进度：第一次点击后、后台还没回写 storage 时，
+    // 进度面板也要马上出现，而不是看起来像没反应。
+    setLookupProgress({
+      status: "running",
+      total: Math.min(pendingLookupCount, THIRD_PARTY_LOOKUP_BATCH_LIMIT),
+      done: 0,
+      found: 0,
+      failed: 0,
+      startedAt: Date.now(),
+      updatedAt: Date.now(),
+    });
+    let attachedToRunningTask = false;
+    try {
+      const response = await browser.runtime.sendMessage({
+        action: "lookupFormerNames",
+        mids: pendingLookupMids,
+      });
+      if (!response?.success) throw new Error(response?.error || "曾用名查询失败");
+      toast.success(response.message ?? "曾用名查询完成");
+      await load();
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "曾用名查询失败";
+      // 后台已经有任务在跑（页面刷新/重开过）：附加上去，而不是把进度藏起来。
+      // 之前的 bug 就是这里直接报错 + finally 关掉 running，用户既看不到进度、也点不动。
+      const stored = await getStorageValue<FormerNameLookupProgress | null>(
+        THIRD_PARTY_NAME_LOOKUP_PROGRESS,
+        null,
+      );
+      if (stored?.status === "running" && !isStaleLookupProgress(stored)) {
+        let actuallyRunning = false;
+        try {
+          const state = await browser.runtime.sendMessage({ action: "getFormerNameTaskState" });
+          actuallyRunning = Boolean(state?.running);
+        } catch {
+          actuallyRunning = false;
+        }
+        if (actuallyRunning) {
+          lookupStartRef.current = 0;
+          setLookupProgress(stored);
+          lookupStartedHereRef.current = false;
+          attachedToRunningTask = true;
+          toast("查询已在后台进行，已显示进度");
+          return;
+        }
+        // 僵尸进度：后台根本没有任务，清掉它，别让页面永远挂着「查询中」
+        await setStorageValue(THIRD_PARTY_NAME_LOOKUP_PROGRESS, {
+          ...stored,
+          status: "failed",
+          completedAt: Date.now(),
+          updatedAt: Date.now(),
+          message: "上次查询已中断（后台任务已不存在）",
+        }).catch(() => undefined);
+        toast("上次查询已中断，进度已重置，可重新开始");
+        return;
+      }
+      toast.error(message);
+    } finally {
+      // 附加模式保持 running，让轮询继续收尾；本页发起的任务才在结束时关掉
+      if (!attachedToRunningTask) {
+        lookupStartedHereRef.current = false;
+        setLookupRunning(false);
+      }
+    }
+  }, [dismissLookupPrompt, load, lookupRunning, pendingLookupCount, pendingLookupMids, syncing]);
+
+  const cancelLookupBatch = useCallback(async () => {
+    try {
+      await browser.runtime.sendMessage({ action: "cancelFormerNames" });
+      toast("正在停止查询…");
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : "停止查询失败");
+    }
+  }, []);
+
+  /** 卡片上的单查：只查这一个人，结果直接写进 following 记录 */
+  const handleLookupFormerName = useCallback(
+    async (item: FollowingItem) => {
+      if (lookupBusyMid !== null) return;
+      setLookupBusyMid(item.mid);
+      try {
+        const result = await fetchThirdPartyFormerNames(item.mid);
+        if (!result.ok) throw new Error(result.message ?? "查询失败");
+        const queriedAt = Date.now();
+        await patchFollowingItems([item.mid], {
+          thirdPartyNames: result.names,
+          thirdPartyQueriedAt: queriedAt,
+        });
+        setItems((previous) =>
+          previous.map((current) =>
+            current.mid === item.mid
+              ? { ...current, thirdPartyNames: result.names, thirdPartyQueriedAt: queriedAt }
+              : current,
+          ),
+        );
+        if (result.names.length > 0) {
+          toast.success(`查到 ${result.names.length} 个曾用名`);
+        } else {
+          toast("aicu 未收录该用户的曾用名");
+        }
+      } catch (error) {
+        toast.error(error instanceof Error ? error.message : "查询曾用名失败");
+      } finally {
+        setLookupBusyMid(null);
+      }
+    },
+    [lookupBusyMid],
+  );
+
+  /**
+   * 在浮层里点选某个第三方名字，作为卡片上显示的名字。
+   * 只有「已注销」账号会传这个回调（名字不会再变）；选择写进 `formerNameDisplayIndex`，
+   * 不影响存档数据本身，同步时也会保留。
+   */
+  const handleSelectFormerName = useCallback(
+    async (item: FollowingItem, index: number) => {
+      const info = resolveDisplayNameInfo(item);
+      if (!info.inferred || index < 0 || index >= info.candidateCount) return;
+      try {
+        await patchFollowingItems([item.mid], { formerNameDisplayIndex: index });
+        setItems((previous) =>
+          previous.map((current) =>
+            current.mid === item.mid ? { ...current, formerNameDisplayIndex: index } : current,
+          ),
+        );
+      } catch (error) {
+        toast.error(error instanceof Error ? error.message : "切换显示名字失败");
+      }
+    },
+    [],
+  );
+
   const syncHealth = (() => {
     if (!progress) return "尚未同步过";
     if (progress.status === "auth_invalid") return "未登录 B 站，同步已停止";
@@ -351,6 +679,19 @@ export const Following = () => {
     if (!progress.fullScanCompleted) return "上次同步不完整，已跳过取关判定";
     return "";
   })();
+
+  const lookupPercent =
+    lookupProgress && lookupProgress.total > 0
+      ? Math.min(100, Math.round((lookupProgress.done / lookupProgress.total) * 100))
+      : 0;
+  const lookupRemainingMinutes = lookupProgress
+    ? Math.max(
+        0,
+        Math.ceil(
+          ((lookupProgress.total - lookupProgress.done) * THIRD_PARTY_LOOKUP_INTERVAL_MS) / 60_000,
+        ),
+      )
+    : null;
 
   const sortLabel = SORTS.find((option) => option.value === sort)?.label ?? "";
   const activeFilterLabel =
@@ -488,6 +829,33 @@ export const Following = () => {
                 ) : null}
               </div>
 
+              {lookupEnabled ? (
+                lookupRunning ? (
+                  <button
+                    type="button"
+                    onClick={() => void cancelLookupBatch()}
+                    title="停止查询（已查完的人不会丢）"
+                    className="inline-flex items-center gap-1.5 rounded-full border border-pink-300 bg-pink-50 px-3.5 py-1.5 text-sm font-medium text-pink-600 transition-colors hover:bg-pink-100 dark:border-pink-500/40 dark:bg-pink-500/10 dark:text-pink-300"
+                  >
+                    <Wand2 className="h-3.5 w-3.5 animate-pulse" />
+                    {lookupProgress
+                      ? `查询中 ${lookupProgress.done}/${lookupProgress.total}`
+                      : "查询中…"}
+                  </button>
+                ) : (
+                  <button
+                    type="button"
+                    onClick={() => void startLookupBatch()}
+                    disabled={pendingLookupCount === 0 || syncing}
+                    title="把关注用户的 UID 发送到第三方站点 aicu.cc 查询曾用名；逐条限速，可随时停止"
+                    className="inline-flex items-center gap-1.5 rounded-full border border-pink-300 bg-pink-50 px-3.5 py-1.5 text-sm font-medium text-pink-600 transition-colors hover:bg-pink-100 disabled:cursor-not-allowed disabled:opacity-50 dark:border-pink-500/40 dark:bg-pink-500/10 dark:text-pink-300 dark:hover:bg-pink-500/20"
+                  >
+                    <Wand2 className="h-3.5 w-3.5" />
+                    {pendingLookupCount > 0 ? `补全曾用名 ${pendingLookupCount}` : "曾用名已查完"}
+                  </button>
+                )
+              ) : null}
+
               <button
                 type="button"
                 onClick={handleSync}
@@ -499,6 +867,80 @@ export const Following = () => {
               </button>
             </div>
           </div>
+
+          {/*
+            批量查询进度。和收藏夹恢复保持一致：进度条 + 统计文案 + 停止按钮，
+            而不是只在工具栏按钮里塞一个数字。离开页面再回来也能从 storage 恢复。
+          */}
+          {lookupRunning ? (
+            <div className="mb-5 rounded-xl border border-pink-200 bg-white p-4 dark:border-pink-500/30 dark:bg-neutral-900">
+              <div className="flex flex-wrap items-center justify-between gap-3">
+                <p className="text-sm font-medium text-gray-800 dark:text-neutral-100">
+                  正在查询曾用名（来源 aicu.cc）
+                </p>
+                <button
+                  type="button"
+                  onClick={() => void cancelLookupBatch()}
+                  className="rounded-full border border-pink-300 bg-pink-50 px-3 py-1 text-xs font-medium text-pink-600 transition-colors hover:bg-pink-100 dark:border-pink-500/40 dark:bg-pink-500/10 dark:text-pink-300 dark:hover:bg-pink-500/20"
+                >
+                  停止查询
+                </button>
+              </div>
+              <div className="mt-3 h-1.5 w-full overflow-hidden rounded-full bg-gray-200 dark:bg-neutral-700">
+                <div
+                  className="h-full rounded-full bg-pink-500 transition-[width] duration-300"
+                  style={{ width: `${Math.max(5, lookupPercent)}%` }}
+                />
+              </div>
+              <p className="mt-2 text-xs leading-relaxed text-gray-400 dark:text-neutral-500">
+                {lookupProgress
+                  ? `已查询 ${lookupProgress.done}/${lookupProgress.total} 条 · ${lookupProgress.found} 人有曾用名 · ${lookupProgress.failed} 人失败${
+                      lookupRemainingMinutes !== null
+                        ? ` · 剩余约 ${lookupRemainingMinutes} 分钟`
+                        : ""
+                    }`
+                  : "正在准备…"}
+              </p>
+              <p className="mt-1 text-[11px] leading-relaxed text-gray-400 dark:text-neutral-500">
+                本轮上限 200 人，逐条 1.5 秒；已查完的结果会立即保存，中途停止不会丢。
+              </p>
+            </div>
+          ) : null}
+
+          {lookupEnabled && !lookupPrompted && !lookupRunning && pendingLookupCount > 0 ? (
+            <div className="mb-5 flex flex-col justify-between gap-3 rounded-xl border border-pink-200 bg-pink-50/60 p-4 md:flex-row md:items-center dark:border-pink-500/30 dark:bg-pink-500/10">
+              <div className="text-sm text-gray-700 dark:text-neutral-200">
+                <p className="font-medium">可以为关注列表查询曾用名</p>
+                <p className="mt-1 text-xs leading-relaxed text-gray-500 dark:text-neutral-400">
+                  来自第三方站点 aicu.cc：只查询当前列表（左侧筛选 + 搜索词）里的用户，
+                  查询会把关注用户的 UID 发送给该站点，逐条限速、随时可停。
+                  当前列表还有 {pendingLookupCount} 人未查询，预计约{" "}
+                  {Math.max(
+                    1,
+                    Math.ceil((pendingLookupCount * THIRD_PARTY_LOOKUP_INTERVAL_MS) / 60_000),
+                  )}{" "}
+                  分钟。
+                </p>
+              </div>
+              <div className="flex shrink-0 gap-2">
+                <button
+                  type="button"
+                  onClick={dismissLookupPrompt}
+                  className="rounded-full px-3 py-1.5 text-xs text-gray-500 transition-colors hover:bg-gray-100 dark:text-neutral-400 dark:hover:bg-neutral-800"
+                >
+                  稍后
+                </button>
+                <button
+                  type="button"
+                  onClick={() => void startLookupBatch()}
+                  disabled={syncing}
+                  className="rounded-full bg-pink-500 px-3.5 py-1.5 text-xs font-medium text-white transition-colors hover:bg-pink-600 disabled:cursor-not-allowed disabled:opacity-50"
+                >
+                  开始查询
+                </button>
+              </div>
+            </div>
+          ) : null}
 
           {loading ? (
             <div className="py-20 text-center text-sm text-gray-400 dark:text-neutral-500">
@@ -522,7 +964,14 @@ export const Following = () => {
                   多出来的高度全堆在底部，看起来就是"底下留白太多"。 */}
               <div className="grid grid-cols-[repeat(auto-fill,minmax(320px,1fr))] items-start gap-6">
                 {page.items.map((item) => (
-                  <FollowingCard key={item.mid} item={item} />
+                  <FollowingCard
+                    key={item.mid}
+                    item={item}
+                    lookupEnabled={lookupEnabled}
+                    lookupBusy={lookupBusyMid === item.mid}
+                    onLookupFormerName={(target) => void handleLookupFormerName(target)}
+                    onSelectFormerName={(target, index) => void handleSelectFormerName(target, index)}
+                  />
                 ))}
               </div>
 
