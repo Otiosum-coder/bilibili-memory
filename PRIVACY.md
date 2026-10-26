@@ -1,7 +1,7 @@
 # 隐私政策 · Privacy Policy
 
 **哔哩哔哩记忆（Bilibili Memory）**
-最后更新：2026-10-17
+最后更新：2026-10-25
 
 ---
 
@@ -48,8 +48,11 @@
 | --- | --- | --- |
 | 你配置了 **WebDAV 同步** | **你自己填写的服务器地址**（如坚果云、自建 NAS） | 手动或按间隔自动同步 |
 | 你点击 **导出 / 本地目录备份** | 你选择的本地文件夹 | 手动或按间隔自动备份 |
+| 你在「关注列表」里查询**曾用名**（默认关闭，需你先开启并确认） | 第三方站点 `api.aicu.cc` | 仅在你点击查询时，逐条发送该关注用户的 UID |
 
-这两种都是**你自己主动配置**的，服务器地址完全由你决定。开发者不参与、也无法访问。
+前两种都是**你自己主动配置**的，服务器地址完全由你决定。开发者不参与、也无法访问。
+
+第三种是**唯一会把数据发往第三方站点**的功能：开启前会明确告知，查询时只发送「你在关注列表里主动查询的那个用户的 UID」，不发送你的账号、Cookie、历史或其他数据；查询频率被限制（逐条间隔发送、可随时停止），结果只保存在本机。
 
 B 站 API 调用：扩展会直接请求 `api.bilibili.com` 等 B 站官方域名，携带你自己的登录态。这是读取你自己数据的唯一途径，与你在浏览器里正常使用 B 站相同。
 
@@ -89,6 +92,7 @@ B 站 API 调用：扩展会直接请求 `api.bilibili.com` 等 B 站官方域�
 
 - `api.bilibili.com` 等 B 站官方接口 —— 读取你自己的数据
 - `biliplus.com` / `jijidown.com` —— **仅在你点击「恢复失效内容」时**查询公开的视频存档信息
+- `api.aicu.cc` —— **仅在你开启「曾用名查询」并点击查询时**，发送该关注用户的 UID 以查询公开的曾用名存档。该站点由第三方维护，可能随时失效
 - 你自建的 WebDAV 服务器
 
 ## 8. 政策变更
@@ -109,9 +113,10 @@ B 站 API 调用：扩展会直接请求 `api.bilibili.com` 等 B 站官方域�
 - **We do not collect any data.** There is no backend server, no analytics, no telemetry, no account system. The developer cannot access your data.
 - Your Bilibili session cookie (`SESSDATA`) is used **in memory only** to call Bilibili's official APIs on your behalf. It is never stored or transmitted to the developer.
 - Data leaves your device **only** when you configure your own WebDAV server or export a backup to a local folder — both are user-initiated and go only where you choose.
+- **One optional exception:** if you enable "look up former names" (off by default, needs explicit confirmation), the UID of the followed user you choose to look up is sent to `api.aicu.cc` — a third-party archive site. No account, cookie, history or other data is sent, requests are rate-limited, and you can stop at any time.
 - **No remote code.** All scripts are bundled within the extension.
 - To remove all data, uninstall the extension from your browser.
 
-Third-party endpoints contacted (only on user action): `api.bilibili.com` (Bilibili's official API), `biliplus.com` / `jijidown.com` (public archives, only when you click "recover invalid content"), and your own WebDAV server.
+Third-party endpoints contacted (only on user action): `api.bilibili.com` (Bilibili's official API), `biliplus.com` / `jijidown.com` (public archives, only when you click "recover invalid content"), `api.aicu.cc` (public former-name archive, only when you enable the feature and click a lookup), and your own WebDAV server.
 
 Contact: <https://github.com/Otiosum-coder/bilibili-memory/issues>

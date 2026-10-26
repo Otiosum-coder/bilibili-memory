@@ -39,7 +39,7 @@ export const BILIPLUS_NETWORK_BACKOFF_MS = 3_000;
 /** 单批最多重试几次 */
 export const BILIPLUS_MAX_RETRIES = 3;
 /** jijidown 只支持单条，逐条查询时的间隔 */
-export const JIJIDOWN_ITEM_DELAY_MS = 2_000;
+export const JIJIDOWN_ITEM_DELAY_MS = 1_500;
 /** jijidown 触发限流后的退避基数，按轮次线性递增 */
 export const JIJIDOWN_BACKOFF_BASE_MS = 15_000;
 /** jijidown 最多跑几轮（每轮只重试上一轮被限流的条目） */

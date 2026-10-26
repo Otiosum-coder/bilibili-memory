@@ -56,7 +56,21 @@ interface PopoverPosition {
   bottom?: number;
 }
 
-export const NameHistoryPopover = ({ item }: { item: FollowingItem }) => {
+export const NameHistoryPopover = ({
+  item,
+  selectedFormerNameIndex,
+  onSelectFormerName,
+}: {
+  item: FollowingItem;
+  /** 当前卡片展示的是第几个第三方名字（-1 表示用兜底 UID） */
+  selectedFormerNameIndex?: number;
+  /**
+   * 允许在浮层里直接点某个名字作为卡片显示名。
+   * **只给「已注销」账号传**：名字不会再变，选了才有意义；
+   * 未注销账号的昵称还会被同步更新，不让用户在这里固定旧名字。
+   */
+  onSelectFormerName?: (index: number) => void;
+}) => {
   const [open, setOpen] = useState(false);
   const [showAllNames, setShowAllNames] = useState(false);
   const [position, setPosition] = useState<PopoverPosition | null>(null);
@@ -170,14 +184,37 @@ export const NameHistoryPopover = ({ item }: { item: FollowingItem }) => {
             <div>
               <p className="mb-2 font-medium text-gray-700 dark:text-neutral-200">第三方存档</p>
               <div className="flex flex-wrap gap-1">
-                {visibleThirdParty.map((name) => (
-                  <span
-                    key={name}
-                    className="rounded border border-gray-200 px-1.5 py-0.5 text-gray-600 dark:border-neutral-700 dark:text-neutral-300"
-                  >
-                    {name}
-                  </span>
-                ))}
+                {visibleThirdParty.map((name, index) =>
+                  onSelectFormerName ? (
+                    <button
+                      key={name}
+                      type="button"
+                      onClick={(event) => {
+                        event.stopPropagation();
+                        onSelectFormerName(index);
+                      }}
+                      title={
+                        index === selectedFormerNameIndex
+                          ? "当前显示的就是这个名字"
+                          : "点击后，卡片上显示这个名字"
+                      }
+                      className={`rounded border px-1.5 py-0.5 text-left transition-colors ${
+                        index === selectedFormerNameIndex
+                          ? "border-pink-400 bg-pink-50 font-medium text-pink-600 dark:border-pink-500/50 dark:bg-pink-500/10 dark:text-pink-300"
+                          : "border-gray-200 text-gray-600 hover:border-pink-300 hover:text-pink-500 dark:border-neutral-700 dark:text-neutral-300 dark:hover:border-pink-500/50 dark:hover:text-pink-400"
+                      }`}
+                    >
+                      {name}
+                    </button>
+                  ) : (
+                    <span
+                      key={name}
+                      className="rounded border border-gray-200 px-1.5 py-0.5 text-gray-600 dark:border-neutral-700 dark:text-neutral-300"
+                    >
+                      {name}
+                    </span>
+                  ),
+                )}
                 {hiddenThirdPartyCount > 0 || showAllNames ? (
                   <button
                     type="button"
@@ -191,9 +228,22 @@ export const NameHistoryPopover = ({ item }: { item: FollowingItem }) => {
                   </button>
                 ) : null}
               </div>
+              {onSelectFormerName ? (
+                <p className="mt-2 text-[11px] leading-relaxed text-pink-500/80 dark:text-pink-400/70">
+                  点击名字可切换卡片上显示的名字（仅已注销账号可用）
+                </p>
+              ) : null}
               <p className="mt-2 text-xs leading-relaxed text-gray-400 dark:text-neutral-500">
-                来自第三方存档，无时间信息、顺序不保证，仅供参考
+                来自第三方存档（aicu.cc），无时间信息、顺序不保证，仅供参考
               </p>
+              <a
+                href="https://www.aicu.cc/"
+                target="_blank"
+                rel="noopener noreferrer"
+                className="mt-1 inline-block text-xs text-blue-500 hover:underline dark:text-blue-400"
+              >
+                在 aicu.cc 查看更多
+              </a>
             </div>
           ) : null}
         </div>

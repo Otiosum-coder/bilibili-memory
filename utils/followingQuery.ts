@@ -25,11 +25,50 @@ export interface FollowingStats {
   gone: number;
 }
 
-/** 名字未知时的兜底展示。绝不返回空串或占位文案 */
-export const resolveDisplayName = (item: FollowingItem): string => {
-  if (item.name && !isGoneName(item.name)) return item.name;
-  return `UID ${item.mid}（名字未知）`;
+export interface DisplayNameInfo {
+  name: string;
+  /** 名字来自第三方存档推测，而不是 B 站接口返回的真实昵称 */
+  inferred: boolean;
+  /** 可选的第三方名字数量（`inferred` 时 > 0） */
+  candidateCount: number;
+  /** 当前展示的是第几个候选（从 0 开始；`inferred` 时有效） */
+  candidateIndex: number;
+}
+
+/** 用户手动切换过的下标优先；越界或缺省时回退到最后一个（最可能的注销前名字） */
+const normalizeFormerNameIndex = (index: number | undefined, length: number): number => {
+  if (typeof index === "number" && Number.isInteger(index) && index >= 0 && index < length) {
+    return index;
+  }
+  return length - 1;
 };
+
+/**
+ * 卡片显示名。真实昵称优先；拿不到真实昵称时，用第三方存档里「最后一个非占位名字」
+ * 兜底（旧设计文档的规则：过滤占位文案后取最后一条作为最可能的注销前名字）。
+ *
+ * 注意：aicu 的 `hname` 没有时间戳、顺序不保证，所以这只是**推测**，
+ * 界面必须通过 `inferred` 标出来，不能当成"最后一次改名"的事实。
+ */
+export const resolveDisplayNameInfo = (item: FollowingItem): DisplayNameInfo => {
+  if (item.name && !isGoneName(item.name)) {
+    return { name: item.name, inferred: false, candidateCount: 0, candidateIndex: -1 };
+  }
+  const candidates = buildThirdPartyNames(item);
+  if (candidates.length > 0) {
+    const candidateIndex = normalizeFormerNameIndex(item.formerNameDisplayIndex, candidates.length);
+    return {
+      name: candidates[candidateIndex],
+      inferred: true,
+      candidateCount: candidates.length,
+      candidateIndex,
+    };
+  }
+  return { name: `UID ${item.mid}（名字未知）`, inferred: false, candidateCount: 0, candidateIndex: -1 };
+};
+
+/** 名字未知时的兜底展示。绝不返回空串或占位文案 */
+export const resolveDisplayName = (item: FollowingItem): string => resolveDisplayNameInfo(item).name;
 
 export const buildFollowingStats = (items: FollowingItem[]): FollowingStats => {
   const stats: FollowingStats = { total: 0, following: 0, unfollowed: 0, gone: 0 };

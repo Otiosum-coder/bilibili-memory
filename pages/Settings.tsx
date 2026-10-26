@@ -31,6 +31,9 @@ import {
   INTERACTIONS_SYNC_INTERVAL,
   DEFAULT_INTERACTIONS_AUTO_SYNC_ENABLED,
   DEFAULT_INTERACTIONS_SYNC_INTERVAL_MINUTES,
+  THIRD_PARTY_NAME_LOOKUP_ENABLED,
+  DEFAULT_THIRD_PARTY_NAME_LOOKUP_ENABLED,
+  THIRD_PARTY_NAME_LOOKUP_CONSENT,
 } from "../utils/constants";
 import toast from "react-hot-toast";
 import { Checkbox } from "../components/Checkbox";
@@ -159,6 +162,12 @@ const Settings = () => {
     DEFAULT_INTERACTIONS_SYNC_INTERVAL_MINUTES,
   );
   const [historyMigrationSkipped, setHistoryMigrationSkipped] = useState(0);
+  /** 第三方曾用名查询（aicu.cc）。默认关闭，首次开启要用户确认 */
+  const [thirdPartyLookupEnabled, setThirdPartyLookupEnabled] = useState(
+    DEFAULT_THIRD_PARTY_NAME_LOOKUP_ENABLED,
+  );
+  const [thirdPartyConsentGiven, setThirdPartyConsentGiven] = useState(false);
+  const [showThirdPartyConsent, setShowThirdPartyConsent] = useState(false);
 
   const isPresetInterval = SYNC_INTERVAL_PRESETS.some(
     (option) => option.minutes === Number(syncInterval),
@@ -312,6 +321,16 @@ const Settings = () => {
           : DEFAULT_INTERACTIONS_SYNC_INTERVAL_MINUTES,
       );
       setHistoryMigrationSkipped(Number(migrationReport.skipped) || 0);
+      const thirdPartyEnabled = await getStorageValue<boolean>(
+        THIRD_PARTY_NAME_LOOKUP_ENABLED,
+        DEFAULT_THIRD_PARTY_NAME_LOOKUP_ENABLED,
+      );
+      const thirdPartyConsent = await getStorageValue<boolean>(
+        THIRD_PARTY_NAME_LOOKUP_CONSENT,
+        false,
+      );
+      setThirdPartyLookupEnabled(thirdPartyEnabled);
+      setThirdPartyConsentGiven(thirdPartyConsent);
     };
     loadSettings();
     void refreshStorageHealth();
@@ -349,6 +368,38 @@ const Settings = () => {
   const handleFollowingIntervalChange = async (minutes: number) => {
     setFollowingIntervalMinutes(minutes);
     await setStorageValue(FOLLOWING_SYNC_INTERVAL, minutes);
+  };
+
+  /**
+   * 第三方曾用名查询开关。开启前必须有知情同意：
+   * 查询会把关注用户的 UID 发送给 aicu.cc，这和项目"数据不出本机"的默认承诺不同，
+   * 所以不能只靠一个静默复选框。
+   */
+  const handleThirdPartyLookupChange = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const next = e.target.checked;
+    if (!next) {
+      setThirdPartyLookupEnabled(false);
+      setShowThirdPartyConsent(false);
+      await setStorageValue(THIRD_PARTY_NAME_LOOKUP_ENABLED, false);
+      return;
+    }
+    if (!thirdPartyConsentGiven) {
+      setShowThirdPartyConsent(true);
+      return;
+    }
+    setThirdPartyLookupEnabled(true);
+    await setStorageValue(THIRD_PARTY_NAME_LOOKUP_ENABLED, true);
+  };
+
+  const confirmThirdPartyConsent = async () => {
+    setThirdPartyConsentGiven(true);
+    setShowThirdPartyConsent(false);
+    setThirdPartyLookupEnabled(true);
+    await Promise.all([
+      setStorageValue(THIRD_PARTY_NAME_LOOKUP_CONSENT, true),
+      setStorageValue(THIRD_PARTY_NAME_LOOKUP_ENABLED, true),
+    ]);
+    toast.success("已开启关注列表曾用名查询");
   };
 
   const handleInteractionAutoSyncChange = async (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -808,6 +859,65 @@ const Settings = () => {
                 关注变动（取关 / 改名 / 注销）只在同步时才会被发现，间隔越长越可能漏掉中间变化。
               </p>
             </div>
+          </div>
+
+          {/* 第三方曾用名查询（aicu.cc）。默认关闭，首次开启必须知情同意：
+              这是本扩展唯一会把数据发到本机之外的功能（只发关注用户的 UID）。 */}
+          <div className="w-full rounded-xl bg-gray-50 dark:bg-neutral-900 shadow-sm border border-gray-100 dark:border-neutral-800">
+            <div className="flex items-center justify-between p-5">
+              <div className="pr-4">
+                <h3 className="text-base font-medium text-gray-800 dark:text-neutral-100">
+                  关注列表曾用名查询（第三方）
+                </h3>
+                <p className="mt-1 text-xs text-gray-400 dark:text-neutral-500">
+                  默认关闭。开启后可在「关注列表」页手动查询曾用名；查询会把该关注用户的 UID
+                  发送给第三方站点 aicu.cc，逐条限速、可随时停止，查到的名字只存本机。
+                  <a
+                    className="ml-1 text-blue-500 hover:underline dark:text-blue-400"
+                    href="https://www.aicu.cc/"
+                    target="_blank"
+                    rel="noopener noreferrer"
+                  >
+                    前往 aicu.cc 查看更多
+                  </a>
+                </p>
+              </div>
+              <label className="relative inline-flex shrink-0 cursor-pointer items-center">
+                <input
+                  type="checkbox"
+                  className="sr-only peer"
+                  checked={thirdPartyLookupEnabled}
+                  onChange={handleThirdPartyLookupChange}
+                />
+                <div className="w-11 h-6 bg-gray-200 dark:bg-neutral-700 peer-focus:outline-none rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border-gray-300 dark:after:border-neutral-600 after:border after:rounded-full after:h-5 after:w-5 after:transition-all peer-checked:bg-blue-600"></div>
+              </label>
+            </div>
+
+            {showThirdPartyConsent ? (
+              <div className="border-t border-pink-200 bg-pink-50/60 px-5 py-4 dark:border-pink-500/30 dark:bg-pink-500/10">
+                <p className="text-xs leading-relaxed text-gray-600 dark:text-neutral-300">
+                  启用后，你在关注列表里查询某个用户的曾用名时，会把该用户的 UID 发送给第三方站点
+                  aicu.cc。该站点由第三方维护、可能随时失效；返回的名字没有时间信息，顺序也不保证，
+                  「未收录」不代表没改过名。所有查询都由你手动触发，不会自动运行。
+                </p>
+                <div className="mt-3 flex flex-wrap gap-2">
+                  <button
+                    type="button"
+                    onClick={() => setShowThirdPartyConsent(false)}
+                    className="rounded-full border border-gray-300 bg-white px-3 py-1.5 text-xs text-gray-600 transition-colors hover:bg-gray-100 dark:border-neutral-700 dark:bg-neutral-900 dark:text-neutral-300 dark:hover:bg-neutral-800"
+                  >
+                    取消
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => void confirmThirdPartyConsent()}
+                    className="rounded-full bg-pink-500 px-3.5 py-1.5 text-xs font-medium text-white transition-colors hover:bg-pink-600"
+                  >
+                    我已了解，启用
+                  </button>
+                </div>
+              </div>
+            ) : null}
           </div>
 
           {/* 收藏夹自动同步。与关注/互动同一套交互，但**默认关闭**：

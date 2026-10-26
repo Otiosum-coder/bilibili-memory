@@ -98,10 +98,12 @@ export const DEFAULT_FAV_FULL_SYNC_INTERVAL_MINUTES = 60 * 24 * 7;
 // 默认关闭、仅用户主动触发、仅限名字已是占位文案的账号。
 export const THIRD_PARTY_NAME_LOOKUP_ENABLED = "thirdPartyNameLookupEnabled";
 export const DEFAULT_THIRD_PARTY_NAME_LOOKUP_ENABLED = false;
-
-// 本地曾用名存档（仅本地构建启用）：由 tools/hname-build.mjs 生成的切片，
-// 导入后只写 storage.local，不上传、不进备份、不随扩展包分发。见 utils/nameArchive.ts。
-export const NAME_ARCHIVE_DATA = "nameArchiveData";
+/** 页面轮询这个键显示「已查 X / 共 Y」 */
+export const THIRD_PARTY_NAME_LOOKUP_PROGRESS = "thirdPartyNameLookupProgress";
+/** 首次同步后的一次性提示是否已经展示/关闭过，避免反复打扰 */
+export const THIRD_PARTY_NAME_LOOKUP_PROMPTED = "thirdPartyNameLookupPrompted";
+/** 是否已阅读并同意「会把关注用户的 UID 发送到 aicu.cc」 */
+export const THIRD_PARTY_NAME_LOOKUP_CONSENT = "thirdPartyNameLookupConsent";
 
 // 图片字节归档（头像 / 收藏封面）。字节只存本地，不进 WebDAV 与本地目录备份
 export const FOLLOWING_AVATAR_ARCHIVE_PROGRESS = "followingAvatarArchiveProgress";
