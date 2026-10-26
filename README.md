@@ -11,7 +11,7 @@
     <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-green?style=flat-square" alt="License" /></a>
     <a href="https://chromewebstore.google.com/detail/jdmogkkaendjkakjipamlnhinmjpolkl"><img src="https://img.shields.io/badge/Chrome-商店安装-blue?style=flat-square" alt="Chrome Web Store" /></a>
     <a href="https://microsoftedge.microsoft.com/addons/detail/mokkmblpfodpmmkndmbfjnmiknmlokah"><img src="https://img.shields.io/badge/Edge-商店安装-blue?style=flat-square" alt="Edge Add-ons" /></a>
-    <img src="https://img.shields.io/badge/Firefox-手动安装-orange?style=flat-square" alt="Firefox" />
+    <a href="https://addons.mozilla.org/zh-CN/firefox/addon/bilibili-memory/"><img src="https://img.shields.io/badge/Firefox-商店安装-orange?style=flat-square" alt="Firefox AMO" /></a>
   </p>
 </div>
 
@@ -36,10 +36,22 @@ B 站的很多东西**默认都是会消失的**：
 ### 永久保存
 
 - **观看历史** — 自动同步并永久保留，突破官方 3 个月限制
-- **收藏夹** — 全量 + 增量同步；失效条目会保留本地已有的标题、封面与时长，不被占位数据覆盖
+- **收藏夹** — 全量 + 增量同步；失效条目会保留本地已有的标题、封面与时长，不被占位数据覆盖；
+  列表接口漏掉的隐藏条目（如「仅自己可见」）会通过补全接口找回，并按收藏夹内位置插入
 - **订阅合集** — 与收藏夹同一套失效保护
 - **关注列表** — 记录改名、取关与注销，保留**曾用名链路**（B 站不提供历史昵称查询，这是唯一来源）
 - **点赞与投币** — B 站只留最近 20 条，超出后本地仍完整保留；掉出窗口的条目**不会被删除**
+
+### 曾用名补全（可选，默认关闭）
+
+B 站只展示当前昵称，改过名之后就查不到以前叫什么了。开启后可以用第三方档案补全关注列表的曾用名：
+
+- **默认关闭**，必须在设置页阅读说明并同意后才会工作；
+- **只查询关注列表**，支持「当前筛选/搜索结果批量补全」和单条补全，不会查询任意 UID；
+- 批量每次最多 200 条，逐条限速、连续失败自动停止、可随时取消；
+- 查询时会把**关注用户的 UID** 发送到第三方档案 [aicu.ac.cc](https://www.aicu.cc/)，
+  不发送 Cookie、账号信息或其他本地数据；结果只写入本地数据库；
+- 结果在名字旁标注来源；已注销账号可以在曾用名浮层里点选，切换卡片上显示的名字。
 
 ### 消失档案
 
@@ -47,8 +59,21 @@ B 站的很多东西**默认都是会消失的**：
 
 - 每条都保存**消失那一刻的完整快照**，按来源与原因筛选，支持搜索与导出
 - **可以恢复到原来的页面** —— 把快照写回收藏夹 / 订阅合集 / 关注列表 / 互动记录
-- 按原因区分：UP 主删除、其他原因删除、内容不可见、已移出合集、改过曾用名……
+- 按原因区分：UP 主删除、其他原因删除、内容不可见、已移出合集、账号注销、改过曾用名……
+- 原因只根据**本地已有数据**（`attr`、`invalidatedKind`、占位标题）推断，不会为了归档额外请求 B 站；
+  推不出来的标「原因不明 / 未证实」，而不是假装知道
+- 只有本次同步**完整覆盖**整个收藏夹时才会判定「消失」，避免把隐藏条目误归档
 - 只增不删；**默认纳入备份范围**（它是内容消失后的唯一副本）
+
+### 失效内容恢复
+
+针对收藏夹里已经变成「已失效视频」的条目，尝试找回标题与封面：
+
+- 来源：B 站公开接口、[biliplus](https://www.biliplus.com/)、[jijidown](https://www.jijidown.com/)，
+  按可用性自动降级
+- 先补标题、再补封面，补到的封面会下载成字节存进本地图片归档，第三方链接以后失效也能看
+- 进度按阶段显示（本地比对 / biliplus / 公开接口 / jijidown / 归档封面），不会长时间无反馈
+- 需要手动点击，不会自动在后台运行；恢复结果会写回本页
 
 ### 备份与同步
 
@@ -62,7 +87,6 @@ B 站的很多东西**默认都是会消失的**：
 ### 其他
 
 - **存储明细** — 按类别列出占用：图片字节为精确值，结构化数据为采样估算，可按类别清理
-- **失效收藏恢复** — 尝试从公开接口找回失效收藏的标题与封面
 - **隐私优先** — 数据默认只存在本地；是否上传云端完全由你决定，且只发往你自己配置的地址
 
 ## 与上游项目的关系
@@ -74,10 +98,12 @@ B 站的很多东西**默认都是会消失的**：
 **本 fork 新增**：
 
 - **关注 UP 主追踪** —— 改名 / 取关 / 注销事件，曾用名链路，注销前快照
+- **曾用名补全**（可选）—— 通过第三方档案补全关注列表的历史昵称
 - **点赞与投币记录**（`interactions`）—— 针对 B 站 20 条滚动窗口的永久留档
 - **订阅合集备份与失效保护**
 - **「消失档案」统一留档页** —— 四处来源汇总、可恢复到原页面
-- **存储明细面板**、**失效收藏恢复**、**本地目录自动备份**
+- **失效内容恢复** —— B 站公开接口 + 第三方档案，补标题与封面，封面字节本地归档
+- **存储明细面板**、**本地目录自动备份**
 - 数据校验与合并策略的若干修正（含收藏/合集失效元数据保护、互动排序修正等）
 
 **同时移除了上游这些功能**（因此本文档不再宣传它们）：
@@ -98,7 +124,7 @@ B 站的很多东西**默认都是会消失的**：
 | --- | --- |
 | **Chrome** | <https://chromewebstore.google.com/detail/jdmogkkaendjkakjipamlnhinmjpolkl> |
 | **Edge** | <https://microsoftedge.microsoft.com/addons/detail/mokkmblpfodpmmkndmbfjnmiknmlokah> |
-| **Firefox** | 暂未上架，请按下方「手动安装」使用 |
+| **Firefox** | <https://addons.mozilla.org/zh-CN/firefox/addon/bilibili-memory/> |
 
 商店版会自动更新，推荐优先使用。
 
@@ -135,6 +161,7 @@ Firefox 用 `pnpm build:firefox`，然后 `about:debugging` → 「临时载入�
 3. 首次同步会全量抓取你的数据
 4. 到「设置」页配置各类自动同步的开关与间隔
 5. 到「数据备份」页配置 WebDAV 或本地目录备份——**消失档案不可再得，建议尽早开启**
+6. 想补全关注列表曾用名的话，到「设置」页了解说明后按需开启
 
 ## 技术栈
 
@@ -159,13 +186,15 @@ pnpm dev                                  # Chrome 开发模式
 
 也可以用 npm（已验证可构建）——代价是那个 wxt 补丁不会应用，`npm run dev` 下重载扩展时可能看到一个未捕获的 Promise 报错，`npm run build` 不受影响。
 
-| 命令                | 说明                |
-| ------------------- | ------------------- |
-| `pnpm dev`          | Chrome 开发模式     |
-| `pnpm build`        | 生产构建            |
-| `pnpm compile`      | TypeScript 类型检查 |
-| `pnpm test`         | 单元测试（vitest）  |
-| `pnpm format`       | Prettier 格式化     |
+| 命令 | 说明 |
+| --- | --- |
+| `pnpm dev` | Chrome 开发模式 |
+| `pnpm build` | Chrome 生产构建（`.output/chrome-mv3`） |
+| `pnpm build:firefox` | Firefox 生产构建（`.output/firefox-mv2`） |
+| `pnpm zip` | 打 Chrome 商店包（`.output/bilibili-memory-<version>-chrome.zip`） |
+| `pnpm zip:firefox` | 打 Firefox 商店包（含 AMO 需要的 sources zip） |
+| `pnpm compile` | TypeScript 类型检查 |
+| `pnpm test` | 单元测试（vitest） |
 
 > ⚠️ 仓库当前的代码与已安装的 Prettier 版本存在格式差异，`format:check` 会在**未改动的文件上**也失败。在弄清基准版本之前，**不要跑 `prettier --write`**，否则会产生大量无关改动。
 
@@ -174,6 +203,9 @@ pnpm dev                                  # Chrome 开发模式
 ## 数据与隐私
 
 - 所有数据默认存储在浏览器本地 IndexedDB（库名 `bilibiliHistory`），不上传任何服务器
+- **曾用名补全默认关闭**。只有你在设置页明确开启并同意后，扩展才会在查询时把**关注列表内用户的 UID**
+  发送给第三方档案 [aicu.ac.cc](https://www.aicu.cc/)；不发送 Cookie、账号信息或其他本地数据，
+  可随时关闭；查询结果只保存在本地。详见 [PRIVACY.md](PRIVACY.md)
 - 使用 WebDAV 时，数据只会发往你自己配置的地址
 - **图片字节归档（头像、收藏封面、互动封面）只存在本地**：本地目录备份会把它写成 `images/` 下的真实文件；JSON 与 WebDAV 备份**不含**图片字节
 
@@ -184,7 +216,11 @@ pnpm dev                                  # Chrome 开发模式
 - **点赞没有时间戳** —— B 站点赞接口不返回点赞时间。首轮记录的条目标「早期」，之后的显示本地首次记录日期
 - **「B站已不显示」不等于你取消了点赞** —— B 站的 `relation` / `has/like` 接口**只反映近期状态**，很早的赞再查就是 `false`。实测对老视频重新点赞会提示「重复点赞」，说明记录仍在。因此本扩展**不删除**这类条目，标签也如实写作「B站已不显示」
 - **互动记录是滚动窗口** —— B 站只返回最近 20 条，两次同步之间被挤出的条目无法补回
+- **第三方曾用名不保证完整** —— aicu 的档案来自历史抓取，可能缺条目、也可能没有时间顺序；扩展只展示已有候选并标注「第三方存档」，没有收录时不会伪造名字
+- **隐藏收藏不一定能找回** —— 补全依赖 B 站 `spaceDetail` 是否对当前账号返回这些条目；接口不返回时，页面仍会如实显示「在线 N 条 / 本地 M 条」
+- **消失档案的原因是本地推断** —— B 站接口不返回删除原因，部分条目只能标「原因不明 / 未证实」
 - **失效条目的元数据只在失效前抓到过时才能保留** —— 如果某个条目在保护逻辑生效之前就被占位数据覆盖，那部分信息无法找回
+- **第三方恢复依赖外部站点** —— biliplus / jijidown 可能限流、下线，或没有收录某条稿件；查不到时会保留原记录并显示失败状态
 
 ## 免责声明
 
