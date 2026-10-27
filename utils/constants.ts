@@ -112,6 +112,8 @@ export const FAV_COVER_ARCHIVE_PROGRESS = "favCoverArchiveProgress";
 export const COLLECTION_COVER_ARCHIVE_PROGRESS = "collectionCoverArchiveProgress";
 /** 失效收藏恢复的实时进度。页面据此轮询显示「已查 X / 共 Y」。 */
 export const FAV_RECOVERY_PROGRESS = "favRecoveryProgress";
+/** 恢复结束时，对因限流没处理的条目再等多久重试一次（毫秒） */
+export const FAV_RECOVERY_FINAL_RETRY_DELAY_MS = 30_000;
 /** 关注/收藏发生变动时是否弹系统通知。默认开启 */
 export const CHANGE_NOTIFICATION_ENABLED = "changeNotificationEnabled";
 
@@ -220,6 +222,15 @@ export const DELETED_HISTORY_IDS = "deletedHistoryIds";
 export const THEME_MODE = "themeMode";
 
 export const UPDATE_HISTORY = [
+  {
+    date: "2026-10-27",
+    version: "0.4.1",
+    changes: [
+      "消失档案：收藏类卡片显示「所属收藏夹」，同一条视频存在于多个收藏夹时不再像重复条目",
+      "消失档案：卡片日期改为视频的发布时间/收藏时间，不再整批显示同一天；新增「发布时间 新→旧 / 旧→新」排序，并换成自定义下拉样式",
+      "恢复失效内容：jijidown 三轮后仍限流的条目，会在本轮结束前等待 30 秒用 biliplus 再补一次；结果会提示「N 条因限流未完成，建议稍后重试」",
+    ],
+  },
   {
     date: "2026-10-26",
     version: "0.4.0",

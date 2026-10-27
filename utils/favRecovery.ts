@@ -346,4 +346,6 @@ export interface FavRecoveryOutcome {
   sources: Partial<Record<FavRecoverySource, number>>;
   /** 跑完之后仍待恢复的条数 */
   remaining: number;
+  /** 其中因第三方限流、本轮没来得及处理的条数（建议稍后重试） */
+  rateLimited: number;
 }

@@ -9,8 +9,8 @@
 
   <p>
     <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-green?style=flat-square" alt="License" /></a>
-    <a href="https://chromewebstore.google.com/detail/jdmogkkaendjkakjipamlnhinmjpolkl"><img src="https://img.shields.io/badge/Chrome-商店安装-blue?style=flat-square" alt="Chrome Web Store" /></a>
-    <a href="https://microsoftedge.microsoft.com/addons/detail/mokkmblpfodpmmkndmbfjnmiknmlokah"><img src="https://img.shields.io/badge/Edge-商店安装-blue?style=flat-square" alt="Edge Add-ons" /></a>
+    <a href="https://chromewebstore.google.com/detail/jdmogkkaendjkakjjpamlnhinmjpolkl"><img src="https://img.shields.io/badge/Chrome-商店安装-blue?style=flat-square" alt="Chrome Web Store" /></a>
+    <a href="https://microsoftedge.microsoft.com/addons/detail/bilibili-memory/mokkmblpfodpmmkndmbfjnmiknnlokah"><img src="https://img.shields.io/badge/Edge-商店安装-blue?style=flat-square" alt="Edge Add-ons" /></a>
     <a href="https://addons.mozilla.org/zh-CN/firefox/addon/bilibili-memory/"><img src="https://img.shields.io/badge/Firefox-商店安装-orange?style=flat-square" alt="Firefox AMO" /></a>
   </p>
 </div>
@@ -122,8 +122,8 @@ B 站只展示当前昵称，改过名之后就查不到以前叫什么了。开
 
 | 浏览器 | 安装 |
 | --- | --- |
-| **Chrome** | <https://chromewebstore.google.com/detail/jdmogkkaendjkakjipamlnhinmjpolkl> |
-| **Edge** | <https://microsoftedge.microsoft.com/addons/detail/mokkmblpfodpmmkndmbfjnmiknmlokah> |
+| **Chrome** | <https://chromewebstore.google.com/detail/jdmogkkaendjkakjjpamlnhinmjpolkl> |
+| **Edge** | <https://microsoftedge.microsoft.com/addons/detail/bilibili-memory/mokkmblpfodpmmkndmbfjnmiknnlokah> |
 | **Firefox** | <https://addons.mozilla.org/zh-CN/firefox/addon/bilibili-memory/> |
 
 商店版会自动更新，推荐优先使用。

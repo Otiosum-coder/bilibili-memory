@@ -129,6 +129,7 @@ export const Favorites = () => {
     phase?: string;
     phaseDone?: number;
     phaseTotal?: number;
+    rateLimited?: number;
   } | null>(null);
 
   // 打开页面时如果后台已有恢复任务在跑，自动附加上去（否则用户会看到一个
@@ -190,6 +191,7 @@ export const Favorites = () => {
         phase?: string;
         phaseDone?: number;
         phaseTotal?: number;
+        rateLimited?: number;
       } | null>(FAV_RECOVERY_PROGRESS, null);
       if (!active || !stored) return;
       // 本页刚发起的任务：忽略上一轮遗留的旧进度，否则点击瞬间就会被判"已完成"，
@@ -220,7 +222,14 @@ export const Favorites = () => {
       setIsRecovering(false);
       setRecoveryProgress(null);
       if (attached) {
-        toast.success("失效内容恢复已完成");
+        const rateLimited = typeof stored.rateLimited === "number" ? stored.rateLimited : 0;
+        if (rateLimited > 0) {
+          toast.success(
+            `失效内容恢复已完成，${rateLimited} 条因限流未完成，建议稍后重试`,
+          );
+        } else {
+          toast.success("失效内容恢复已完成");
+        }
         if (selectedFolderId) {
           void loadResources(selectedFolderId, { resetSearch: false });
         }

@@ -2,6 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   ArrowDownUp,
   BadgeCheck,
+  Check,
   CheckSquare,
   ChevronDown,
   ExternalLink,
@@ -18,6 +19,7 @@ import { createAssetObjectUrl } from "../utils/assetArchive";
 import {
   deleteVanishArchiveItems,
   deleteVanishedFavResources,
+  getAllFavFolders,
   getAllFavResources,
   getAllFollowing,
   getAllInteractions,
@@ -49,6 +51,7 @@ import {
   type VanishArchiveFilter,
 } from "../utils/vanishArchive";
 import type {
+  FavoriteFolder,
   FollowingItem,
   VanishArchiveItem,
   VanishArchiveReason,
@@ -117,6 +120,34 @@ const formatDate = (timestamp: number): string => {
 };
 
 /**
+ * 档案卡片上显示的“内容自身时间”。
+ *
+ * 卡片原来显示 `vanishedAt`（首次判定消失时间），但同一批归档的条目会全部相同，
+ * 看起来就是“日期都一样、顺序乱了”。这里改用快照里的 `pubtime`（发布时间），
+ * 退而求其次用 `fav_time`；两者都没有才显示「时间未知」。
+ * 归档时间仍保留在 tooltip / 详情里。
+ */
+const getArchiveDisplayTime = (
+  item: VanishArchiveItem,
+): { at: number; label: "发布时间" | "收藏时间" } | null => {
+  const snapshot =
+    item.item && typeof item.item === "object" && !Array.isArray(item.item)
+      ? (item.item as Record<string, unknown>)
+      : null;
+  if (!snapshot) return null;
+
+  const pubtime = Number(snapshot.pubtime ?? snapshot.pubdate);
+  if (Number.isFinite(pubtime) && pubtime > 0) {
+    return { at: pubtime * 1000, label: "发布时间" };
+  }
+  const favTime = Number(snapshot.fav_time);
+  if (Number.isFinite(favTime) && favTime > 0) {
+    return { at: favTime * 1000, label: "收藏时间" };
+  }
+  return null;
+};
+
+/**
  * 快照字段的中文名。
  *
  * 详情默认只展示这张表里认识的字段——直接把整个对象 `JSON.stringify` 摊给用户，
@@ -140,6 +171,7 @@ const SNAPSHOT_FIELD_LABELS: Record<string, string> = {
   authorMid: "UP 主 UID",
   duration: "时长",
   pubdate: "投稿时间",
+  pubtime: "发布时间",
   fav_time: "收藏时间",
   interactedAt: "互动时间",
   firstSeenAt: "首次记录时间",
@@ -325,6 +357,7 @@ const ArchiveCover = ({ item, avatar = false }: { item: VanishArchiveItem; avata
 const VanishedCard = ({
   item,
   following,
+  folderLabel,
   selected,
   managing,
   onToggleSelect,
@@ -333,6 +366,8 @@ const VanishedCard = ({
 }: {
   item: VanishArchiveItem;
   following?: FollowingItem;
+  /** 「收藏夹：xxx」，仅收藏类条目有值；同一 BV 在多个夹子时用来区分重复条目 */
+  folderLabel?: string | null;
   selected: boolean;
   managing: boolean;
   onToggleSelect: () => void;
@@ -352,6 +387,8 @@ const VanishedCard = ({
   const duration = isFollowing
     ? ""
     : formatInteractionDuration(item.duration ?? snapshotDuration(item));
+  // 卡片右下角展示内容自身时间（发布时间 → 收藏时间），归档时间放进 tooltip
+  const displayTime = isFollowing ? null : getArchiveDisplayTime(item);
 
   // 只有"可能仍然可访问"的条目才给链接：其余点开只会看到错误页
   const reachable =
@@ -514,6 +551,14 @@ const VanishedCard = ({
                 </p>
               )
             ) : null}
+            {folderLabel ? (
+              <p
+                className="mt-1 line-clamp-1 text-[11px] text-gray-400 dark:text-neutral-500"
+                title={folderLabel}
+              >
+                {folderLabel}
+              </p>
+            ) : null}
           </>
         )}
 
@@ -561,9 +606,13 @@ const VanishedCard = ({
               )}
               <span
                 className="shrink-0 tabular-nums text-gray-400 dark:text-neutral-500"
-                title={`消失判定时间：${formatDateTime(item.vanishedAt)}`}
+                title={
+                  displayTime
+                    ? `${displayTime.label}：${formatDateTime(displayTime.at)} ｜ 归档时间：${formatDateTime(item.vanishedAt)}`
+                    : `内容时间未知 ｜ 归档时间：${formatDateTime(item.vanishedAt)}`
+                }
               >
-                {formatDate(item.vanishedAt)}
+                {displayTime ? formatDate(displayTime.at) : "时间未知"}
               </span>
             </>
           )}
@@ -874,23 +923,34 @@ const VANISH_PAGE_SIZE = 48;
  */
 const DELETE_CONFIRM_WAIT_SECONDS = 5;
 
-type SortKey = "vanished_desc" | "vanished_asc" | "title_asc";
+type SortKey =
+  | "pubtime_desc"
+  | "pubtime_asc"
+  | "vanished_desc"
+  | "vanished_asc"
+  | "title_asc";
 
 const SORTS: Array<{ key: SortKey; label: string }> = [
+  { key: "pubtime_desc", label: "发布时间 新→旧" },
+  { key: "pubtime_asc", label: "发布时间 旧→新" },
   { key: "vanished_desc", label: "最近消失" },
   { key: "vanished_asc", label: "最早消失" },
-  { key: "title_asc", label: "标题" },
+  { key: "title_asc", label: "标题 A→Z" },
 ];
 
 const Vanished = () => {
   const [archive, setArchive] = useState<VanishArchiveItem[]>([]);
   const [following, setFollowing] = useState<FollowingItem[]>([]);
+  const [folders, setFolders] = useState<FavoriteFolder[]>([]);
   const [loading, setLoading] = useState(true);
   const [keyword, setKeyword] = useState("");
   // 「全部」视图会同时渲染关注卡片与视频卡片（两套排版），已移除；默认只看收藏夹。
   const [source, setSource] = useState<VanishArchiveSource>("favorites");
   const [reason, setReason] = useState<VanishArchiveReason | "all">("all");
-  const [sort, setSort] = useState<SortKey>("vanished_desc");
+  const [sort, setSort] = useState<SortKey>("pubtime_desc");
+  /** 自定义排序下拉：原生 select 的菜单样式在不同浏览器里差异太大 */
+  const [isSortOpen, setIsSortOpen] = useState(false);
+  const sortMenuRef = useRef<HTMLDivElement>(null);
   const initialSourcePickedRef = useRef(false);
   /** 档案快照里没有对应关注记录时，名字切换只在本地生效（key = 档案 id） */
   const [archiveNameOverrides, setArchiveNameOverrides] = useState<Record<string, number>>({});
@@ -923,13 +983,15 @@ const Vanished = () => {
   const load = useCallback(async () => {
     setLoading(true);
     try {
-      const [stored, legacy, followingList, favorites, interactions] = await Promise.all([
-        getAllVanishArchive(),
-        getAllVanishedFavResources(),
-        getAllFollowing(),
-        getAllFavResources(),
-        getAllInteractions(),
-      ]);
+      const [stored, legacy, followingList, favorites, interactions, folderList] =
+        await Promise.all([
+          getAllVanishArchive(),
+          getAllVanishedFavResources(),
+          getAllFollowing(),
+          getAllFavResources(),
+          getAllInteractions(),
+          getAllFavFolders(),
+        ]);
 
       // 两层来源合并。第二层是"读时派生"：源记录里已经查不到、但还没写进档案的内容。
       // 没有它，用户本地明明有已失效收藏 / 已注销关注 / 稿件已删的互动，页面却是空的。
@@ -960,6 +1022,7 @@ const Vanished = () => {
         }
       }
       setFollowing(followingList);
+      setFolders(folderList);
     } catch (error) {
       console.error("读取消失档案失败:", error);
       toast.error("读取消失档案失败");
@@ -972,11 +1035,33 @@ const Vanished = () => {
     void load();
   }, [load]);
 
+  useEffect(() => {
+    if (!isSortOpen) return;
+    const handleClickOutside = (event: MouseEvent) => {
+      if (sortMenuRef.current && !sortMenuRef.current.contains(event.target as Node)) {
+        setIsSortOpen(false);
+      }
+    };
+    document.addEventListener("mousedown", handleClickOutside);
+    return () => document.removeEventListener("mousedown", handleClickOutside);
+  }, [isSortOpen]);
+
   const stats = useMemo(() => buildVanishArchiveStats(archive), [archive]);
   const followingByMid = useMemo(
     () => new Map(following.map((item) => [item.mid, item])),
     [following],
   );
+
+  /** 收藏夹 id → 名称：档案按「收藏夹 + 视频」存条目，同一条 BV 在多个夹子里会出现多条 */
+  const folderLabelFor = (item: VanishArchiveItem): string | null => {
+    if (item.kind !== "favorite") return null;
+    const snapshot = item.item as { folder_id?: unknown } | null | undefined;
+    const rawFolderId = snapshot?.folder_id ?? item.sourceId.split(":")[0];
+    const folderId = Number(rawFolderId);
+    if (!Number.isFinite(folderId) || folderId <= 0) return null;
+    const title = folders.find((folder) => folder.id === folderId)?.title;
+    return title ? `收藏夹：${title}` : `收藏夹 ID ${folderId}`;
+  };
 
   /**
    * 在曾用名浮层里点选名字，切换卡片显示名。
@@ -1006,15 +1091,37 @@ const Vanished = () => {
   const filtered = useMemo(() => {
     const filter: VanishArchiveFilter = { keyword, source, reason };
     const result = queryVanishArchive(archive, filter);
+    // 卡片显示的是"内容自身时间"（发布时间 → 收藏时间），排序就必须用它；
+    // 之前默认按 vanishedAt 排，而批量归档的 vanishedAt 几乎相同，看起来就是乱序。
+    const displayTimeOf = (item: VanishArchiveItem) => getArchiveDisplayTime(item)?.at ?? 0;
+    const byDisplayTime = (a: VanishArchiveItem, b: VanishArchiveItem, asc: boolean) => {
+      const ta = displayTimeOf(a);
+      const tb = displayTimeOf(b);
+      if (ta === 0 && tb === 0) return b.vanishedAt - a.vanishedAt;
+      if (ta === 0) return 1;
+      if (tb === 0) return -1;
+      return asc ? ta - tb : tb - ta;
+    };
+
+    if (sort === "pubtime_desc") {
+      return result.slice().sort((a, b) => byDisplayTime(a, b, false));
+    }
+    if (sort === "pubtime_asc") {
+      return result.slice().sort((a, b) => byDisplayTime(a, b, true));
+    }
     if (sort === "vanished_asc") {
-      return result.slice().sort((a, b) => a.vanishedAt - b.vanishedAt);
+      return result
+        .slice()
+        .sort((a, b) => a.vanishedAt - b.vanishedAt || byDisplayTime(a, b, false));
     }
     if (sort === "title_asc") {
       return result
         .slice()
         .sort((a, b) => (a.title || a.sourceId).localeCompare(b.title || b.sourceId, "zh-CN"));
     }
-    return result;
+    return result
+      .slice()
+      .sort((a, b) => b.vanishedAt - a.vanishedAt || byDisplayTime(a, b, false));
   }, [archive, keyword, reason, sort, source]);
 
   const visible = useMemo(() => filtered.slice(0, visibleCount), [filtered, visibleCount]);
@@ -1145,6 +1252,7 @@ const Vanished = () => {
         undefined)
       : undefined;
   const detailRows = detailItem ? buildSnapshotRows(detailItem.item) : [];
+  const detailFolderLabel = detailItem ? folderLabelFor(detailItem) : null;
 
   /** 侧栏筛选按钮：与「互动记录」「关注列表」保持同一套样式与计数位置 */
   const filterButtonClass = (active: boolean) =>
@@ -1300,19 +1408,58 @@ const Vanished = () => {
                 ) : null}
               </div>
 
-              <div className="relative flex items-center">
-                <ArrowDownUp className="pointer-events-none absolute left-2.5 h-3.5 w-3.5 text-gray-400 dark:text-neutral-500" />
-                <select
-                  value={sort}
-                  onChange={(event) => setSort(event.target.value as SortKey)}
-                  className="appearance-none rounded-full border border-gray-200 bg-gray-50 py-1.5 pl-8 pr-7 text-sm text-gray-700 focus:border-pink-400 focus:outline-none dark:border-neutral-700 dark:bg-neutral-800 dark:text-neutral-100"
+              <div className="relative" ref={sortMenuRef}>
+                <button
+                  type="button"
+                  onClick={() => setIsSortOpen((open) => !open)}
+                  aria-haspopup="listbox"
+                  aria-expanded={isSortOpen}
+                  className={`flex items-center gap-1.5 rounded-full border bg-gray-50 py-1.5 pl-2.5 pr-2.5 text-sm transition-colors focus:outline-none dark:bg-neutral-800 ${
+                    isSortOpen
+                      ? "border-pink-400 text-pink-600 dark:border-pink-500/50 dark:text-pink-400"
+                      : "border-gray-200 text-gray-700 hover:border-pink-300 dark:border-neutral-700 dark:text-neutral-100 dark:hover:border-pink-500/50"
+                  }`}
                 >
-                  {SORTS.map((option) => (
-                    <option key={option.key} value={option.key}>
-                      {option.label}
-                    </option>
-                  ))}
-                </select>
+                  <ArrowDownUp className="h-3.5 w-3.5 text-gray-400 dark:text-neutral-500" />
+                  <span className="whitespace-nowrap">
+                    {SORTS.find((option) => option.key === sort)?.label ?? "排序"}
+                  </span>
+                  <ChevronDown
+                    className={`h-3.5 w-3.5 text-gray-400 transition-transform dark:text-neutral-500 ${
+                      isSortOpen ? "rotate-180" : ""
+                    }`}
+                  />
+                </button>
+
+                {isSortOpen ? (
+                  <div
+                    role="listbox"
+                    aria-label="排序方式"
+                    className="absolute right-0 z-40 mt-1.5 w-44 overflow-hidden rounded-xl border border-gray-200 bg-white py-1 shadow-lg dark:border-neutral-700 dark:bg-neutral-900"
+                  >
+                    {SORTS.map((option) => (
+                      <button
+                        key={option.key}
+                        type="button"
+                        role="option"
+                        aria-selected={option.key === sort}
+                        onClick={() => {
+                          setSort(option.key);
+                          setIsSortOpen(false);
+                          resetPaging();
+                        }}
+                        className={`flex w-full items-center justify-between gap-2 px-3 py-2 text-left text-sm transition-colors ${
+                          option.key === sort
+                            ? "bg-pink-50 font-medium text-pink-600 dark:bg-pink-500/10 dark:text-pink-400"
+                            : "text-gray-700 hover:bg-gray-50 dark:text-neutral-300 dark:hover:bg-neutral-800"
+                        }`}
+                      >
+                        <span>{option.label}</span>
+                        {option.key === sort ? <Check className="h-4 w-4" /> : null}
+                      </button>
+                    ))}
+                  </div>
+                ) : null}
               </div>
 
               {stats.total > 0 ? (
@@ -1408,6 +1555,7 @@ const Vanished = () => {
                     <VanishedCard
                       key={item.id}
                       item={item}
+                      folderLabel={folderLabelFor(item)}
                       selected={selected.includes(item.id)}
                       managing={managing}
                       onToggleSelect={() => toggleSelect(item.id)}
@@ -1592,6 +1740,14 @@ const Vanished = () => {
                     {formatDateTime(detailItem.vanishedAt)}
                   </dd>
                 </div>
+                {detailFolderLabel ? (
+                  <div className="flex justify-between gap-3">
+                    <dt className="text-gray-500 dark:text-neutral-400">所属收藏夹</dt>
+                    <dd className="min-w-0 break-all text-right text-gray-700 dark:text-neutral-200">
+                      {detailFolderLabel.replace(/^收藏夹：/, "")}
+                    </dd>
+                  </div>
+                ) : null}
                 <div className="flex justify-between gap-3">
                   <dt className="text-gray-500 dark:text-neutral-400">最近一次核查</dt>
                   <dd className="text-right tabular-nums text-gray-700 dark:text-neutral-200">

@@ -23,6 +23,7 @@ import {
   FOLLOWING_AVATAR_ARCHIVE_PROGRESS,
   FAV_COVER_ARCHIVE_PROGRESS,
   FAV_RECOVERY_PROGRESS,
+  FAV_RECOVERY_FINAL_RETRY_DELAY_MS,
   FAVORITES_AUTO_SYNC_ENABLED,
   FAVORITES_SYNC_INTERVAL,
   FAVORITES_LAST_SYNC,
@@ -3041,6 +3042,7 @@ export default defineBackground(() => {
         failedBatches: 0,
         sources: {},
         remaining: stats.pending,
+        rateLimited: 0,
       };
 
       console.log(
@@ -3063,6 +3065,7 @@ export default defineBackground(() => {
         phase: "local" as RecoveryPhase,
         phaseDone: 0,
         phaseTotal: candidates.length,
+        rateLimited: 0,
       };
       const flushProgress = async () => {
         progressState.updatedAt = Date.now();
@@ -3378,6 +3381,61 @@ export default defineBackground(() => {
           );
         }
         console.log(`jijidown 合计：命中 ${jijidownHit}，确实没有 ${jijidownMiss}`);
+
+        // 最后一轮：jijidown 三轮后仍被限流的条目，等 30 秒再用 biliplus 补一次。
+        // 不加这一步的话，这些条目会直接失败；用户只能隔一会儿手动再点一次。
+        if (pendingJijidown.length > 0) {
+          console.log(
+            `限流重试：等待 ${Math.round(FAV_RECOVERY_FINAL_RETRY_DELAY_MS / 1000)} 秒后重查 ${pendingJijidown.length} 条`,
+          );
+          progressState.phase = "biliplus";
+          progressState.phaseDone = 0;
+          progressState.phaseTotal = pendingJijidown.length;
+          await flushProgress();
+          await new Promise((resolve) =>
+            setTimeout(resolve, FAV_RECOVERY_FINAL_RETRY_DELAY_MS),
+          );
+
+          const leftovers = pendingJijidown;
+          const retryById = new Map(leftovers.map((item) => [item.id, item]));
+          const recoveredIds = new Set<number>();
+          const retryChunks = chunkAids(
+            leftovers.map((item) => item.id),
+            BILIPLUS_BATCH_SIZE,
+          );
+
+          for (const chunk of retryChunks) {
+            const batch = await fetchBiliplusAidInfoWithRetry(chunk, { maxRetries: 1 });
+            if (batch.status === "ok" || batch.status === "all_missing") {
+              for (const aid of chunk) {
+                const resource = retryById.get(aid);
+                if (!resource) continue;
+                const outcome = applyRecoveryResult(
+                  working.get(aid)!,
+                  batch.data[String(aid)],
+                  "biliplus",
+                  Date.now(),
+                );
+                if (outcome.changed) {
+                  markImproved(outcome.resource);
+                  result.recovered += 1;
+                  result.sources.biliplus = (result.sources.biliplus ?? 0) + 1;
+                  recoveredIds.add(aid);
+                }
+              }
+            }
+            progressState.phaseDone += chunk.length;
+            progressState.recovered = result.recovered;
+            await flushProgress();
+            await new Promise((resolve) => setTimeout(resolve, BILIPLUS_BATCH_DELAY_MS));
+          }
+
+          pendingJijidown = leftovers.filter((item) => !recoveredIds.has(item.id));
+          result.rateLimited = pendingJijidown.length;
+          console.log(
+            `限流重试完成：补回 ${recoveredIds.size} 条，仍剩 ${result.rateLimited} 条`,
+          );
+        }
       }
 
       // 一次性写回所有被改善的记录（取自共享工作副本，避免互相覆盖）
@@ -3413,6 +3471,7 @@ export default defineBackground(() => {
       // 只写 running 的话，重新进入页面的用户会永远看到一个不会消失的进度条。
       progressState.phase = "done";
       progressState.status = "completed";
+      progressState.rateLimited = result.rateLimited;
       await flushProgress();
       console.log("失效收藏恢复结束:", result);
       return result;
@@ -3443,7 +3502,10 @@ export default defineBackground(() => {
         message:
           result.attempted === 0
             ? "没有需要恢复的条目"
-            : `本轮查询 ${result.attempted} 条，恢复 ${result.recovered} 条，剩余 ${result.remaining} 条`,
+            : `本轮查询 ${result.attempted} 条，恢复 ${result.recovered} 条，剩余 ${result.remaining} 条` +
+              (result.rateLimited > 0
+                ? `；${result.rateLimited} 条因限流未完成，建议稍后重试`
+                : ""),
       });
     } catch (error) {
       console.error("失效收藏恢复失败:", error);
