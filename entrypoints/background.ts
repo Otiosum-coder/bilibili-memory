@@ -2143,6 +2143,34 @@ export default defineBackground(() => {
     }
 
     if (isFullSync) {
+      // 收藏类消失档案必须**独立落库**，不能只靠档案页从当前收藏夹实时派生。
+      // 本地已经判定失效的记录是明确证据；即使本轮接口漏页、覆盖不完整，
+      // 也应该先把当时的真实快照存下来——否则收藏夹被占位文案覆盖后，
+      // 档案页实时派生也只能跟着变成「已失效视频」，整份历史就一起没了。
+      const currentResources = await getFavResources(folder.id);
+      const invalidLocal = currentResources.filter(
+        (resource) => isInvalidatedResource(resource) || resource.invalidatedKind != null,
+      );
+      if (invalidLocal.length > 0) {
+        const now = Date.now();
+        const archived = invalidLocal.map((resource) => {
+          const kind = resource.invalidatedKind ?? resolveInvalidatedKind(resource.attr);
+          const reason: VanishArchiveReason =
+            kind === "removed_by_uploader"
+              ? "removed_by_uploader"
+              : kind === "removed_by_other"
+                ? "removed_by_other"
+                : "unknown";
+          const record = buildFavoriteArchiveItem(resource, reason, now);
+          if (kind === null || kind === "other") record.invalidationUnproven = true;
+          return record;
+        });
+        await putVanishArchive(archived);
+        console.log(
+          `收藏夹「${folder.title}」：${archived.length} 条本地失效记录已持久化到消失档案`,
+        );
+      }
+
       if (!allPagesFetched) {
         throw new Error(`收藏夹「${folder.title}」未完整同步，已跳过本地清理`);
       }
@@ -3591,12 +3619,16 @@ export default defineBackground(() => {
 
         const lookup = await fetchThirdPartyFormerNames(item.mid);
         if (lookup.ok) {
-          await patchFollowingItems([item.mid], {
+          const patched = await patchFollowingItems([item.mid], {
             thirdPartyNames: lookup.names,
             thirdPartyQueriedAt: Date.now(),
           }).catch((error) => {
             console.warn(`写入曾用名缓存失败（${item.mid}）:`, error);
+            return -1;
           });
+          if (patched === 0) {
+            console.warn(`曾用名已查到但未写入（${item.mid}）：关注条目可能已被同步删除`);
+          }
           consecutiveFailures = 0;
           if (lookup.names.length > 0) result.found += 1;
         } else {

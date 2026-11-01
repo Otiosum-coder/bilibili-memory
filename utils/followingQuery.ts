@@ -201,18 +201,34 @@ export const buildLocalNameTimeline = (item: FollowingItem): FollowingNameSegmen
 };
 
 /**
+ * 比较昵称时忽略空白/零宽字符差异；展示仍用原字符串。
+ * 只用于去重和「当前名 vs 曾用名」判断，避免把视觉上相同的名字重复展示。
+ */
+const normalizeNameForCompare = (name: string | undefined): string =>
+  (name ?? "")
+    .normalize("NFC")
+    .replace(/[\u200B-\u200D\uFEFF]/g, "")
+    .replace(/\s+/g, " ")
+    .trim();
+
+/**
  * 第三方（aicu.cc）存档的曾用名。
  *
  * 该数据**没有时间戳、顺序不保证、可能混入占位文案**，因此必须与本地观测的
  * 时间轴分开呈现，绝不能合并进同一条时间轴。这里做去重与占位文案过滤。
  */
 export const buildThirdPartyNames = (item: FollowingItem): string[] => {
+  const currentName = normalizeNameForCompare(item.name);
   const seen = new Set<string>();
   const result: string[] = [];
   for (const name of item.thirdPartyNames ?? []) {
     const trimmed = (name ?? "").trim();
-    if (!trimmed || isGoneName(trimmed) || seen.has(trimmed)) continue;
-    seen.add(trimmed);
+    const comparable = normalizeNameForCompare(trimmed);
+    // 与当前昵称一模一样的「曾用名」没有展示价值（aicu 有时会把当前名也收进 hname），
+    // 但不要从存档里删掉——以后账号再改名，它就是有效的曾用名了。
+    if (!trimmed || isGoneName(trimmed) || !comparable) continue;
+    if (comparable === currentName || seen.has(comparable)) continue;
+    seen.add(comparable);
     result.push(trimmed);
   }
   return result;

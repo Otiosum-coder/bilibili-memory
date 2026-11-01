@@ -123,6 +123,11 @@ export interface DBConfig {
       keyPath: string;
       indexes: string[];
     };
+    /** 第三方曾用名独立存档（v12）：不随关注快照同步而丢失 */
+    formerNames: {
+      keyPath: string;
+      indexes: string[];
+    };
   };
 }
 
@@ -415,6 +420,25 @@ export interface FollowingNameRecord {
 
 /** `name` 的来源。第三方存档不写入 `name`，只进 `thirdPartyNames`。 */
 export type FollowingNameSource = "api" | "local_backfill";
+
+/**
+ * 第三方曾用名的独立存档记录（v12 新增的 `formerNames` store）。
+ *
+ * 为什么单独存：`thirdPartyNames` 放在 `following` 里会被整份关注同步快照
+ * 和 WebDAV 合并抹掉，而 aicu 查询是 1.5 秒/条，丢一次就要全部重查。
+ * 这里按 mid 独立保存，读关注列表时再叠加回条目。
+ */
+export interface FormerNameRecord {
+  mid: number;
+  /** 第三方只增不减，按查询结果去重追加 */
+  names: string[];
+  /** 最近一次成功查询的时间；0 表示只有旧数据、还没查过 */
+  queriedAt: number;
+  /** 用户手动选择展示的下标，缺省展示最后一个 */
+  displayIndex?: number;
+  /** 最后一次写入时间，仅用于诊断 */
+  updatedAt: number;
+}
 
 export interface FollowingItem {
   /** UID，关注列表接口返回的 `mid` */

@@ -6,6 +6,7 @@ import {
   buildInteractionArchiveItem,
   buildVanishArchiveStats,
   collectLiveVanishArchive,
+  mergeRestoredFavorite,
   mergeVanishArchive,
   queryVanishArchive,
   resolveInteractionArchiveReason,
@@ -414,5 +415,45 @@ describe("mergeVanishArchive", () => {
 
   it("两边都为空返回空数组", () => {
     expect(mergeVanishArchive([], [])).toEqual([]);
+  });
+});
+
+describe("mergeRestoredFavorite", () => {
+  it("快照是真实内容、当前记录是占位时，恢复真实字段并保留保护标记", () => {
+    const snapshot = makeFav(1, { attr: 1, title: "真实标题", cover: "https://x/real.jpg" });
+    const current = makeFav(1, {
+      attr: 9,
+      title: "已失效视频",
+      cover: "",
+      coverAssetId: "cover:/real.jpg",
+      recoveredAt: NOW,
+      recoverySource: "biliplus",
+    });
+
+    const restored = mergeRestoredFavorite(snapshot, current);
+    expect(restored.title).toBe("真实标题");
+    expect(restored.cover).toBe("https://x/real.jpg");
+    expect(restored.coverAssetId).toBe("cover:/real.jpg");
+    expect(restored.recoveredAt).toBe(NOW);
+    expect(restored.recoverySource).toBe("biliplus");
+  });
+
+  it("当前记录已经是真实内容时，不被旧快照的占位文案盖回去", () => {
+    const snapshot = makeFav(2, { attr: 9, title: "已失效视频", cover: "" });
+    const current = makeFav(2, {
+      title: "后来恢复的标题",
+      cover: "https://x/new.jpg",
+      coverAssetId: "cover:/new.jpg",
+    });
+
+    const restored = mergeRestoredFavorite(snapshot, current);
+    expect(restored.title).toBe("后来恢复的标题");
+    expect(restored.cover).toBe("https://x/new.jpg");
+    expect(restored.coverAssetId).toBe("cover:/new.jpg");
+  });
+
+  it("没有当前记录时直接返回快照", () => {
+    const snapshot = makeFav(3);
+    expect(mergeRestoredFavorite(snapshot, undefined)).toBe(snapshot);
   });
 });

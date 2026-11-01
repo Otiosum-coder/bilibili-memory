@@ -19,6 +19,8 @@ export interface CrossModuleMetrics {
   folderCount: number;
   collectionCount: number;
   collectionResourceCount: number;
+  /** 消失档案里「收藏夹」来源的条数；和档案页默认视图同口径，不是当前失效收藏数 */
+  vanishedCount: number;
 }
 
 export interface DashboardMetric {
@@ -33,10 +35,10 @@ export const buildDashboardMetrics = (
 ): DashboardMetric[] => [
   { key: "historyCount", label: "历史记录", value: metrics.historyCount },
   { key: "favoriteCount", label: "收藏内容", value: metrics.favoriteCount },
-  { key: "folderCount", label: "收藏夹", value: metrics.folderCount },
   { key: "collectionCount", label: "订阅合集", value: metrics.collectionCount },
   { key: "collectionResourceCount", label: "合集内容", value: metrics.collectionResourceCount },
   { key: "followingCount", label: "关注 UP 主", value: followingCount },
+  { key: "vanishedCount", label: "失效内容", value: metrics.vanishedCount },
 ];
 
 // ---------------------------------------------------------------------------

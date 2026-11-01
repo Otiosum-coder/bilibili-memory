@@ -438,6 +438,22 @@ describe("shouldPreserveLocalMetadata", () => {
     expect(shouldPreserveLocalMetadata(makeInvalid(1))).toBe(false);
   });
 
+  it("失效但本地已有真实标题时也保护（不依赖 recoveredAt）", () => {
+    const local = makeInvalid(2, {
+      title: "失效前真实标题",
+      cover: PLACEHOLDER_COVER,
+    });
+    expect(shouldPreserveLocalMetadata(local)).toBe(true);
+  });
+
+  it("失效但本地已有真实封面时也保护", () => {
+    const local = makeInvalid(3, {
+      title: PLACEHOLDER_TITLE,
+      cover: "https://i0.hdslb.com/bfs/archive/real.jpg",
+    });
+    expect(shouldPreserveLocalMetadata(local)).toBe(true);
+  });
+
   it("没有本地记录时不保护", () => {
     expect(shouldPreserveLocalMetadata(undefined)).toBe(false);
   });

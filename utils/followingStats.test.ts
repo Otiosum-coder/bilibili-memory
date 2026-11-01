@@ -63,6 +63,7 @@ describe("buildDashboardMetrics", () => {
         folderCount: 6,
         collectionCount: 3,
         collectionResourceCount: 50,
+        vanishedCount: 12,
       },
       1142,
     );
@@ -70,13 +71,14 @@ describe("buildDashboardMetrics", () => {
     expect(metrics.map((metric) => metric.label)).toEqual([
       "历史记录",
       "收藏内容",
-      "收藏夹",
       "订阅合集",
       "合集内容",
       "关注 UP 主",
+      "失效内容",
     ]);
-    expect(metrics[metrics.length - 1].value).toBe(1142);
+    expect(metrics[metrics.length - 1].value).toBe(12);
     expect(metrics[0].value).toBe(100);
+    expect(metrics.find((metric) => metric.label === "关注 UP 主")?.value).toBe(1142);
   });
 });
 

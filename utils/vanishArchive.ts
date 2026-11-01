@@ -8,7 +8,11 @@ import type {
   VanishArchiveSource,
   VanishedFavResource,
 } from "./types";
-import { INVALIDATED_TITLE_RE, resolveInvalidatedKind } from "./favVanishedDiff";
+import {
+  INVALIDATED_TITLE_RE,
+  isInvalidatedResource,
+  resolveInvalidatedKind,
+} from "./favVanishedDiff";
 import { isPlaceholderImage } from "./imageUrl";
 
 /**
@@ -534,6 +538,55 @@ const isRealTitle = (title: string | undefined | null): boolean =>
 const isRealCover = (cover: string | undefined | null): boolean =>
   Boolean(cover && cover.trim() && !isPlaceholderImage(cover));
 
+/**
+ * 把档案快照合并回收藏夹当前记录（恢复用）。
+ *
+ * 不能直接 `put(snapshot)`：快照是"消失那一刻"的旧副本，当前记录里可能有
+ * 更新的字段、归档图片的 `coverAssetId`，以及最关键的 `recoveredAt` 保护标记。
+ * 直接覆盖会把 `recoveredAt` 抹掉，下一次同步又会被占位文案盖回去。
+ *
+ * 规则：
+ * - 标题/封面逐字段取**真实**的一边（当前真实优先，其次快照真实）
+ * - 保护/较新字段（recoveredAt、coverAssetId、ctime/pubtime、时长）有值就保留
+ * - 其余字段当前记录优先，避免恢复动作把用户后来改过的信息回退
+ */
+export const mergeRestoredFavorite = (
+  snapshot: FavoriteResource,
+  current: FavoriteResource | undefined,
+): FavoriteResource => {
+  if (!current) return snapshot;
+
+  const title = isRealTitle(current.title)
+    ? current.title
+    : isRealTitle(snapshot.title)
+      ? snapshot.title
+      : current.title || snapshot.title;
+  const cover = isRealCover(current.cover)
+    ? current.cover
+    : isRealCover(snapshot.cover)
+      ? snapshot.cover
+      : current.cover || snapshot.cover;
+
+  return {
+    ...snapshot,
+    ...current,
+    title,
+    cover,
+    coverAssetId: current.coverAssetId ?? snapshot.coverAssetId,
+    recoveredAt: current.recoveredAt ?? snapshot.recoveredAt,
+    recoverySource: current.recoverySource ?? snapshot.recoverySource,
+    intro: current.intro || snapshot.intro,
+    upper: current.upper?.name ? current.upper : (snapshot.upper ?? current.upper),
+    duration: current.duration || snapshot.duration,
+    ctime: current.ctime || snapshot.ctime,
+    pubtime: current.pubtime || snapshot.pubtime,
+    bvid: current.bvid || current.bv_id || snapshot.bvid,
+    bv_id: current.bv_id || current.bvid || snapshot.bv_id,
+    invalidatedAt: current.invalidatedAt ?? snapshot.invalidatedAt,
+    invalidatedKind: current.invalidatedKind ?? snapshot.invalidatedKind,
+  };
+};
+
 export const mergeVanishArchive = (
   base: VanishArchiveItem[],
   incoming: VanishArchiveItem[],
@@ -600,7 +653,9 @@ export const markLocallyResolved = (
     interactions: InteractionItem[];
   },
 ): VanishArchiveItem[] => {
-  const favoriteKeys = new Set(input.favorites.map((item) => `${item.folder_id}:${item.id}`));
+  const favoriteByKey = new Map(
+    input.favorites.map((item) => [`${item.folder_id}:${item.id}`, item]),
+  );
   const collectionIds = new Set(input.collections.map((item) => String(item.id)));
   const followingMids = new Set(input.following.map((item) => String(item.mid)));
   const interactionIds = new Set(input.interactions.map((item) => item.id));
@@ -609,8 +664,12 @@ export const markLocallyResolved = (
     // 读时派生的条目本来就和源记录同时存在，不能据此判成"误归档"
     if (item.liveDerived) return item;
     let resolved = false;
-    if (item.kind === "favorite") resolved = favoriteKeys.has(item.sourceId);
-    else if (item.kind === "collection") resolved = collectionIds.has(item.sourceId);
+    if (item.kind === "favorite") {
+      const live = favoriteByKey.get(item.sourceId);
+      // 收藏还在、但本身仍是失效占位，不算"已恢复"——否则档案页会把
+      // 所有仍留在收藏夹里的失效条目默认折叠，用户反而看不到档案。
+      resolved = Boolean(live && (!isInvalidatedResource(live) || live.recoveredAt));
+    } else if (item.kind === "collection") resolved = collectionIds.has(item.sourceId);
     else if (item.kind === "following") resolved = followingMids.has(item.sourceId);
     else resolved = interactionIds.has(item.sourceId);
     return resolved ? { ...item, resolvedLocally: true } : item;

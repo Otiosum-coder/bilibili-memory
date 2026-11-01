@@ -885,7 +885,10 @@ export const Favorites = () => {
       <div className="flex-1 overflow-y-auto" ref={contentRef}>
         <div className="p-6">
           {selectedFolderId && (
-            <div className="mb-6 flex flex-col md:flex-row justify-between md:items-center gap-4 bg-white dark:bg-neutral-900 p-4 rounded-xl shadow-sm border border-gray-100 dark:border-neutral-800">
+            <div
+              data-tour="favorites-toolbar"
+              className="mb-6 flex flex-col md:flex-row justify-between md:items-center gap-4 bg-white dark:bg-neutral-900 p-4 rounded-xl shadow-sm border border-gray-100 dark:border-neutral-800"
+            >
               <div className="flex flex-wrap items-center gap-3">
                 <h1 className="flex items-center gap-2 text-xl font-bold">
                   {selectedFolder?.title}
@@ -920,6 +923,7 @@ export const Favorites = () => {
 
                 <button
                   type="button"
+                  data-tour="favorites-recover"
                   onClick={handleRecoverInvalid}
                   disabled={!selectedFolder || loading || isRecovering || isFavoriteSyncing}
                   className={`inline-flex items-center gap-1.5 rounded-lg border px-3 py-1.5 text-sm font-medium transition-colors disabled:cursor-not-allowed disabled:opacity-40 ${

@@ -1,5 +1,5 @@
 import { useEffect, useLayoutEffect, useRef, useState } from "react";
-import { Archive, DatabaseBackup, History, X } from "lucide-react";
+import { DatabaseBackup, Heart, History, RotateCcw, Users, Wand2, X } from "lucide-react";
 
 interface FirstRunGuideModalProps {
   open: boolean;
@@ -19,7 +19,7 @@ interface GuideStep {
 const steps: GuideStep[] = [
   {
     title: "欢迎使用哔哩哔哩记忆",
-    description: "接下来用几步了解历史记录和备份。每一步都会指向真实功能，也可以随时跳过。",
+    description: "接下来用几步认识收藏夹、关注列表和备份。每一步都会指向真实功能，也可以随时跳过。",
     icon: History,
     accent: "bg-pink-50 text-pink-600 dark:bg-pink-500/10 dark:text-pink-400",
     target: null,
@@ -34,45 +34,48 @@ const steps: GuideStep[] = [
     path: "/history",
   },
   {
-    title: "历史记录工具栏",
-    description: "页面顶部可以刷新、筛选、搜索和调整显示方式，快速定位想找的视频。",
-    icon: History,
+    title: "收藏夹页面",
+    description:
+      "左侧是收藏夹目录，右侧是本地保存的收藏内容。可以按收藏夹查看、搜索，也能看到在线收藏夹比本地多出的条数。",
+    icon: Heart,
     accent: "bg-pink-50 text-pink-600 dark:bg-pink-500/10 dark:text-pink-400",
-    target: "[data-tour='history-toolbar']",
-    path: "/history",
+    target: "[data-tour='favorites-toolbar']",
+    path: "/favorites",
+  },
+  {
+    title: "恢复失效内容",
+    description:
+      "收藏的视频失效后，标题和封面可能被 B 站替换成占位内容。点「恢复失效内容」，会用本地记录和第三方档案尝试找回；需要手动触发，不会自动运行。",
+    icon: RotateCcw,
+    accent: "bg-orange-50 text-orange-600 dark:bg-orange-500/10 dark:text-orange-400",
+    target: "[data-tour='favorites-recover']",
+    path: "/favorites",
+  },
+  {
+    title: "关注列表",
+    description:
+      "这里保存你关注的 UP 主，以及取关、改名、账号注销等变化。第一次同步会建立基线；B 站不提供历史变化，因此变化记录只能从建立基线之后开始累积。",
+    icon: Users,
+    accent: "bg-blue-50 text-blue-600 dark:bg-blue-500/10 dark:text-blue-400",
+    target: "[data-tour='following-toolbar']",
+    path: "/following",
+  },
+  {
+    title: "查询曾用名",
+    description:
+      "在设置中开启第三方曾用名查询后，关注列表右上角会出现「补全曾用名」。数据来自 aicu.cc，默认关闭，需要先同意；只查询关注列表，不提供任意 UID 查询。",
+    icon: Wand2,
+    accent: "bg-purple-50 text-purple-600 dark:bg-purple-500/10 dark:text-purple-400",
+    target: "[data-tour='following-toolbar']",
+    path: "/following",
   },
   {
     title: "数据备份",
-    description: "从这里进入备份中心，集中管理 WebDAV、本地目录和 JSON 文件备份。",
-    icon: DatabaseBackup,
-    accent: "bg-amber-50 text-amber-600 dark:bg-amber-500/10 dark:text-amber-400",
-    target: "[data-tour='backup-menu']",
-    path: "/webdav-sync",
-  },
-  {
-    title: "本地自动备份",
     description:
-      "选择电脑上的备份目录后，可定时把历史记录保存为 JSON 文件。备份直接写入本地，不经过第三方；浏览器运行时执行，目录权限失效时需要重新授权。",
+      "数据默认只保存在浏览器本地。想换设备或防止浏览器数据丢失，可以在这里导出 JSON，或配置 WebDAV / 本地目录备份。",
     icon: DatabaseBackup,
     accent: "bg-emerald-50 text-emerald-600 dark:bg-emerald-500/10 dark:text-emerald-400",
-    target: "[data-tour='backup-local']",
-    path: "/webdav-sync",
-  },
-  {
-    title: "WebDAV 自动备份",
-    description:
-      "配置自己的 WebDAV 服务后，可按设定周期在后台自动同步已选数据，适合跨设备保存历史记录、收藏夹、订阅合集、关注列表与消失档案。请先测试并保存连接，再开启自动同步。",
-    icon: DatabaseBackup,
-    accent: "bg-orange-50 text-orange-600 dark:bg-orange-500/10 dark:text-orange-400",
-    target: "[data-tour='backup-webdav-auto']",
-    path: "/webdav-sync",
-  },
-  {
-    title: "选择备份范围",
-    description: "手动备份默认全选全部数据；你也可以自由取消勾选，只备份需要的部分。",
-    icon: Archive,
-    accent: "bg-blue-50 text-blue-600 dark:bg-blue-500/10 dark:text-blue-400",
-    target: "[data-tour='backup-manual']",
+    target: "[data-tour='backup-menu']",
     path: "/webdav-sync",
   },
 ];

@@ -271,6 +271,24 @@ describe("buildThirdPartyNames", () => {
     expect(buildThirdPartyNames(item)).toEqual(["咕噜大魔王", "王册大魔王"]);
   });
 
+  it("过滤与当前昵称相同的曾用名", () => {
+    const item = makeItem(1, {
+      name: "杰哥观察者模式启动中",
+      thirdPartyNames: ["杰哥观察者模式启动中", "真正的旧名"],
+    });
+
+    expect(buildThirdPartyNames(item)).toEqual(["真正的旧名"]);
+  });
+
+  it("忽略空白差异后仍相同的曾用名也会被过滤", () => {
+    const item = makeItem(1, {
+      name: "旧 名字",
+      thirdPartyNames: ["旧  名字", "另一个旧名"],
+    });
+
+    expect(buildThirdPartyNames(item)).toEqual(["另一个旧名"]);
+  });
+
   it("没有第三方数据时返回空数组", () => {
     expect(buildThirdPartyNames(makeItem(1))).toEqual([]);
   });
@@ -297,5 +315,13 @@ describe("hasFormerNames", () => {
 
   it("第三方数据全是占位文案时不算有曾用名", () => {
     expect(hasFormerNames(makeItem(1, { thirdPartyNames: ["账号已注销"] }))).toBe(false);
+  });
+
+  it("第三方数据只有当前昵称时不算有曾用名", () => {
+    const item = makeItem(1, {
+      name: "同一个名字",
+      thirdPartyNames: ["同一个名字"],
+    });
+    expect(hasFormerNames(item)).toBe(false);
   });
 });

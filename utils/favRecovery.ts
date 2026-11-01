@@ -297,7 +297,11 @@ export const shouldPreserveLocalMetadata = (
 ): boolean => {
   if (!local) return false;
   if (local.recoveredAt) return true;
-  return !isInvalidatedResource(local);
+  if (!isInvalidatedResource(local)) return true;
+  // 失效记录里也可能已经有真实标题/封面（旧版本保护下来的、或从档案恢复回来但
+  // 没写 recoveredAt 的）。只要有一个字段是真实内容，就不能被占位文案覆盖。
+  // 否则一次同步就会把最后一份真实元数据换掉，且不可逆。
+  return !isPlaceholderTitle(local.title) || !isPlaceholderImage(local.cover);
 };
 
 export interface RecoveryStats {

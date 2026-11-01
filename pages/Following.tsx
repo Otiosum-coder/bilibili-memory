@@ -750,7 +750,10 @@ export const Following = () => {
       {/* 主区域 */}
       <main className="flex-1 overflow-y-auto">
         <div className="mx-auto max-w-[1500px] px-6 py-5 lg:px-10">
-          <div className="mb-6 flex flex-col justify-between gap-4 rounded-xl border border-gray-100 bg-white p-4 shadow-sm md:flex-row md:items-center dark:border-neutral-800 dark:bg-neutral-900">
+          <div
+            data-tour="following-toolbar"
+            className="mb-6 flex flex-col justify-between gap-4 rounded-xl border border-gray-100 bg-white p-4 shadow-sm md:flex-row md:items-center dark:border-neutral-800 dark:bg-neutral-900"
+          >
             <h1 className="flex items-center gap-2 text-xl font-bold text-gray-900 dark:text-neutral-100">
               {activeFilterLabel}
               <span className="whitespace-nowrap rounded-full border border-gray-100 bg-gray-50 px-2 py-1 text-sm font-normal text-gray-500 dark:border-neutral-700 dark:bg-neutral-800 dark:text-neutral-400">
@@ -845,6 +848,7 @@ export const Following = () => {
                 ) : (
                   <button
                     type="button"
+                    data-tour="following-lookup"
                     onClick={() => void startLookupBatch()}
                     disabled={pendingLookupCount === 0 || syncing}
                     title="把关注用户的 UID 发送到第三方站点 aicu.cc 查询曾用名；逐条限速，可随时停止"

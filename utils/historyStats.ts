@@ -566,7 +566,7 @@ export const buildReportAvailability = (
 };
 
 // ---------------------------------------------------------------------------
-// 周期报告（周 / 月 / 年，均为自然周期，截止到今天）
+// 周期报告（周报 = 最近 7 天，月报 = 最近 30 天，年报 = 自然年，均截止到今天）
 // ---------------------------------------------------------------------------
 
 export interface HistoryReport {
@@ -591,14 +591,19 @@ export interface HistoryReport {
   completedPlays: number;
 }
 
-/** 周期起点（本地自然周 / 月 / 年），终点是"今天" */
+/**
+ * 周期起点（本地自然日），终点是"今天"。
+ * - 周报：最近 7 天，含今天
+ * - 月报：最近 30 天，含今天
+ * - 年报：自然年，从 1 月 1 日开始
+ */
 export const resolvePeriodStartMs = (kind: ReportKind, nowMs: number): number => {
   const date = new Date(nowMs);
   date.setHours(0, 0, 0, 0);
   if (kind === "week") {
-    date.setDate(date.getDate() - ((date.getDay() + 6) % 7));
+    date.setDate(date.getDate() - 6);
   } else if (kind === "month") {
-    date.setDate(1);
+    date.setDate(date.getDate() - 29);
   } else {
     date.setMonth(0, 1);
   }

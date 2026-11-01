@@ -1,10 +1,12 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useNavigate } from "react-router-dom";
 import toast from "react-hot-toast";
 import { FileText, LayoutDashboard, RefreshCw, X } from "lucide-react";
 import {
   FOLLOWING_LAST_SYNC,
   FOLLOWING_SYNC_INTERVAL,
   FOLLOWING_SYNC_PROGRESS,
+  INTERACTIONS_SYNC_PROGRESS,
   FOLLOWING_AVATAR_ARCHIVE_PROGRESS,
   FAV_COVER_ARCHIVE_PROGRESS,
   COLLECTION_COVER_ARCHIVE_PROGRESS,
@@ -20,10 +22,20 @@ import {
   getAllInteractions,
   getAllSubscribedCollectionResources,
   getAllSubscribedCollections,
+  getAllVanishedFavResources,
+  getAllVanishArchive,
   getEarliestHistoryEventViewAt,
   getHistoryEventsInRange,
   getTotalHistoryCount,
 } from "../utils/db";
+import { isInvalidatedResource } from "../utils/favVanishedDiff";
+import {
+  collectLiveVanishArchive,
+  enrichArchiveFromLive,
+  mergeArchiveWithLegacy,
+  mergeVanishArchive,
+  normalizeArchiveReasons,
+} from "../utils/vanishArchive";
 import {
   CHANGE_TYPE_COLOR,
   CHANGE_TYPE_LABEL,
@@ -67,6 +79,7 @@ import {
 import { getStorageValue, setStorageValue } from "../utils/storage";
 import type { FollowingEvent, FollowingItem, HistoryEvent } from "../utils/types";
 import type { FollowingSyncProgress } from "../utils/followingSync";
+import type { InteractionSyncProgress } from "../utils/interactionSync";
 import type { AvatarArchiveProgress } from "../utils/followingAssetArchive";
 import type { CoverArchiveProgress } from "../utils/favCoverArchive";
 import { FollowingChangeDetailModal } from "../components/FollowingChangeDetailModal";
@@ -74,6 +87,27 @@ import { FollowingChangeListModal } from "../components/FollowingChangeListModal
 
 /** 「最近变动」面板里直接展示的预览条数；更早的在「查看更多」弹窗里 */
 const CHANGE_PREVIEW_SIZE = 8;
+
+/**
+ * KPI 涨跌的基准。只存「上次打开总览时」的六个数字：
+ * 用 storage.local 是因为它跟随扩展 ID 保留，扩展升级/浏览器重启后仍然在。
+ */
+const DASHBOARD_KPI_SNAPSHOT = "dashboardKpiSnapshot";
+
+interface DashboardKpiSnapshot {
+  at: number;
+  values: Record<string, number>;
+}
+
+/** 每个 KPI 点进去对应的页面；失效内容单独走消失档案 */
+const KPI_ROUTES: Record<string, string> = {
+  historyCount: "/history",
+  favoriteCount: "/favorites",
+  collectionCount: "/collections",
+  collectionResourceCount: "/collections",
+  followingCount: "/following",
+  vanishedCount: "/vanished",
+};
 
 const RANGES = [
   { days: 7, label: "近 7 天" },
@@ -1127,7 +1161,40 @@ const Panel = ({
   </section>
 );
 
+/**
+ * 小问号说明。长口径不该一直摊在面板里，但「完整播放是下限」这类警告
+ * 仍然要有一行可见的摘要，细节收进这里。
+ */
+const InfoTip = ({
+  label,
+  align = "left",
+  children,
+}: {
+  label: string;
+  align?: "left" | "right";
+  children: React.ReactNode;
+}) => (
+  <span className="group relative inline-flex shrink-0 items-center align-middle">
+    <button
+      type="button"
+      aria-label={label}
+      className="flex h-3.5 w-3.5 items-center justify-center rounded-full border border-gray-300 text-[9px] leading-none text-gray-400 transition-colors hover:border-pink-300 hover:text-pink-500 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-pink-500 dark:border-neutral-600 dark:text-neutral-500 dark:hover:border-pink-500/50 dark:hover:text-pink-400"
+    >
+      ?
+    </button>
+    <span
+      role="tooltip"
+      className={`pointer-events-none absolute top-full z-30 mt-1.5 hidden w-72 rounded-lg bg-gray-900 p-3 text-left text-xs font-normal leading-relaxed text-gray-100 shadow-lg group-hover:block group-focus-within:block dark:bg-neutral-700 ${
+        align === "right" ? "right-0" : "left-1/2 -translate-x-1/2"
+      }`}
+    >
+      {children}
+    </span>
+  </span>
+);
+
 export const Dashboard = () => {
+  const navigate = useNavigate();
   const [loading, setLoading] = useState(true);
   const [syncing, setSyncing] = useState(false);
   const [rangeDays, setRangeDays] = useState<number>(30);
@@ -1147,7 +1214,17 @@ export const Dashboard = () => {
     folderCount: 0,
     collectionCount: 0,
     collectionResourceCount: 0,
+    vanishedCount: 0,
   });
+  /** 上次打开总览时的 KPI，用来算涨跌；null 表示第一次打开，没有基准 */
+  const [kpiBaseline, setKpiBaseline] = useState<Record<string, number> | null>(null);
+  const kpiBaselineLoadedRef = useRef(false);
+  /** 收藏封面的条目覆盖率：分子有本地字节，分母有封面地址 */
+  const [favoriteCoverStats, setFavoriteCoverStats] = useState({ archived: 0, total: 0 });
+  const [interactionProgress, setInteractionProgress] = useState<InteractionSyncProgress | null>(
+    null,
+  );
+  const [interactionSyncing, setInteractionSyncing] = useState(false);
   const [following, setFollowing] = useState<Awaited<ReturnType<typeof getAllFollowing>>>([]);
   const [events, setEvents] = useState<FollowingEvent[]>([]);
   const [interactions, setInteractions] = useState<Awaited<ReturnType<typeof getAllInteractions>>>(
@@ -1190,6 +1267,10 @@ export const Dashboard = () => {
         viewEventList,
         earliestViewAt,
         interactionList,
+        storedArchive,
+        legacyArchive,
+        savedKpiSnapshot,
+        savedInteractionProgress,
       ] = await Promise.all([
         getTotalHistoryCount(),
         getAllFavResources(),
@@ -1218,7 +1299,35 @@ export const Dashboard = () => {
         ),
         getEarliestHistoryEventViewAt(),
         getAllInteractions(),
+        getAllVanishArchive(),
+        getAllVanishedFavResources(),
+        getStorageValue<DashboardKpiSnapshot | null>(DASHBOARD_KPI_SNAPSHOT, null),
+        getStorageValue<InteractionSyncProgress | null>(INTERACTIONS_SYNC_PROGRESS, null),
       ]);
+
+      // KPI 的「失效内容」必须和消失档案页默认视图同口径：
+      // 持久档案 + 旧档案 + 当前收藏实时派生，再按字段择优合并。
+      const archiveItems = normalizeArchiveReasons(
+        enrichArchiveFromLive(
+          mergeVanishArchive(
+            mergeArchiveWithLegacy(storedArchive, legacyArchive),
+            collectLiveVanishArchive({
+              favorites,
+              collections: [],
+              following: followingList,
+              interactions: interactionList,
+              isInvalidated: isInvalidatedResource,
+            }),
+          ),
+          favorites,
+        ),
+      );
+      const vanishedCount = archiveItems.filter((item) => item.source === "favorites").length;
+      const favoriteCoverCandidates = favorites.filter((item) => Boolean(item.cover));
+      setFavoriteCoverStats({
+        archived: favoriteCoverCandidates.filter((item) => Boolean(item.coverAssetId)).length,
+        total: favoriteCoverCandidates.length,
+      });
 
       setMetrics({
         historyCount,
@@ -1226,6 +1335,7 @@ export const Dashboard = () => {
         folderCount: folders.length,
         collectionCount: collections.length,
         collectionResourceCount: collectionResources.length,
+        vanishedCount,
       });
       setFollowing(followingList);
       setEvents(eventList);
@@ -1242,6 +1352,28 @@ export const Dashboard = () => {
       setViewEvents(viewEventList);
       setRecordStartedAt(earliestViewAt);
       setInteractions(interactionList);
+      setInteractionProgress(savedInteractionProgress);
+
+      const kpiValues: Record<string, number> = {
+        historyCount,
+        favoriteCount: favorites.length,
+        collectionCount: collections.length,
+        collectionResourceCount: collectionResources.length,
+        followingCount: followingList.length,
+        vanishedCount,
+      };
+      if (!kpiBaselineLoadedRef.current) {
+        kpiBaselineLoadedRef.current = true;
+        setKpiBaseline(savedKpiSnapshot?.values ?? null);
+      }
+      // 每次打开都把「这一次」记成下一次的基准；差值必须是两次访问之间，
+      // 而不是页面内刷新前后。写入失败不影响页面展示。
+      void setStorageValue<DashboardKpiSnapshot>(DASHBOARD_KPI_SNAPSHOT, {
+        at: Date.now(),
+        values: kpiValues,
+      }).catch((error) => {
+        console.warn("保存总览 KPI 快照失败:", error);
+      });
     } catch (error) {
       console.error("加载总览失败:", error);
       toast.error("加载总览失败");
@@ -1291,6 +1423,25 @@ export const Dashboard = () => {
     return () => browser.storage.local.onChanged.removeListener(listener);
   }, [refreshArchiveStats]);
 
+  /** 关注 / 互动同步的进度会写到 storage，空状态里的按钮靠它显示实时条数 */
+  useEffect(() => {
+    const listener = (changes: Record<string, { newValue?: unknown }>) => {
+      if (FOLLOWING_SYNC_PROGRESS in changes) {
+        setProgress(
+          (changes[FOLLOWING_SYNC_PROGRESS]?.newValue as FollowingSyncProgress | undefined) ?? null,
+        );
+      }
+      if (INTERACTIONS_SYNC_PROGRESS in changes) {
+        setInteractionProgress(
+          (changes[INTERACTIONS_SYNC_PROGRESS]?.newValue as InteractionSyncProgress | undefined) ??
+            null,
+        );
+      }
+    };
+    browser.storage.local.onChanged.addListener(listener);
+    return () => browser.storage.local.onChanged.removeListener(listener);
+  }, []);
+
   const handleSync = useCallback(async () => {
     setSyncing(true);
     try {
@@ -1302,6 +1453,20 @@ export const Dashboard = () => {
       toast.error(error instanceof Error ? error.message : "关注同步失败");
     } finally {
       setSyncing(false);
+    }
+  }, [load]);
+
+  const handleSyncInteractions = useCallback(async () => {
+    setInteractionSyncing(true);
+    try {
+      const response = await browser.runtime.sendMessage({ action: "syncInteractions" });
+      if (!response?.success) throw new Error(response?.error || "互动记录同步失败");
+      toast.success(response.message ?? "互动记录同步完成");
+      await load();
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : "互动记录同步失败");
+    } finally {
+      setInteractionSyncing(false);
     }
   }, [load]);
 
@@ -1441,8 +1606,9 @@ export const Dashboard = () => {
   /**
    * 报告周期内的关注变动（新增 / 取关 / 改名 / 注销）。
    *
-   * 口径与报告一致：都是"自然周期起点 → 现在"。数据来自 followingEvents，
-   * 也就是插件观测到的事件；建立基线之前的变动无从回溯，这点在弹窗里写清楚。
+   * 口径与报告一致：周报取最近 7 天、月报取最近 30 天、年报取自然年，
+   * 都是"起点 → 现在"。数据来自 followingEvents，也就是插件观测到的事件；
+   * 建立基线之前的变动无从回溯，这点在弹窗里写清楚。
    */
   const activeReportFollowing = useMemo((): EventTypeTotals | null => {
     if (!reportKind) return null;
@@ -1520,6 +1686,32 @@ export const Dashboard = () => {
     return tasks;
   })();
 
+  /** KPI 涨跌：只跟「上次打开总览」比；没有基准或没变化就不显示 */
+  const kpiDelta = (key: string, value: number): number | null => {
+    if (!kpiBaseline || key === "vanishedCount") return null;
+    const previous = kpiBaseline[key];
+    if (typeof previous !== "number" || !Number.isFinite(previous)) return null;
+    const delta = value - previous;
+    return delta === 0 ? null : delta;
+  };
+
+  const favoriteCoverPercent =
+    favoriteCoverStats.total > 0
+      ? Math.round((favoriteCoverStats.archived / favoriteCoverStats.total) * 1000) / 10
+      : 0;
+  const favoriteCoverCoverage =
+    favoriteCoverStats.total > 0
+      ? `${favoriteCoverStats.archived} / ${favoriteCoverStats.total} 条（${favoriteCoverPercent}%）`
+      : "—";
+
+  const interactionFetched =
+    interactionProgress?.types.reduce((sum, item) => sum + item.fetchedCount, 0) ?? 0;
+  const interactionProgressText = interactionSyncing
+    ? interactionProgress
+      ? `已抓取 ${interactionFetched} 条`
+      : "已抓取 0 条，正在连接…"
+    : "";
+
   return (
     <div className="h-screen overflow-y-auto">
       <div className="mx-auto max-w-[1500px] px-6 py-5 lg:px-10">
@@ -1548,19 +1740,65 @@ export const Dashboard = () => {
           <div className="py-20 text-center text-sm text-gray-400 dark:text-neutral-500">加载中…</div>
         ) : (
           <div className="space-y-5">
-            {/* A. 跨模块指标 */}
+            {/* A. 跨模块指标：沿用旧版的紧凑左对齐；口径说明只放在需要解释的
+                ? 里，不占卡片正文，也不额外占一整行。 */}
             <div className="flex flex-wrap gap-3">
-              {kpis.map((metric) => (
-                <div
-                  key={metric.key}
-                  className="min-w-[8.5rem] max-w-[15rem] flex-1 rounded-xl border border-gray-100 bg-white px-4 py-3 shadow-sm dark:border-neutral-800 dark:bg-neutral-900"
-                >
-                  <p className="text-xs text-gray-500 dark:text-neutral-400">{metric.label}</p>
-                  <p className="mt-1 text-xl font-semibold tabular-nums text-gray-900 dark:text-neutral-100">
-                    {metric.value}
-                  </p>
-                </div>
-              ))}
+              {kpis.map((metric) => {
+                const delta = kpiDelta(metric.key, metric.value);
+                const route = KPI_ROUTES[metric.key];
+                const tip =
+                  metric.key === "favoriteCount"
+                    ? metrics.folderCount > 0
+                      ? `收藏内容分布在 ${metrics.folderCount} 个收藏夹。`
+                      : "本地保存的收藏内容条数。"
+                    : metric.key === "collectionResourceCount"
+                      ? "只统计本地已同步的合集条目；合集内容不会随目录自动抓取，打开合集后才会更新。"
+                      : metric.key === "vanishedCount"
+                        ? "收藏夹来源的失效内容；点击卡片可进入消失档案。"
+                        : null;
+                return (
+                  <div
+                    key={metric.key}
+                    className="relative min-w-[8.5rem] max-w-[15rem] flex-1 rounded-xl border border-gray-100 bg-white px-4 py-3 shadow-sm transition-colors hover:border-pink-200 hover:bg-pink-50/30 focus-within:ring-2 focus-within:ring-pink-500 dark:border-neutral-800 dark:bg-neutral-900 dark:hover:border-pink-500/40 dark:hover:bg-pink-500/5"
+                  >
+                    {/* 覆盖整张卡的主点击区，? 按钮放在它上层，避免按钮嵌套 */}
+                    <button
+                      type="button"
+                      onClick={() => route && navigate(route)}
+                      aria-label={route ? `打开${metric.label}` : metric.label}
+                      className="absolute inset-0 rounded-xl focus-visible:outline-none"
+                    />
+                    <div className="pointer-events-none flex items-start justify-between gap-2">
+                      <div className="min-w-0">
+                        <p className="text-xs text-gray-500 dark:text-neutral-400">{metric.label}</p>
+                        <div className="mt-1 flex items-baseline gap-1.5">
+                          <p className="text-xl font-semibold tabular-nums text-gray-900 dark:text-neutral-100">
+                            {metric.value}
+                          </p>
+                          {delta !== null ? (
+                            <span
+                              className={`rounded-full px-2 py-0.5 text-xs font-medium tabular-nums ${
+                                delta > 0
+                                  ? "bg-emerald-50 text-emerald-600 dark:bg-emerald-500/10 dark:text-emerald-400"
+                                  : "bg-rose-50 text-rose-600 dark:bg-rose-500/10 dark:text-rose-400"
+                              }`}
+                            >
+                              {delta > 0 ? `+${delta}` : delta}
+                            </span>
+                          ) : null}
+                        </div>
+                      </div>
+                      {tip ? (
+                        <div className="pointer-events-auto relative z-10 -mr-1 -mt-0.5">
+                          <InfoTip label={`${metric.label}说明`} align="right">
+                            {tip}
+                          </InfoTip>
+                        </div>
+                      ) : null}
+                    </div>
+                  </div>
+                );
+              })}
             </div>
 
             {/* 观看记录统计：回答"我看了什么"，报告按记录覆盖天数门控 */}
@@ -1590,13 +1828,16 @@ export const Dashboard = () => {
                 ))}
               </div>
 
-              <p className="mt-2 text-xs leading-relaxed text-gray-400 dark:text-neutral-500">
-                「视频」是去重后的数量，同一视频当天看多次只算 1 个；「完整播放」是进度到达片尾
-                （≥95% 或接口标记已看完）的次数，同一视频循环播放会分别计数。
-                两者都只统计视频 / 番剧 / 课程，不含直播与文章。
-                计数来自插件的定时观测：扩展没在运行时的观看看不到，循环短于同步间隔时可能漏采，
-                所以完整播放次数是下限。
-              </p>
+              <div className="mt-2 flex items-center gap-1.5 text-xs text-gray-400 dark:text-neutral-500">
+                <span>完整播放次数是下限。</span>
+                <InfoTip label="观看统计口径">
+                  「视频」是去重后的数量，同一视频当天看多次只算 1 个；「完整播放」是进度到达片尾
+                  （≥95% 或接口标记已看完）的次数，同一视频循环播放会分别计数。
+                  两者都只统计视频 / 番剧 / 课程，不含直播与文章。
+                  计数来自插件的定时观测：扩展没在运行时的观看看不到，循环短于同步间隔时可能漏采，
+                  所以完整播放次数是下限。
+                </InfoTip>
+              </div>
 
               <div className="mt-4 flex flex-wrap items-center gap-2">
                 {VIEW_WINDOW_OPTIONS.map((option) => (
@@ -1653,9 +1894,13 @@ export const Dashboard = () => {
                 <div className="flex flex-wrap items-baseline justify-between gap-2">
                   {/* 用不同视频数：按记录会被长视频带偏。
                       不再画"星期分布"——周几看得多对回顾没有指导意义，"几点看得多"才有。 */}
-                  <p className="text-sm font-medium text-gray-700 dark:text-neutral-200">
+                  <p className="flex items-center gap-1.5 text-sm font-medium text-gray-700 dark:text-neutral-200">
                     时段分布（个视频）
-                    <span className="ml-2 text-xs font-normal text-gray-400 dark:text-neutral-500">
+                    <InfoTip label="时段分布口径">
+                      按每个视频在所选窗口内第一次被看到的时间归入小时；同一视频多次观看只算一次，
+                      直播与文章不计入。
+                    </InfoTip>
+                    <span className="ml-1 text-xs font-normal text-gray-400 dark:text-neutral-500">
                       近 {viewWindowDays} 天
                     </span>
                   </p>
@@ -1746,7 +1991,7 @@ export const Dashboard = () => {
                         ))}
                       </div>
                       <p className="mt-2 text-xs leading-relaxed text-gray-400 dark:text-neutral-500">
-                        已记录 {reportAvailability.coverageDays} 天，报告按自然周期统计。
+                        已记录 {reportAvailability.coverageDays} 天。周报按最近 7 天、月报按最近 30 天、年报按自然年统计。
                       </p>
                     </>
                   ) : (
@@ -1767,13 +2012,39 @@ export const Dashboard = () => {
             <div className="grid gap-5 lg:grid-cols-2">
               {/* B. 关注构成 */}
               <Panel title="关注构成" hint={`共 ${followingStats.total} 位`}>
-                <ProportionBar
-                  segments={[
-                    { label: "仍关注", value: followingStats.following, color: "#22c55e" },
-                    { label: "已取关", value: followingStats.unfollowed, color: "#f59e0b" },
-                    { label: "已注销", value: followingStats.gone, color: "#94a3b8" },
-                  ]}
-                />
+                {followingStats.total === 0 ? (
+                  <div className="rounded-lg border border-dashed border-gray-200 px-4 py-6 text-center dark:border-neutral-700">
+                    <p className="text-sm text-gray-500 dark:text-neutral-400">
+                      还没有关注列表数据。
+                    </p>
+                    <p className="mt-1 text-xs text-gray-400 dark:text-neutral-500">
+                      同步一次后开始建立基线；这里会显示实时抓取的人数。
+                    </p>
+                    <button
+                      type="button"
+                      onClick={handleSync}
+                      disabled={syncing}
+                      className="mt-3 rounded-full bg-pink-500 px-3.5 py-1 text-xs font-medium text-white transition-colors hover:bg-pink-600 disabled:cursor-not-allowed disabled:opacity-50"
+                    >
+                      {syncing ? "同步中…" : "立即同步关注列表"}
+                    </button>
+                    {syncing ? (
+                      <p className="mt-2 text-xs tabular-nums text-gray-400 dark:text-neutral-500">
+                        {progress
+                          ? `已抓取 ${progress.fetchedCount}${progress.total ? ` / ${progress.total}` : ""} 位`
+                          : "已抓取 0 位，正在连接…"}
+                      </p>
+                    ) : null}
+                  </div>
+                ) : (
+                  <ProportionBar
+                    segments={[
+                      { label: "仍关注", value: followingStats.following, color: "#22c55e" },
+                      { label: "已取关", value: followingStats.unfollowed, color: "#f59e0b" },
+                      { label: "已注销", value: followingStats.gone, color: "#94a3b8" },
+                    ]}
+                  />
+                )}
               </Panel>
 
               {/* B2. 互动记录构成（点赞 / 投币） */}
@@ -1782,9 +2053,26 @@ export const Dashboard = () => {
                 hint={`共 ${interactionStats.total} 条（${INTERACTION_TYPE_LABEL.like} ${interactionStats.like} / ${INTERACTION_TYPE_LABEL.coin} ${interactionStats.coin}）`}
               >
                 {interactionStats.total === 0 ? (
-                  <div className="rounded-lg border border-dashed border-gray-200 py-8 text-center text-sm text-gray-400 dark:border-neutral-700 dark:text-neutral-500">
-                    <p>还没有点赞 / 投币记录。</p>
-                    <p className="mt-2">去「互动记录」页同步一次就能开始本地留存。</p>
+                  <div className="rounded-lg border border-dashed border-gray-200 px-4 py-6 text-center dark:border-neutral-700">
+                    <p className="text-sm text-gray-500 dark:text-neutral-400">
+                      还没有点赞 / 投币记录。
+                    </p>
+                    <p className="mt-1 text-xs text-gray-400 dark:text-neutral-500">
+                      同步一次后开始本地留存；这里会显示实时抓取条数。
+                    </p>
+                    <button
+                      type="button"
+                      onClick={handleSyncInteractions}
+                      disabled={interactionSyncing}
+                      className="mt-3 rounded-full bg-pink-500 px-3.5 py-1 text-xs font-medium text-white transition-colors hover:bg-pink-600 disabled:cursor-not-allowed disabled:opacity-50"
+                    >
+                      {interactionSyncing ? "同步中…" : "立即同步互动记录"}
+                    </button>
+                    {interactionSyncing ? (
+                      <p className="mt-2 text-xs tabular-nums text-gray-400 dark:text-neutral-500">
+                        {interactionProgressText}
+                      </p>
+                    ) : null}
                   </div>
                 ) : (
                   <>
@@ -1927,45 +2215,56 @@ export const Dashboard = () => {
               {/* F. 数据健康度 */}
               <Panel title="数据健康度">
                 <dl className="space-y-2 text-sm">
-                  {[
-                    {
-                      label: "首次基线",
-                      value: hasBaseline ? "已建立" : "未建立",
-                    },
-                    {
-                      label: "上次同步",
-                      value: formatDateTime(lastSyncAt ?? undefined),
-                    },
-                    {
-                      label: "同步间隔",
-                      value:
-                        intervalMinutes >= 60
-                          ? `${Math.round(intervalMinutes / 60)} 小时`
-                          : `${intervalMinutes} 分钟`,
-                    },
-                    {
-                      label: "下次同步",
-                      value: formatDateTime(nextRunAt ?? undefined),
-                    },
-                    {
-                      label: "头像归档",
-                      value:
-                        archiveProgress && archiveProgress.remaining > 0
-                          ? `${avatarAssetCount} 张 · 待归档 ${archiveProgress.remaining}`
-                          : `${avatarAssetCount} 张`,
-                    },
-                    {
-                      label: "封面归档",
-                      value:
-                        coverArchivePending > 0
-                          ? `${coverAssetCount} 张 · 待归档 ${coverArchivePending}`
-                          : `${coverAssetCount} 张`,
-                    },
-                    { label: "图片合计", value: `${assetCount} 张` },
-                  ].map((row) => (
+                  {(
+                    [
+                      {
+                        label: "首次基线",
+                        value: hasBaseline ? "已建立" : "未建立",
+                      },
+                      {
+                        label: "上次同步",
+                        value: formatDateTime(lastSyncAt ?? undefined),
+                      },
+                      {
+                        label: "同步间隔",
+                        value:
+                          intervalMinutes >= 60
+                            ? `${Math.round(intervalMinutes / 60)} 小时`
+                            : `${intervalMinutes} 分钟`,
+                      },
+                      {
+                        label: "下次同步",
+                        value: formatDateTime(nextRunAt ?? undefined),
+                      },
+                      {
+                        label: "头像归档",
+                        value:
+                          archiveProgress && archiveProgress.remaining > 0
+                            ? `${avatarAssetCount} 张 · 待归档 ${archiveProgress.remaining}`
+                            : `${avatarAssetCount} 张`,
+                      },
+                      {
+                        label: "封面归档",
+                        value: favoriteCoverCoverage,
+                        tip: `按收藏条目统计：${favoriteCoverStats.archived} / ${favoriteCoverStats.total} 条已有本地封面字节。assets 里另有 ${coverAssetCount} 张封面图片（含合集封面和历史旧图）。${
+                          coverArchivePending > 0 ? `待归档 ${coverArchivePending} 条。` : ""
+                        }`,
+                      },
+                      { label: "图片合计", value: `${assetCount} 张` },
+                    ] as Array<{ label: string; value: string; tip?: string }>
+                  ).map((row) => (
                     <div key={row.label} className="flex items-center justify-between gap-3">
-                      <dt className="text-gray-500 dark:text-neutral-400">{row.label}</dt>
-                      <dd className="tabular-nums text-gray-700 dark:text-neutral-200">{row.value}</dd>
+                      <dt className="flex items-center gap-1 text-gray-500 dark:text-neutral-400">
+                        {row.label}
+                        {row.tip ? (
+                          <InfoTip label={`${row.label}说明`} align="right">
+                            {row.tip}
+                          </InfoTip>
+                        ) : null}
+                      </dt>
+                      <dd className="whitespace-nowrap text-right tabular-nums text-gray-700 dark:text-neutral-200">
+                        {row.value}
+                      </dd>
                     </div>
                   ))}
                 </dl>

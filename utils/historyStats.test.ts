@@ -22,7 +22,6 @@ import {
   type StatsEvent,
 } from "./historyStats";
 
-const DAY = 86_400_000;
 
 // 用固定的基准时间，测试不随运行时刻漂移：2026-10-08 12:00（本地时区）
 const NOW = new Date(2026, 9, 8, 12, 0, 0).getTime();
@@ -252,9 +251,14 @@ describe("汇总（今天 / 本周 / 本月 / 本年）", () => {
   });
 
   it("本周从周一开始，周日的事件不算进本周", () => {
-    const weekStartMs = resolvePeriodStartMs("week", NOW);
-    expect(new Date(weekStartMs).getDay()).toBe(1);
-    const weekStartSec = Math.floor(weekStartMs / 1000);
+    // 这里的"本周"是总览的周统计，仍是自然周；报告周期才改成最近 7 天
+    const naturalWeekStart = new Date(NOW);
+    naturalWeekStart.setHours(0, 0, 0, 0);
+    naturalWeekStart.setDate(
+      naturalWeekStart.getDate() - ((naturalWeekStart.getDay() + 6) % 7),
+    );
+    expect(naturalWeekStart.getDay()).toBe(1);
+    const weekStartSec = Math.floor(naturalWeekStart.getTime() / 1000);
 
     const summary = summarizeViewCounts(
       [
@@ -608,14 +612,20 @@ describe("报告可用性：覆盖天数不足就不生成", () => {
 });
 
 describe("周期报告", () => {
-  it("周报起点是周一，月报起点是 1 号，年报起点是 1 月 1 日", () => {
+  it("周报起点是 7 天前，月报起点是 30 天前，年报起点是 1 月 1 日", () => {
+    const startOfToday = new Date(NOW);
+    startOfToday.setHours(0, 0, 0, 0);
+
+    const expectedWeek = new Date(startOfToday);
+    expectedWeek.setDate(expectedWeek.getDate() - 6);
     const week = new Date(resolvePeriodStartMs("week", NOW));
-    expect(week.getDay()).toBe(1);
+    expect(week.getTime()).toBe(expectedWeek.getTime());
     expect(week.getHours()).toBe(0);
 
+    const expectedMonth = new Date(startOfToday);
+    expectedMonth.setDate(expectedMonth.getDate() - 29);
     const month = new Date(resolvePeriodStartMs("month", NOW));
-    expect(month.getDate()).toBe(1);
-    expect(month.getMonth()).toBe(9);
+    expect(month.getTime()).toBe(expectedMonth.getTime());
 
     const year = new Date(resolvePeriodStartMs("year", NOW));
     expect(year.getMonth()).toBe(0);
@@ -671,10 +681,8 @@ describe("周期报告", () => {
     expect(report.activeDays).toBe(2);
   });
 
-  it("周期长度按自然周期计算", () => {
-    const weekReport = buildHistoryReport([], "week", NOW);
-    const weekStart = new Date(resolvePeriodStartMs("week", NOW));
-    const expected = Math.round((new Date(NOW).setHours(0, 0, 0, 0) - weekStart.getTime()) / DAY) + 1;
-    expect(weekReport.totalDays).toBe(expected);
+  it("周报固定 7 天，月报固定 30 天", () => {
+    expect(buildHistoryReport([], "week", NOW).totalDays).toBe(7);
+    expect(buildHistoryReport([], "month", NOW).totalDays).toBe(30);
   });
 });
