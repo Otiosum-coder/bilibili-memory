@@ -1,18 +1,3 @@
-export const IS_SYNC_DELETE = "isSyncDelete";
-export const IS_SYNC_DELETE_FROM_BILIBILI = "isSyncDeleteFromBilibili";
-
-/**
- * 注入脚本 <-> content script 的页面级 window 消息类型。
- *
- * 必须带项目前缀：页面上的 window.postMessage 对所有扩展的 content script 可见，
- * 若沿用上游的 `DELETE_HISTORY_FROM_INJECT`，当本扩展与上游扩展同时安装时，
- * 一份消息会被两个扩展各处理一次，造成串台。
- */
-export const PAGE_MESSAGE_DELETE_HISTORY = "BILIMEMORY_DELETE_HISTORY";
-
-/** 注入脚本的防重复包装标志，同样带项目前缀以免与其它扩展互相误判 */
-export const INJECTED_FETCH_GUARD_KEY = "__BILIMEMORY_FETCH_INTERCEPTED__";
-
 export const HAS_FULL_SYNC = "hasFullSync";
 export const HAS_FULL_FAV_SYNC = "hasFullFavSync";
 
@@ -110,6 +95,12 @@ export const FOLLOWING_AVATAR_ARCHIVE_PROGRESS = "followingAvatarArchiveProgress
 export const FAV_COVER_ARCHIVE_PROGRESS = "favCoverArchiveProgress";
 /** 订阅合集内容的封面归档进度。与收藏封面共用 `assets` 的 cover 类型 */
 export const COLLECTION_COVER_ARCHIVE_PROGRESS = "collectionCoverArchiveProgress";
+/** 订阅合集首次全量内容同步的进度。目录同步后自动排队，也可手动触发/取消。 */
+export const COLLECTION_ARCHIVE_SYNC_PROGRESS = "collectionArchiveSyncProgress";
+/** 合集内容列表接口的翻页间隔，避免一次性打太快 */
+export const COLLECTION_ARCHIVE_PAGE_DELAY_MS = 1_200;
+/** 进度超过这个时间没心跳就认为后台任务已经中断 */
+export const COLLECTION_ARCHIVE_SYNC_STALE_MS = 120_000;
 /** 失效收藏恢复的实时进度。页面据此轮询显示「已查 X / 共 Y」。 */
 export const FAV_RECOVERY_PROGRESS = "favRecoveryProgress";
 /** 恢复结束时，对因限流没处理的条目再等多久重试一次（毫秒） */
@@ -166,7 +157,11 @@ export const DEFAULT_WEBDAV_SYNC_ITEMS = {
   favResources: true,
   subscribedCollections: true,
   subscribedCollectionResources: true,
+  /** 合集级消失档案（v13）。合集壳已从订阅目录消失，本地这份是唯一元数据 */
+  collectionArchives: true,
   following: true,
+  /** 曾用名独立存档（v12）。已取关账号的名字不会出现在 following 里 */
+  formerNames: true,
   followingEvents: true,
   vanishedFavResources: true,
   interactions: true,
@@ -187,7 +182,9 @@ export const DEFAULT_LOCAL_HISTORY_BACKUP_ITEMS: BackupItems = {
   favResources: false,
   subscribedCollections: false,
   subscribedCollectionResources: false,
+  collectionArchives: false,
   following: false,
+  formerNames: false,
   followingEvents: false,
   vanishedFavResources: false,
   interactions: false,
@@ -222,6 +219,17 @@ export const DELETED_HISTORY_IDS = "deletedHistoryIds";
 export const THEME_MODE = "themeMode";
 
 export const UPDATE_HISTORY = [
+  {
+    date: "2026-11-06",
+    version: "0.5.0",
+    changes: [
+      "数据备份：改为按分类勾选备份内容；新增合集档案、曾用名存档，WebDAV 与本地目录备份保持一致",
+      "设置页：重构为「数据与存储 / 自动同步」两栏，补齐手动同步、同步间隔与更明确的危险操作",
+      "侧边栏：账号卡改为头像与身份牌，菜单支持拖拽排序",
+      "总览：最近在看 UP 主最多显示 9 位，观看报告改为周报 / 月报 / 年报清单",
+      "仓库整理：移除开发配置与废弃模块，补充项目地址和隐私说明",
+    ],
+  },
   {
     date: "2026-10-27",
     version: "0.4.1",

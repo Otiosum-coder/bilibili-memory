@@ -12,21 +12,9 @@ patchedDependencies:
 importers:
   .:
     dependencies:
-      "@types/howler":
-        specifier: ^2.2.12
-        version: 2.2.13
-      axios:
-        specifier: ^1.9.0
-        version: 1.18.1
-      date-fns:
-        specifier: ^4.1.0
-        version: 4.4.0
       dayjs:
         specifier: ^1.11.13
         version: 1.11.21
-      howler:
-        specifier: ^2.2.4
-        version: 2.2.4
       lucide-react:
         specifier: ^0.511.0
         version: 0.511.0(react@19.2.7)
@@ -45,9 +33,6 @@ importers:
       use-debounce:
         specifier: ^10.0.4
         version: 10.1.1(react@19.2.7)
-      zustand:
-        specifier: ^5.0.5
-        version: 5.0.14(@types/react@19.2.17)(react@19.2.7)
     devDependencies:
       "@types/react":
         specifier: ^19.1.2

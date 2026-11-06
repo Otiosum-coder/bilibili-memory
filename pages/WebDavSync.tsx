@@ -57,7 +57,9 @@ import {
   getAllFavResources,
   getAllSubscribedCollections,
   getAllSubscribedCollectionResources,
+  getAllCollectionArchives,
   getAllFollowing,
+  getAllFormerNames,
   getAllFollowingEvents,
   getBackupLocalIds,
   getAllInteractions,
@@ -72,6 +74,8 @@ import {
   smartMergeFavResources,
   importSubscribedCollections,
   smartMergeSubscribedCollectionResources,
+  importCollectionArchives,
+  importFormerNames,
   smartMergeFollowing,
   smartMergeFollowingEvents,
   smartMergeVanishedFavResources,
@@ -154,11 +158,26 @@ const DATA_ITEMS: DataItemDef[] = [
     merge: smartMergeSubscribedCollectionResources,
   },
   {
+    key: "collectionArchives",
+    label: "合集档案",
+    file: "collectionArchives.json",
+    // 包含已软删除的 tombstone，否则恢复后它们会重新出现在列表里
+    getAll: () => getAllCollectionArchives(true),
+    merge: importCollectionArchives,
+  },
+  {
     key: "following",
     label: "关注的 UP 主",
     file: "following.json",
     getAll: getAllFollowing,
     merge: smartMergeFollowing,
+  },
+  {
+    key: "formerNames",
+    label: "曾用名存档",
+    file: "formerNames.json",
+    getAll: getAllFormerNames,
+    merge: importFormerNames,
   },
   {
     key: "followingEvents",
@@ -837,8 +856,20 @@ const WebDavSync = () => {
                 totalSkipped += result.skipped;
                 recognized = true;
               }
+              if (Array.isArray(data.collectionArchives)) {
+                const result = await importCollectionArchives(data.collectionArchives);
+                totalMerged += result.merged;
+                totalSkipped += result.skipped;
+                recognized = true;
+              }
               if (Array.isArray(data.following)) {
                 const result = await smartMergeFollowing(data.following);
+                totalMerged += result.merged;
+                totalSkipped += result.skipped;
+                recognized = true;
+              }
+              if (Array.isArray(data.formerNames)) {
+                const result = await importFormerNames(data.formerNames);
                 totalMerged += result.merged;
                 totalSkipped += result.skipped;
                 recognized = true;
@@ -908,6 +939,21 @@ const WebDavSync = () => {
   // ===== 自动同步操作 =====
 
   const handleAutoSyncToggle = async (enabled: boolean) => {
+    if (enabled) {
+      // 后台自动同步读的是已保存配置，不是页面里正在编辑的这份。
+      // 如果用户只输入了地址没点“保存配置”，开启后后台会读到旧/空配置并静默跳过。
+      const saved = await loadWebDavConfig();
+      const configIsSaved =
+        !!saved &&
+        saved.serverUrl === config.serverUrl &&
+        saved.username === config.username &&
+        saved.password === config.password &&
+        saved.basePath === config.basePath;
+      if (!configIsSaved) {
+        toast.error("配置尚未保存或已修改，请先点「保存配置」再开启自动同步");
+        return;
+      }
+    }
     setAutoSyncEnabled(enabled);
     await setStorageValue(WEBDAV_AUTO_SYNC_ENABLED, enabled);
     if (enabled) {

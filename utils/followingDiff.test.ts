@@ -344,4 +344,46 @@ describe("diffFollowing - 事件幂等与脏数据", () => {
     expect(next[0].thirdPartyNames).toEqual(["旧名A", "旧名B"]);
     expect(next[0].thirdPartyQueriedAt).toBe(NOW - DAY_MS);
   });
+
+  it("头像地址随真实 face 更新，并在 face 变成占位图时保留旧地址", () => {
+    const existing = [
+      makeExisting(1, {
+        face: "https://i0.hdslb.com/bfs/face/old.jpg",
+        avatarSourceUrl: "https://i0.hdslb.com/bfs/face/old.jpg",
+      }),
+    ];
+
+    const changed = diffFollowing(
+      existing,
+      [makeEntry(1, "UP_1", { face: "https://i0.hdslb.com/bfs/face/new.jpg" })],
+      makeOptions(),
+    );
+    expect(changed.next[0].avatarSourceUrl).toBe("https://i0.hdslb.com/bfs/face/new.jpg");
+
+    const gone = diffFollowing(
+      existing,
+      [
+        makeEntry(1, "账号已注销", {
+          face: "https://i0.hdslb.com/bfs/face/member/noface.jpg",
+        }),
+      ],
+      makeOptions(),
+    );
+    expect(gone.next[0].avatarSourceUrl).toBe("https://i0.hdslb.com/bfs/face/old.jpg");
+  });
+
+  it("旧记录没有 avatarSourceUrl 时，用上一轮真实 face 兜底", () => {
+    const existing = [makeExisting(1, { face: "https://i0.hdslb.com/bfs/face/legacy.jpg" })];
+    const { next } = diffFollowing(
+      existing,
+      [
+        makeEntry(1, "账号已注销", {
+          face: "https://i0.hdslb.com/bfs/face/member/noface.jpg",
+        }),
+      ],
+      makeOptions(),
+    );
+
+    expect(next[0].avatarSourceUrl).toBe("https://i0.hdslb.com/bfs/face/legacy.jpg");
+  });
 });

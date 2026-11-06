@@ -122,6 +122,21 @@ describe("buildResourceCopyText", () => {
     expect(text).toContain("https://space.bilibili.com/247177563");
   });
 
+  it("输出封面远程地址，便于只保存地址而不下载图片", () => {
+    const text = buildResourceCopyText(makeResource(1));
+
+    expect(text).toContain("封面地址：https://i0.hdslb.com/bfs/archive/1.jpg");
+    expect(text).not.toContain("B站占位图");
+  });
+
+  it("封面是占位图时明确标注，避免把占位图地址当成原封面", () => {
+    const text = buildResourceCopyText(
+      makeResource(1, { attr: 1, title: "已失效视频", cover: PLACEHOLDER_COVER }),
+    );
+
+    expect(text).toContain(`封面地址：${PLACEHOLDER_COVER}（B站占位图，原封面已丢失）`);
+  });
+
   it("时长、时间与统计数按可读格式输出", () => {
     const text = buildResourceCopyText(makeResource(1));
 

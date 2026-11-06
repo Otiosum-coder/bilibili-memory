@@ -107,10 +107,21 @@ export const About: React.FC = () => {
             主追踪等能力。原项目采用 MIT 许可证，版权归原作者及贡献者所有，详见仓库根目录的
             LICENSE 文件。
           </p>
-          <p className="text-gray-600 text-base mt-3">上游项目地址：</p>
-          <p className="text-lg mb-4">
+          <p className="text-gray-600 text-base mt-3">项目地址：</p>
+          <p className="text-lg mb-3 break-all">
             <a
-              className="text-blue-500 break-all"
+              className="text-blue-500 hover:text-blue-600"
+              href="https://github.com/Otiosum-coder/bilibili-memory"
+              target="_blank"
+              rel="noopener noreferrer"
+            >
+              https://github.com/Otiosum-coder/bilibili-memory
+            </a>
+          </p>
+          <p className="text-gray-600 text-base mt-3">上游项目地址：</p>
+          <p className="text-lg mb-4 break-all">
+            <a
+              className="text-blue-500 hover:text-blue-600"
               href="https://github.com/mundane799699/bilibili-history-wxt"
               target="_blank"
               rel="noopener noreferrer"

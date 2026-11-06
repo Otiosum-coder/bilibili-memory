@@ -24,7 +24,9 @@ import {
   getAllHistoryTombstones,
   getAllSubscribedCollectionResources,
   getAllSubscribedCollections,
+  getAllCollectionArchives,
   getAllFollowing,
+  getAllFormerNames,
   getAllFollowingEvents,
   getAllVanishedFavResources,
   getAllVanishArchive,
@@ -130,7 +132,13 @@ const LOCAL_BACKUP_DATA_ITEMS: {
     label: "合集视频",
     getAll: getAllSubscribedCollectionResources,
   },
+  {
+    key: "collectionArchives",
+    label: "合集档案",
+    getAll: () => getAllCollectionArchives(true),
+  },
   { key: "following", label: "关注的 UP 主", getAll: getAllFollowing },
+  { key: "formerNames", label: "曾用名存档", getAll: getAllFormerNames },
   { key: "followingEvents", label: "关注变动", getAll: getAllFollowingEvents },
   // 旧 store 不再单独作为备份项：它已被 `vanishArchive` 取代，
   // 数据会在写 `vanishArchive` 时一起并进来（见本文件下方的合并逻辑）

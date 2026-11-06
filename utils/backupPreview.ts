@@ -35,7 +35,17 @@ export const BACKUP_KEY_SPECS: BackupKeySpec[] = [
     label: "合集视频",
     idOf: (item) => (item?.id != null ? String(item.id) : null),
   },
+  {
+    key: "collectionArchives",
+    label: "合集档案",
+    idOf: (item) => (item?.id != null ? String(item.id) : null),
+  },
   { key: "following", label: "关注的 UP 主", idOf: (item) => (item?.mid != null ? String(item.mid) : null) },
+  {
+    key: "formerNames",
+    label: "曾用名存档",
+    idOf: (item) => (item?.mid != null ? String(item.mid) : null),
+  },
   {
     key: "followingEvents",
     label: "关注变动",
@@ -46,6 +56,11 @@ export const BACKUP_KEY_SPECS: BackupKeySpec[] = [
     label: "消失档案",
     idOf: (item) =>
       item?.id != null && item?.folder_id != null ? `${item.folder_id}:${item.id}` : null,
+  },
+  {
+    key: "vanishArchive",
+    label: "统一消失档案",
+    idOf: (item) => (item?.id != null ? String(item.id) : null),
   },
   {
     key: "interactions",

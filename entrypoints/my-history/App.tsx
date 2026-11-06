@@ -210,7 +210,7 @@ const MainLayout = ({ children }: MainLayoutProps) => {
     <div className="flex h-screen dark:bg-[#0a0a0a] dark:text-neutral-100">
       {!isWelcome && <Sidebar />}
       {/* 主内容区域 */}
-      <div className={`${!isWelcome ? "ml-40" : ""} w-full transition-all duration-300`}>
+      <div className={`${!isWelcome ? "ml-[152px]" : ""} w-full transition-all duration-300`}>
         {children}
       </div>
       {!isWelcome && isFirstRunGuideReady && !isFirstRunGuideOpen && (

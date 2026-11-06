@@ -40,7 +40,9 @@ const LOCAL_BACKUP_ITEM_OPTIONS: { key: BackupItemKey; label: string }[] = [
   { key: "favResources", label: "收藏资源" },
   { key: "subscribedCollections", label: "订阅合集" },
   { key: "subscribedCollectionResources", label: "合集视频" },
+  { key: "collectionArchives", label: "合集档案" },
   { key: "following", label: "关注的 UP 主" },
+  { key: "formerNames", label: "曾用名存档" },
   { key: "followingEvents", label: "关注变动" },
   { key: "vanishArchive", label: "消失档案" },
   { key: "interactions", label: "点赞与投币" },
@@ -385,10 +387,6 @@ export const LocalHistoryBackupPanel = () => {
                 }}
                 disabled={isRunning}
                 accent="emerald"
-                hints={{
-                  vanishArchive:
-                    "收藏、订阅合集、关注与互动四处「已查不到」内容的快照。它无法从 B 站重新同步，建议保留",
-                }}
                 scopeHint="只影响本地目录备份。WebDAV 同步与 JSON 导出各有自己的备份内容，互不影响。"
               />
             </div>

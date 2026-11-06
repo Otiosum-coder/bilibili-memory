@@ -7,6 +7,9 @@ import {
   ChevronDown,
   ExternalLink,
   Inbox,
+  Layers,
+  LayoutGrid,
+  List,
   RefreshCw,
   RotateCcw,
   Search,
@@ -17,15 +20,20 @@ import {
 import toast from "react-hot-toast";
 import { createAssetObjectUrl } from "../utils/assetArchive";
 import {
+  deleteCollectionArchiveResources,
+  deleteCollectionArchives,
   deleteVanishArchiveItems,
   deleteVanishedFavResources,
+  getAllCollectionArchives,
   getAllFavFolders,
   getAllFavResources,
   getAllFollowing,
   getAllInteractions,
   getAllVanishArchive,
   getAllVanishedFavResources,
+  getSubscribedCollectionResources,
   patchFollowingItems,
+  restoreCollectionArchives,
   restoreVanishArchiveItems,
 } from "../utils/db";
 import { isInvalidatedResource } from "../utils/favVanishedDiff";
@@ -51,8 +59,10 @@ import {
   type VanishArchiveFilter,
 } from "../utils/vanishArchive";
 import type {
+  CollectionArchive,
   FavoriteFolder,
   FollowingItem,
+  SubscribedCollectionResource,
   VanishArchiveItem,
   VanishArchiveReason,
   VanishArchiveSource,
@@ -913,6 +923,72 @@ const VanishedFollowingRow = ({
   );
 };
 
+const CollectionArchiveCard = ({
+  item,
+  onOpen,
+  onDelete,
+}: {
+  item: CollectionArchive;
+  onOpen: () => void;
+  onDelete: () => void;
+}) => {
+  const cover = item.cover?.trim();
+  return (
+    <article
+      className="group cursor-pointer overflow-hidden rounded-xl border border-gray-100 bg-white shadow-sm transition-shadow hover:shadow-md dark:border-neutral-800 dark:bg-neutral-900"
+      onClick={onOpen}
+    >
+      <div className="relative aspect-video overflow-hidden bg-gray-100 dark:bg-neutral-800">
+        {cover ? (
+          <img
+            src={cover.replace(/^http:/, "https:")}
+            alt={item.title || "合集封面"}
+            className="h-full w-full object-cover"
+            loading="lazy"
+            onError={(event) => {
+              event.currentTarget.src = PLACEHOLDER_COVER_PATH;
+            }}
+          />
+        ) : (
+          <div className="flex h-full w-full items-center justify-center text-gray-300 dark:text-neutral-600">
+            <Layers className="h-10 w-10" />
+          </div>
+        )}
+        <span
+          className={`absolute left-2.5 top-2.5 rounded-md px-2 py-1 text-xs font-medium text-white ${
+            item.reason === "collection_gone" ? "bg-amber-600/90" : "bg-sky-600/90"
+          }`}
+        >
+          {item.reason === "collection_gone" ? "已离开订阅" : "合集已失效"}
+        </span>
+        <button
+          type="button"
+          aria-label="删除合集本地备份"
+          title="删除本地备份"
+          onClick={(event) => {
+            event.stopPropagation();
+            onDelete();
+          }}
+          className="absolute right-2.5 top-2.5 rounded-md bg-black/45 p-1.5 text-white opacity-100 backdrop-blur-sm transition-all hover:bg-red-600 sm:opacity-0 sm:group-hover:opacity-100"
+        >
+          <Trash2 className="h-3.5 w-3.5" />
+        </button>
+      </div>
+      <div className="p-4">
+        <h3 className="line-clamp-2 text-sm font-semibold leading-6 text-gray-900 dark:text-neutral-100">
+          {item.title?.trim() || `合集 ${item.id}`}
+        </h3>
+        <p className="mt-1.5 truncate text-xs text-gray-500 dark:text-neutral-400">
+          {item.upper?.name || "未知 UP 主"}
+        </p>
+        <p className="mt-2 text-xs text-gray-400 dark:text-neutral-500">
+          本地保存 {item.resourceCount || 0} 条 · {formatDate(item.archivedAt)} 归档
+        </p>
+      </div>
+    </article>
+  );
+};
+
 const VANISH_PAGE_SIZE = 48;
 
 /**
@@ -938,8 +1014,54 @@ const SORTS: Array<{ key: SortKey; label: string }> = [
   { key: "title_asc", label: "标题 A→Z" },
 ];
 
+/**
+ * 没有筛选条件时，按当前来源解释"为什么这里没有记录"。
+ *
+ * 之前所有空结果都复用「没有匹配的记录 / 清除筛选」，但来源本身为空时
+ * 用户并没有筛掉任何东西，看到这句话只会困惑。尤其「订阅合集」来源：
+ * 合集本地备份已经移到订阅合集页，这里空是正常的，需要说清楚。
+ */
+const SOURCE_EMPTY_STATE: Record<
+  VanishArchiveSource,
+  { title: string; description: string }
+> = {
+  favorites: {
+    title: "还没有消失的收藏内容",
+    description: "收藏的视频在 B 站失效、或从收藏夹里消失时，会先留档到这里。",
+  },
+  collections: {
+    title: "还没有消失的合集内容",
+    description:
+      "整个合集从订阅目录消失、或合集里的视频被移除/失效时，会先留档到这里。",
+  },
+  following: {
+    title: "还没有关注账号的消失记录",
+    description: "关注账号注销，或被检测到改名时，会记录在这里。",
+  },
+  interactions: {
+    title: "还没有消失的互动记录",
+    description: "点赞或投币过的视频被删除时，会记录在这里。",
+  },
+};
+
 const Vanished = () => {
   const [archive, setArchive] = useState<VanishArchiveItem[]>([]);
+  const [collectionArchives, setCollectionArchives] = useState<CollectionArchive[]>([]);
+  const [collectionDetail, setCollectionDetail] = useState<CollectionArchive | null>(null);
+  const [collectionDetailResources, setCollectionDetailResources] = useState<
+    SubscribedCollectionResource[]
+  >([]);
+  const [collectionDetailLoading, setCollectionDetailLoading] = useState(false);
+  const [collectionDetailView, setCollectionDetailView] = useState<"grid" | "list">("grid");
+  const [collectionDeleteTarget, setCollectionDeleteTarget] = useState<CollectionArchive | null>(null);
+  const [collectionDeleting, setCollectionDeleting] = useState(false);
+  const [collectionUndo, setCollectionUndo] = useState<{
+    item: CollectionArchive;
+    remaining: number;
+  } | null>(null);
+  const pendingCollectionDeleteRef = useRef<CollectionArchive | null>(null);
+  const collectionUndoTimerRef = useRef<number | null>(null);
+  const collectionUndoIntervalRef = useRef<number | null>(null);
   const [following, setFollowing] = useState<FollowingItem[]>([]);
   const [folders, setFolders] = useState<FavoriteFolder[]>([]);
   const [loading, setLoading] = useState(true);
@@ -983,15 +1105,23 @@ const Vanished = () => {
   const load = useCallback(async () => {
     setLoading(true);
     try {
-      const [stored, legacy, followingList, favorites, interactions, folderList] =
-        await Promise.all([
-          getAllVanishArchive(),
-          getAllVanishedFavResources(),
-          getAllFollowing(),
-          getAllFavResources(),
-          getAllInteractions(),
-          getAllFavFolders(),
-        ]);
+      const [
+        stored,
+        legacy,
+        followingList,
+        favorites,
+        interactions,
+        folderList,
+        collectionArchiveList,
+      ] = await Promise.all([
+        getAllVanishArchive(),
+        getAllVanishedFavResources(),
+        getAllFollowing(),
+        getAllFavResources(),
+        getAllInteractions(),
+        getAllFavFolders(),
+        getAllCollectionArchives(),
+      ]);
 
       // 两层来源合并。第二层是"读时派生"：源记录里已经查不到、但还没写进档案的内容。
       // 没有它，用户本地明明有已失效收藏 / 已注销关注 / 稿件已删的互动，页面却是空的。
@@ -1012,12 +1142,20 @@ const Vanished = () => {
         ),
       );
       setArchive(merged);
+      setCollectionArchives(
+        collectionArchiveList.slice().sort((a, b) => b.archivedAt - a.archivedAt),
+      );
 
       // 默认只看收藏夹；若收藏夹档案为空，自动切到第一个有内容的来源
       if (!initialSourcePickedRef.current) {
         initialSourcePickedRef.current = true;
         if (!merged.some((item) => item.source === "favorites")) {
-          const first = SOURCES.find((value) => merged.some((item) => item.source === value));
+          const first = SOURCES.find((value) =>
+            value === "collections"
+              ? collectionArchiveList.length > 0 ||
+                merged.some((item) => item.source === "collections")
+              : merged.some((item) => item.source === value),
+          );
           if (first) setSource(first);
         }
       }
@@ -1088,6 +1226,116 @@ const Vanished = () => {
     }
   };
 
+  const openCollectionArchive = async (item: CollectionArchive) => {
+    setCollectionDetail(item);
+    setCollectionDetailResources([]);
+    setCollectionDetailLoading(true);
+    try {
+      const resources = await getSubscribedCollectionResources(item.id);
+      setCollectionDetailResources(resources.slice().sort((a, b) => a.index - b.index));
+    } catch (error) {
+      console.error("读取合集档案内容失败:", error);
+      toast.error("读取合集内容失败");
+    } finally {
+      setCollectionDetailLoading(false);
+    }
+  };
+
+  const clearCollectionUndoTimers = () => {
+    if (collectionUndoTimerRef.current !== null) {
+      window.clearTimeout(collectionUndoTimerRef.current);
+      collectionUndoTimerRef.current = null;
+    }
+    if (collectionUndoIntervalRef.current !== null) {
+      window.clearInterval(collectionUndoIntervalRef.current);
+      collectionUndoIntervalRef.current = null;
+    }
+  };
+
+  const finalizeCollectionDeletion = async (item: CollectionArchive) => {
+    try {
+      await deleteCollectionArchiveResources(item.id);
+    } catch (error) {
+      console.error("清理合集档案内容失败:", error);
+    }
+  };
+
+  const beginCollectionUndo = (item: CollectionArchive) => {
+    clearCollectionUndoTimers();
+    pendingCollectionDeleteRef.current = item;
+    let remaining = 5;
+    setCollectionUndo({ item, remaining });
+    collectionUndoIntervalRef.current = window.setInterval(() => {
+      remaining -= 1;
+      if (remaining > 0) {
+        setCollectionUndo((current) => (current ? { ...current, remaining } : current));
+      }
+    }, 1000);
+    collectionUndoTimerRef.current = window.setTimeout(() => {
+      clearCollectionUndoTimers();
+      pendingCollectionDeleteRef.current = null;
+      setCollectionUndo(null);
+      void finalizeCollectionDeletion(item);
+    }, 5000);
+  };
+
+  const handleDeleteCollectionArchive = async () => {
+    const target = collectionDeleteTarget;
+    if (!target || collectionDeleting) return;
+    setCollectionDeleting(true);
+    try {
+      const previous = pendingCollectionDeleteRef.current;
+      if (previous) {
+        clearCollectionUndoTimers();
+        pendingCollectionDeleteRef.current = null;
+        await finalizeCollectionDeletion(previous);
+      }
+      await deleteCollectionArchives([target.id]);
+      setCollectionArchives((current) => current.filter((item) => item.id !== target.id));
+      setCollectionDeleteTarget(null);
+      beginCollectionUndo(target);
+    } catch (error) {
+      console.error("删除合集档案失败:", error);
+      toast.error("删除合集档案失败");
+    } finally {
+      setCollectionDeleting(false);
+    }
+  };
+
+  const handleUndoCollectionDelete = async () => {
+    const target = collectionUndo?.item;
+    if (!target) return;
+    clearCollectionUndoTimers();
+    pendingCollectionDeleteRef.current = null;
+    try {
+      await restoreCollectionArchives([target.id]);
+      setCollectionArchives((current) =>
+        current.some((item) => item.id === target.id) ? current : [target, ...current],
+      );
+      setCollectionUndo(null);
+      toast.success("已恢复合集档案");
+    } catch (error) {
+      console.error("撤销删除合集档案失败:", error);
+      toast.error("撤销失败，请刷新后重试");
+    }
+  };
+
+  useEffect(
+    () => () => {
+      if (collectionUndoTimerRef.current !== null) {
+        window.clearTimeout(collectionUndoTimerRef.current);
+      }
+      if (collectionUndoIntervalRef.current !== null) {
+        window.clearInterval(collectionUndoIntervalRef.current);
+      }
+      const pending = pendingCollectionDeleteRef.current;
+      if (pending) {
+        void deleteCollectionArchiveResources(pending.id);
+      }
+    },
+    [],
+  );
+
   const filtered = useMemo(() => {
     const filter: VanishArchiveFilter = { keyword, source, reason };
     const result = queryVanishArchive(archive, filter);
@@ -1125,6 +1373,37 @@ const Vanished = () => {
   }, [archive, keyword, reason, sort, source]);
 
   const visible = useMemo(() => filtered.slice(0, visibleCount), [filtered, visibleCount]);
+
+  /**
+   * 合集级档案和视频档案是两个 store：
+   * - 消失档案的「订阅合集」原先只有合集内被移除的视频；
+   * - 合集壳（整个合集消失）在 `collectionArchives`，需要单独读、单独渲染。
+   */
+  const collectionArchiveVisible = useMemo(() => {
+    // 合集级档案没有「UP 删除/其他原因」这类视频原因，原因筛选时不混进来。
+    if (source !== "collections" || reason !== "all") return [];
+    const needle = keyword.trim().toLowerCase();
+    if (!needle) return collectionArchives;
+    return collectionArchives.filter((item) => {
+      const haystack = [
+        item.title,
+        item.upper?.name,
+        String(item.id),
+        item.intro,
+      ]
+        .join(" ")
+        .toLowerCase();
+      return haystack.includes(needle);
+    });
+  }, [collectionArchives, keyword, reason, source]);
+
+  const hasCollectionArchives = collectionArchives.length > 0;
+  const visibleArchiveCount = collectionArchiveVisible.length;
+  const sourceTotal =
+    source === "collections" ? filtered.length + visibleArchiveCount : filtered.length;
+
+  const hasActiveFilters = keyword.trim().length > 0 || reason !== "all";
+  const sourceEmptyState = SOURCE_EMPTY_STATE[source];
 
   const resetPaging = () => setVisibleCount(VANISH_PAGE_SIZE);
 
@@ -1298,7 +1577,8 @@ const Vanished = () => {
             >
               <span>{VANISH_SOURCE_LABEL[value]}</span>
               <span className="text-xs text-gray-400 dark:text-neutral-500">
-                {stats.bySource[value]}
+                {stats.bySource[value] +
+                  (value === "collections" ? collectionArchives.length : 0)}
               </span>
             </button>
           ))}
@@ -1376,7 +1656,7 @@ const Vanished = () => {
             <h1 className="flex items-center gap-2 text-xl font-bold text-gray-900 dark:text-neutral-100">
               {VANISH_SOURCE_LABEL[source]}
               <span className="whitespace-nowrap rounded-full border border-gray-100 bg-gray-50 px-2 py-1 text-sm font-normal text-gray-500 dark:border-neutral-700 dark:bg-neutral-800 dark:text-neutral-400">
-                {filtered.length} 条
+                {sourceTotal} 条
               </span>
             </h1>
 
@@ -1498,7 +1778,7 @@ const Vanished = () => {
                 />
               ))}
             </div>
-          ) : stats.total === 0 ? (
+          ) : stats.total === 0 && !hasCollectionArchives ? (
             <div className="mx-auto max-w-xl py-20 text-center">
               <Inbox className="mx-auto h-10 w-10 text-gray-300 dark:text-neutral-600" />
               <p className="mt-4 text-sm font-medium text-gray-600 dark:text-neutral-300">
@@ -1509,19 +1789,48 @@ const Vanished = () => {
                 关注账号注销、点赞过的稿件被删也一并收入。开启对应的自动同步后，它会自己攒起来。
               </p>
             </div>
-          ) : filtered.length === 0 ? (
-            <div className="py-20 text-center text-sm text-gray-400 dark:text-neutral-500">
-              没有匹配的记录
-              <button
-                type="button"
-                onClick={clearFilters}
-                className="ml-2 text-pink-600 underline underline-offset-4 dark:text-pink-400"
-              >
-                清除筛选
-              </button>
+          ) : sourceTotal === 0 ? (
+            <div className="mx-auto max-w-xl py-20 text-center">
+              <Inbox className="mx-auto h-10 w-10 text-gray-300 dark:text-neutral-600" />
+              <p className="mt-4 text-sm font-medium text-gray-600 dark:text-neutral-300">
+                {hasActiveFilters ? "没有匹配的记录" : sourceEmptyState.title}
+              </p>
+              <p className="mt-2 text-xs leading-relaxed text-gray-400 dark:text-neutral-500">
+                {hasActiveFilters
+                  ? "当前关键词或筛选条件没有命中任何档案。"
+                  : sourceEmptyState.description}
+              </p>
+              {hasActiveFilters ? (
+                <button
+                  type="button"
+                  onClick={clearFilters}
+                  className="mt-4 rounded-full border border-gray-200 px-4 py-1.5 text-xs text-gray-600 transition-colors hover:border-pink-300 hover:text-pink-500 dark:border-neutral-700 dark:text-neutral-300 dark:hover:border-pink-500/50 dark:hover:text-pink-400"
+                >
+                  清除筛选
+                </button>
+              ) : null}
             </div>
           ) : (
             <>
+              {source === "collections" && collectionArchiveVisible.length > 0 ? (
+                <div className="mb-5">
+                  <div className="mb-3 flex items-center gap-2 text-sm font-semibold text-gray-800 dark:text-neutral-200">
+                    <Layers className="h-4 w-4 text-sky-500" />
+                    合集档案（{collectionArchiveVisible.length}）
+                  </div>
+                  <div className="grid grid-cols-[repeat(auto-fill,minmax(250px,1fr))] gap-5">
+                    {collectionArchiveVisible.map((item) => (
+                      <CollectionArchiveCard
+                        key={item.id}
+                        item={item}
+                        onOpen={() => void openCollectionArchive(item)}
+                        onDelete={() => setCollectionDeleteTarget(item)}
+                      />
+                    ))}
+                  </div>
+                </div>
+              ) : null}
+
               {/* 关注类用行式布局（与「关注列表」页一致），视频类用网格卡片 */}
               {followingVisible.length > 0 ? (
                 // 与「关注列表」页同一个网格：多列、每列最小 320px。
@@ -1571,19 +1880,21 @@ const Vanished = () => {
                 </div>
               ) : null}
 
-              {filtered.length > visible.length ? (
-                <button
-                  type="button"
-                  onClick={() => setVisibleCount((count) => count + VANISH_PAGE_SIZE)}
-                  className="mx-auto mt-6 block rounded-full border border-gray-200 px-5 py-2 text-sm text-gray-600 transition-colors hover:border-pink-300 hover:text-pink-500 dark:border-neutral-700 dark:text-neutral-300 dark:hover:border-pink-500/50 dark:hover:text-pink-400"
-                >
-                  加载更多（还有 {filtered.length - visible.length} 条）
-                </button>
-              ) : (
-                <p className="mt-6 text-center text-xs text-gray-400 dark:text-neutral-500">
-                  已显示全部 {filtered.length} 条
-                </p>
-              )}
+              {filtered.length > 0 ? (
+                filtered.length > visible.length ? (
+                  <button
+                    type="button"
+                    onClick={() => setVisibleCount((count) => count + VANISH_PAGE_SIZE)}
+                    className="mx-auto mt-6 block rounded-full border border-gray-200 px-5 py-2 text-sm text-gray-600 transition-colors hover:border-pink-300 hover:text-pink-500 dark:border-neutral-700 dark:text-neutral-300 dark:hover:border-pink-500/50 dark:hover:text-pink-400"
+                  >
+                    加载更多（还有 {filtered.length - visible.length} 条）
+                  </button>
+                ) : (
+                  <p className="mt-6 text-center text-xs text-gray-400 dark:text-neutral-500">
+                    已显示全部 {filtered.length} 条
+                  </p>
+                )
+              ) : null}
             </>
           )}
         </div>
@@ -1696,6 +2007,271 @@ const Vanished = () => {
                   : deleteWait > 0
                     ? `请稍候 ${deleteWait} 秒…`
                     : `确认删除 ${deleteConfirm.length} 条`}
+              </button>
+            </div>
+          </div>
+        </div>
+      ) : null}
+
+      {collectionDeleteTarget ? (
+        <div
+          className="fixed inset-0 z-[70] flex items-center justify-center bg-black/60 px-4 backdrop-blur-sm"
+          onMouseDown={(event) => {
+            if (event.target === event.currentTarget && !collectionDeleting) {
+              setCollectionDeleteTarget(null);
+            }
+          }}
+        >
+          <div className="w-full max-w-md rounded-xl bg-white p-5 shadow-xl dark:bg-neutral-900">
+            <h3 className="text-lg font-bold text-gray-900 dark:text-neutral-100">
+              删除合集本地备份？
+            </h3>
+            <p className="mt-2 text-sm leading-6 text-gray-600 dark:text-neutral-300">
+              「{collectionDeleteTarget.title?.trim() || `合集 ${collectionDeleteTarget.id}`}」
+              的本地备份会被删除，不会取消你在 B 站的订阅，也不会影响合集本身。
+            </p>
+            <p className="mt-2 text-sm leading-6 text-gray-500 dark:text-neutral-400">
+              删除后会保留 5 秒撤销机会；超时后本地保存的视频条目也会一起清理。
+            </p>
+            <div className="mt-5 flex justify-end gap-2">
+              <button
+                type="button"
+                onClick={() => setCollectionDeleteTarget(null)}
+                disabled={collectionDeleting}
+                className="rounded-lg border border-gray-200 px-4 py-2 text-sm font-medium text-gray-700 transition-colors hover:bg-gray-50 disabled:opacity-50 dark:border-neutral-700 dark:text-neutral-300 dark:hover:bg-neutral-800"
+              >
+                取消
+              </button>
+              <button
+                type="button"
+                onClick={() => void handleDeleteCollectionArchive()}
+                disabled={collectionDeleting}
+                className="rounded-lg bg-red-600 px-4 py-2 text-sm font-medium text-white transition-colors hover:bg-red-700 disabled:cursor-not-allowed disabled:opacity-50"
+              >
+                {collectionDeleting ? "删除中…" : "确认删除"}
+              </button>
+            </div>
+          </div>
+        </div>
+      ) : null}
+
+      {collectionUndo ? (
+        <div className="fixed bottom-6 left-1/2 z-[80] flex -translate-x-1/2 items-center gap-3 rounded-xl bg-gray-900 px-4 py-3 text-sm text-white shadow-xl dark:bg-neutral-800">
+          <span className="max-w-[16rem] truncate">
+            已删除「{collectionUndo.item.title?.trim() || `合集 ${collectionUndo.item.id}`}」的本地备份
+          </span>
+          <span className="text-xs text-gray-300">{collectionUndo.remaining} 秒</span>
+          <button
+            type="button"
+            onClick={() => void handleUndoCollectionDelete()}
+            className="font-medium text-pink-300 underline underline-offset-2 transition-colors hover:text-pink-200"
+          >
+            撤销
+          </button>
+        </div>
+      ) : null}
+
+      {collectionDetail ? (
+        <div
+          className="fixed inset-0 z-[55] flex items-center justify-center bg-black/60 px-4 backdrop-blur-sm"
+          onMouseDown={(event) => {
+            if (event.target === event.currentTarget) setCollectionDetail(null);
+          }}
+        >
+          <div className="flex max-h-[85vh] w-full max-w-5xl flex-col rounded-xl bg-white shadow-xl dark:bg-neutral-900">
+            <div className="flex items-start justify-between gap-3 border-b border-gray-100 p-5 dark:border-neutral-800">
+              <div className="flex min-w-0 items-start gap-3">
+                <div className="h-16 w-24 shrink-0 overflow-hidden rounded-lg bg-gray-100 dark:bg-neutral-800">
+                  {collectionDetail.cover ? (
+                    <img
+                      src={collectionDetail.cover.replace(/^http:/, "https:")}
+                      alt={collectionDetail.title || "合集封面"}
+                      className="h-full w-full object-cover"
+                      onError={(event) => {
+                        event.currentTarget.src = PLACEHOLDER_COVER_PATH;
+                      }}
+                    />
+                  ) : (
+                    <div className="flex h-full w-full items-center justify-center text-gray-300 dark:text-neutral-600">
+                      <Layers className="h-6 w-6" />
+                    </div>
+                  )}
+                </div>
+                <div className="min-w-0">
+                  <h2 className="line-clamp-2 text-lg font-bold text-gray-900 dark:text-neutral-100">
+                    {collectionDetail.title?.trim() || `合集 ${collectionDetail.id}`}
+                  </h2>
+                  <p className="mt-1 text-xs text-gray-500 dark:text-neutral-400">
+                    {collectionDetail.upper?.name || "未知 UP 主"} · 合集 ID{" "}
+                    {collectionDetail.id}
+                  </p>
+                  <p className="mt-1 text-xs text-gray-400 dark:text-neutral-500">
+                    {collectionDetail.reason === "collection_gone"
+                      ? "已离开订阅"
+                      : "合集已失效"}{" "}
+                    · 归档于 {formatDate(collectionDetail.archivedAt)} · 本地保存{" "}
+                    {collectionDetail.resourceCount || 0} 条
+                  </p>
+                </div>
+              </div>
+              <div className="flex shrink-0 items-center gap-2">
+                <div className="flex rounded-lg border border-gray-200 p-0.5 dark:border-neutral-700">
+                  <button
+                    type="button"
+                    onClick={() => setCollectionDetailView("grid")}
+                    className={`inline-flex items-center gap-1 rounded-md px-2 py-1 text-xs transition-colors ${
+                      collectionDetailView === "grid"
+                        ? "bg-gray-100 text-gray-800 dark:bg-neutral-800 dark:text-neutral-100"
+                        : "text-gray-400 hover:text-gray-600 dark:text-neutral-500 dark:hover:text-neutral-300"
+                    }`}
+                  >
+                    <LayoutGrid className="h-3.5 w-3.5" />
+                    网格
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setCollectionDetailView("list")}
+                    className={`inline-flex items-center gap-1 rounded-md px-2 py-1 text-xs transition-colors ${
+                      collectionDetailView === "list"
+                        ? "bg-gray-100 text-gray-800 dark:bg-neutral-800 dark:text-neutral-100"
+                        : "text-gray-400 hover:text-gray-600 dark:text-neutral-500 dark:hover:text-neutral-300"
+                    }`}
+                  >
+                    <List className="h-3.5 w-3.5" />
+                    列表
+                  </button>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => setCollectionDetail(null)}
+                  className="shrink-0 rounded-md p-1.5 text-gray-400 transition-colors hover:bg-gray-100 dark:hover:bg-neutral-800"
+                  aria-label="关闭合集档案"
+                >
+                  <X className="h-4 w-4" />
+                </button>
+              </div>
+            </div>
+
+            <div className="min-h-0 flex-1 overflow-y-auto p-5">
+              <h3 className="text-sm font-semibold text-gray-800 dark:text-neutral-200">
+                本地保存的内容
+              </h3>
+              <p className="mt-1 text-xs leading-relaxed text-gray-400 dark:text-neutral-500">
+                这些是合集消失前保存下来的视频条目；只在本机展示，不会写回 B 站。
+              </p>
+
+              {collectionDetailLoading ? (
+                <div className="py-10 text-center text-sm text-gray-400 dark:text-neutral-500">
+                  正在读取…
+                </div>
+              ) : collectionDetailResources.length === 0 ? (
+                <div className="py-10 text-center text-sm text-gray-400 dark:text-neutral-500">
+                  本地没有保存到这个合集的内容。
+                </div>
+              ) : collectionDetailView === "grid" ? (
+                <div className="mt-3 grid grid-cols-[repeat(auto-fill,minmax(170px,1fr))] gap-3">
+                  {collectionDetailResources.map((resource) => {
+                    const card = (
+                      <>
+                        <div className="relative aspect-video overflow-hidden bg-gray-100 dark:bg-neutral-800">
+                          <img
+                            src={resource.cover || `https://i0.hdslb.com${PLACEHOLDER_COVER_PATH}`}
+                            alt=""
+                            loading="lazy"
+                            className="h-full w-full object-cover transition-transform duration-200 group-hover:scale-[1.02]"
+                            onError={(e) => {
+                              const img = e.currentTarget;
+                              img.onerror = null;
+                              img.src = `https://i0.hdslb.com${PLACEHOLDER_COVER_PATH}`;
+                            }}
+                          />
+                          {resource.invalidatedKind ? (
+                            <span className="absolute left-2 top-2 rounded bg-black/60 px-1.5 py-0.5 text-[10px] text-white">
+                              已失效
+                            </span>
+                          ) : null}
+                        </div>
+                        <div className="p-2.5">
+                          <p className="line-clamp-2 min-h-[2.5em] text-xs leading-5 text-gray-800 dark:text-neutral-200">
+                            {resource.title?.trim() || "（无标题）"}
+                          </p>
+                          <p className="mt-1 line-clamp-1 text-[11px] text-gray-400 dark:text-neutral-500">
+                            {resource.author_name || "未知 UP 主"} ·{" "}
+                            {resource.pubdate ? formatDate(resource.pubdate * 1000) : "时间未知"}
+                          </p>
+                        </div>
+                      </>
+                    );
+                    return resource.bvid ? (
+                      <a
+                        key={resource.id}
+                        href={`https://www.bilibili.com/video/${resource.bvid}`}
+                        target="_blank"
+                        rel="noopener noreferrer"
+                        className="group overflow-hidden rounded-lg border border-gray-100 bg-white transition-colors hover:border-pink-200 dark:border-neutral-800 dark:bg-neutral-900 dark:hover:border-pink-900"
+                      >
+                        {card}
+                      </a>
+                    ) : (
+                      <div
+                        key={resource.id}
+                        className="group overflow-hidden rounded-lg border border-gray-100 bg-white dark:border-neutral-800 dark:bg-neutral-900"
+                      >
+                        {card}
+                      </div>
+                    );
+                  })}
+                </div>
+              ) : (
+                <div className="mt-3 divide-y divide-gray-100 overflow-hidden rounded-lg border border-gray-100 dark:divide-neutral-800 dark:border-neutral-800">
+                  {collectionDetailResources.map((resource) => (
+                    <div
+                      key={resource.id}
+                      className="flex items-center gap-3 px-3 py-2.5 text-sm"
+                    >
+                      <div className="min-w-0 flex-1">
+                        <p className="line-clamp-1 text-gray-800 dark:text-neutral-200">
+                          {resource.title?.trim() || "（无标题）"}
+                        </p>
+                        <p className="mt-0.5 text-xs text-gray-400 dark:text-neutral-500">
+                          {resource.author_name || "未知 UP 主"} ·{" "}
+                          {resource.pubdate ? formatDate(resource.pubdate * 1000) : "时间未知"}
+                        </p>
+                      </div>
+                      {resource.bvid ? (
+                        <a
+                          href={`https://www.bilibili.com/video/${resource.bvid}`}
+                          target="_blank"
+                          rel="noopener noreferrer"
+                          className="shrink-0 font-mono text-xs text-pink-500 hover:underline"
+                        >
+                          {resource.bvid}
+                        </a>
+                      ) : null}
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+
+            <div className="flex justify-end gap-2 border-t border-gray-100 p-4 dark:border-neutral-800">
+              <button
+                type="button"
+                onClick={() => {
+                  if (!collectionDetail) return;
+                  setCollectionDeleteTarget(collectionDetail);
+                  setCollectionDetail(null);
+                }}
+                className="rounded-lg border border-red-200 px-4 py-2 text-sm font-medium text-red-600 transition-colors hover:bg-red-50 dark:border-red-900/60 dark:text-red-400 dark:hover:bg-red-950/30"
+              >
+                删除本地备份
+              </button>
+              <button
+                type="button"
+                onClick={() => setCollectionDetail(null)}
+                className="rounded-lg border border-gray-200 px-4 py-2 text-sm font-medium text-gray-700 transition-colors hover:bg-gray-50 dark:border-neutral-700 dark:text-neutral-300 dark:hover:bg-neutral-800"
+              >
+                关闭
               </button>
             </div>
           </div>
@@ -1888,6 +2464,7 @@ const Vanished = () => {
           </div>
         </div>
       ) : null}
+
     </div>
   );
 };

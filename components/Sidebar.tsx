@@ -61,7 +61,7 @@ const menuList = [
     to: "/interactions",
   },
   {
-    // 侧边栏只有 w-40（160px），标题必须短：用「消失档案」四个字
+    // 侧边栏只有 w-[152px]（152px），标题必须短：用「消失档案」四个字
     title: "消失档案",
     icon: <ArchiveIcon className="w-4 h-4" />,
     to: "/vanished",
@@ -190,10 +190,10 @@ export const Sidebar = () => {
   const isDark = themeMode === "dark";
 
   return (
-    <div className="fixed top-0 left-0 w-40 bg-gray-100 dark:bg-[#141414] dark:text-neutral-100 flex-shrink-0 h-full">
+    <div className="fixed top-0 left-0 w-[152px] bg-gray-100 dark:bg-[#141414] dark:text-neutral-100 flex-shrink-0 h-full">
       {!hideUserInfo && <UserInfo />}
 
-      <nav className="space-y-2 p-4">
+      <nav className="space-y-2 px-4 pb-4 pt-2">
         {orderedMenus
           .filter((item) => !hiddenMenus.includes(item.title))
           .map((item) => (

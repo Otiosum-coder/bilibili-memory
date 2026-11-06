@@ -1,5 +1,6 @@
 import { INVALIDATED_KIND_LABEL, isInvalidatedResource, resolveInvalidatedKind } from "./favVanishedDiff";
 import { needsRecovery } from "./favRecovery";
+import { isPlaceholderImage } from "./imageUrl";
 import { formatDateTime, formatDuration } from "./format";
 import type { FavoriteResource, FavRecoverySource } from "./types";
 
@@ -80,6 +81,9 @@ export const buildResourceCopyText = (resource: FavoriteResource): string => {
   const lines: string[] = [
     `AV号：${resource.id}`,
     `BV号：${resource.bvid || resource.bv_id || "（无）"}`,
+    resource.cover
+      ? `封面地址：${resource.cover}${isPlaceholderImage(resource.cover) ? "（B站占位图，原封面已丢失）" : ""}`
+      : "封面地址：（无）",
     `标题：${resource.title}`,
     `UP主：${resource.upper?.name || "未知"}（https://space.bilibili.com/${resource.upper?.mid ?? ""}）`,
   ];

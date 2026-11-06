@@ -1,6 +1,7 @@
 import {
   AssetKind,
   AssetRecord,
+  CollectionArchive,
   DBConfig,
   FollowingEvent,
   FollowingItem,
@@ -41,7 +42,7 @@ import { mergeRestoredFavorite, mergeVanishArchive } from "./vanishArchive";
 
 const DB_CONFIG: DBConfig = {
   name: "bilibiliHistory",
-  version: 12,
+  version: 13,
   stores: {
     history: {
       keyPath: "id",
@@ -74,6 +75,10 @@ const DB_CONFIG: DBConfig = {
     subscribedCollectionResources: {
       keyPath: "id",
       indexes: ["collection_id", "pubdate"],
+    },
+    collectionArchives: {
+      keyPath: "id",
+      indexes: ["archivedAt", "deletedAt"],
     },
     following: {
       keyPath: "mid",
@@ -473,6 +478,19 @@ export const openDB = (): Promise<IDBDatabase> => {
         console.log("v12: 已创建第三方曾用名独立存档");
       }
 
+      // v13：合集级消失档案。合集壳从订阅目录消失后，原来的名字/封面/UP
+      // 需要单独留一份；视频条目仍留在 subscribedCollectionResources，详情页按 id 读取。
+      if (oldVersion < 13) {
+        if (!db.objectStoreNames.contains("collectionArchives")) {
+          const collectionArchiveStore = db.createObjectStore("collectionArchives", {
+            keyPath: "id",
+          });
+          collectionArchiveStore.createIndex("archivedAt", "archivedAt", { unique: false });
+          collectionArchiveStore.createIndex("deletedAt", "deletedAt", { unique: false });
+        }
+        console.log("v13: 已创建合集级消失档案 store");
+      }
+
       if (oldVersion > 0 && oldVersion < 12 && db.objectStoreNames.contains("following")) {
         const source = transaction.objectStore("following");
         const target = transaction.objectStore("formerNames");
@@ -633,6 +651,15 @@ export const openDB = (): Promise<IDBDatabase> => {
         console.log("补创建formerNames表");
         const formerNamesStore = db.createObjectStore("formerNames", { keyPath: "mid" });
         formerNamesStore.createIndex("queriedAt", "queriedAt", { unique: false });
+      }
+
+      if (!db.objectStoreNames.contains("collectionArchives")) {
+        console.log("补创建collectionArchives表");
+        const collectionArchiveStore = db.createObjectStore("collectionArchives", {
+          keyPath: "id",
+        });
+        collectionArchiveStore.createIndex("archivedAt", "archivedAt", { unique: false });
+        collectionArchiveStore.createIndex("deletedAt", "deletedAt", { unique: false });
       }
     };
   });
@@ -1993,10 +2020,31 @@ export const saveFavResources = async (resources: FavoriteResource[]): Promise<v
         };
         getReq.onerror = HandleError;
       } else {
-        // 正常视频直接保存
-        const putReq = store.put(res);
-        putReq.onsuccess = () => CheckComplete();
-        putReq.onerror = HandleError;
+        // 正常视频也做一层封面保护：B站偶尔会在 attr 还没变成失效时，
+        // 先把 cover 换成占位图。只有新封面是占位图时才读旧记录，
+        // 正常封面保持原来的直接写入路径。
+        if (isPlaceholderImage(res.cover)) {
+          const getReq = store.get([res.folder_id, res.id]);
+          getReq.onsuccess = () => {
+            const oldData = getReq.result as FavoriteResource | undefined;
+            let dataToSave = res;
+            if (oldData?.cover && !isPlaceholderImage(oldData.cover)) {
+              dataToSave = {
+                ...res,
+                cover: oldData.cover,
+                coverAssetId: oldData.coverAssetId ?? res.coverAssetId,
+              };
+            }
+            const putReq = store.put(dataToSave);
+            putReq.onsuccess = () => CheckComplete();
+            putReq.onerror = HandleError;
+          };
+          getReq.onerror = HandleError;
+        } else {
+          const putReq = store.put(res);
+          putReq.onsuccess = () => CheckComplete();
+          putReq.onerror = HandleError;
+        }
       }
 
       function HandleError(e: Event) {
@@ -2055,19 +2103,144 @@ export const getFavResources = async (folderId?: number): Promise<FavoriteResour
   });
 };
 
+const isInvalidCollectionShell = (collection: SubscribedCollection): boolean => {
+  const title = (collection.title || "").trim();
+  return !title || title === "未命名合集" || /合集.*失效|已失效/.test(title);
+};
+
+/**
+ * 合并合集壳。
+ *
+ * 线上接口对已失效合集返回的是「该合集已失效」这类占位标题和空封面；
+ * 原实现直接 clear + put，会把本地保存的真实名称、封面、UP 一起覆盖。
+ * 这里只保护"基本不变"的字段，media_count 仍取线上值（0 时回退本地，
+ * 避免接口暂时异常把已有数量抹掉）。
+ */
+const mergeCollectionShell = (
+  previous: SubscribedCollection | undefined,
+  incoming: SubscribedCollection,
+): SubscribedCollection => {
+  if (!previous) return incoming;
+  const incomingInvalid = isInvalidCollectionShell(incoming);
+  const cover =
+    isPlaceholderImage(incoming.cover) && !isPlaceholderImage(previous.cover)
+      ? previous.cover
+      : incoming.cover || previous.cover;
+  return {
+    ...incoming,
+    title:
+      incomingInvalid || !incoming.title || incoming.title === "未命名合集"
+        ? previous.title || incoming.title
+        : incoming.title,
+    cover,
+    intro: incoming.intro || previous.intro,
+    media_count:
+      incoming.media_count > 0 ? incoming.media_count : previous.media_count,
+    upper: incoming.upper?.name ? incoming.upper : previous.upper,
+  };
+};
+
 export const replaceSubscribedCollections = async (
   collections: SubscribedCollection[],
 ): Promise<void> => {
   const db = await openDB();
-  const tx = db.transaction("subscribedCollections", "readwrite");
-  const store = tx.objectStore("subscribedCollections");
+  const previousCollections = await getAllSubscribedCollections();
+  const previousArchives = await getAllCollectionArchives(true);
+  const previousById = new Map(previousCollections.map((item) => [item.id, item]));
+  const archiveById = new Map(previousArchives.map((item) => [item.id, item]));
+  const incomingIds = new Set(collections.map((item) => item.id));
+
+  const archivesToPut: CollectionArchive[] = [];
+  const archiveIdsToDelete: number[] = [];
+  const archiveFor = (
+    collection: SubscribedCollection,
+    reason: CollectionArchive["reason"],
+    existing: CollectionArchive | undefined,
+    localResourceCount: number,
+  ): CollectionArchive => ({
+    id: collection.id,
+    title: existing?.title || collection.title,
+    cover: existing?.cover || collection.cover,
+    intro: existing?.intro || collection.intro,
+    ctime: existing?.ctime || collection.ctime,
+    mtime: existing?.mtime || collection.mtime,
+    media_count: existing?.media_count || collection.media_count,
+    upper: existing?.upper || collection.upper,
+    index: existing?.index ?? collection.index,
+    reason,
+    archivedAt: existing?.archivedAt || Date.now(),
+    deletedAt: existing?.deletedAt,
+    resourceCount: Math.max(existing?.resourceCount ?? 0, localResourceCount),
+    lastSyncedMediaCount: collection.media_count,
+  });
+
+  const nextCollections: SubscribedCollection[] = [];
+  for (const incoming of collections) {
+    const previous = previousById.get(incoming.id);
+    const existingArchive = archiveById.get(incoming.id);
+    const invalid = isInvalidCollectionShell(incoming);
+
+    if (invalid) {
+      // 线上只剩占位壳：不再放进活跃列表；只有本地确实存过内容才值得归档。
+      if (previous) {
+        const localResourceCount = await getSubscribedCollectionResourceCount(previous.id);
+        if (localResourceCount > 0 && !existingArchive?.deletedAt) {
+          archivesToPut.push(
+            archiveFor(previous, "collection_invalid", existingArchive, localResourceCount),
+          );
+        } else if (localResourceCount <= 0) {
+          archiveIdsToDelete.push(previous.id);
+        }
+      }
+      continue;
+    }
+
+    if (!invalid && existingArchive) {
+      // 重新订阅或恢复有效：清掉删除标记，离开消失档案。
+      archiveIdsToDelete.push(incoming.id);
+    }
+
+    nextCollections.push(previous ? mergeCollectionShell(previous, incoming) : incoming);
+  }
+
+  for (const previous of previousCollections) {
+    if (incomingIds.has(previous.id)) continue;
+    const existingArchive = archiveById.get(previous.id);
+    // 用户主动删除过的合集，后续同步不能把它重新拉回来。
+    if (existingArchive?.deletedAt) continue;
+    const localResourceCount = await getSubscribedCollectionResourceCount(previous.id);
+    // 没存过任何内容的合集只留一个空壳标题，没有恢复价值。
+    if (localResourceCount <= 0) {
+      archiveIdsToDelete.push(previous.id);
+      continue;
+    }
+    archivesToPut.push(
+      archiveFor(previous, "collection_gone", existingArchive, localResourceCount),
+    );
+  }
+
+  // 兼容旧版本留下的空档案：只保留本地确实有内容的合集。
+  for (const archive of previousArchives) {
+    if (archive.resourceCount <= 0) archiveIdsToDelete.push(archive.id);
+  }
+
+  const tx = db.transaction(
+    ["subscribedCollections", "collectionArchives"],
+    "readwrite",
+  );
+  const collectionStore = tx.objectStore("subscribedCollections");
+  const archiveStore = tx.objectStore("collectionArchives");
 
   return new Promise((resolve, reject) => {
-    const clearRequest = store.clear();
+    const clearRequest = collectionStore.clear();
     clearRequest.onsuccess = () => {
-      collections.forEach((collection) => store.put(collection));
+      nextCollections.forEach((collection) => collectionStore.put(collection));
     };
     clearRequest.onerror = () => reject(clearRequest.error);
+
+    archivesToPut.forEach((archive) => archiveStore.put(archive));
+    archiveIdsToDelete.forEach((id) => archiveStore.delete(id));
+
     tx.oncomplete = () => resolve();
     tx.onerror = () => reject(tx.error);
   });
@@ -2149,11 +2322,18 @@ const preserveCollectionMetadata = (
     previous.invalidatedAt ??
     (incomingInvalidated ? Date.now() : undefined);
 
+  // 即使这次没有失效标记，也不要用占位封面覆盖本地真实封面。
+  const cover =
+    isPlaceholderImage(incoming.cover) && !isPlaceholderImage(previous.cover)
+      ? previous.cover
+      : incoming.cover || previous.cover;
+
   // 只有"本地有有效数据"时才保护。本地本身就是失效状态的话，
   // 保留占位数据毫无意义，让远端覆盖即可。
   if (!incomingInvalidated || previousInvalidated) {
     return {
       ...incoming,
+      cover,
       coverAssetId: previous.coverAssetId ?? incoming.coverAssetId,
       invalidatedKind,
       invalidatedAt,
@@ -2163,7 +2343,7 @@ const preserveCollectionMetadata = (
   return {
     ...incoming,
     title: previous.title || incoming.title,
-    cover: previous.cover || incoming.cover,
+    cover,
     duration: previous.duration || incoming.duration,
     pubdate: previous.pubdate || incoming.pubdate,
     author_name: previous.author_name || incoming.author_name,
@@ -2206,6 +2386,193 @@ export const getAllSubscribedCollectionResources = async (): Promise<
     const request = store.getAll();
     request.onsuccess = () => resolve(request.result);
     request.onerror = () => reject(request.error);
+  });
+};
+
+/** 统计某个合集在本地保存了多少条内容，用于增量同步判断。 */
+export const getSubscribedCollectionResourceCount = async (
+  collectionId: number,
+): Promise<number> => {
+  const db = await openDB();
+  const tx = db.transaction("subscribedCollectionResources", "readonly");
+  const index = tx.objectStore("subscribedCollectionResources").index("collection_id");
+
+  return new Promise((resolve, reject) => {
+    const request = index.count(collectionId);
+    request.onsuccess = () => resolve(request.result);
+    request.onerror = () => reject(request.error);
+  });
+};
+
+export const getAllCollectionArchives = async (
+  includeDeleted = false,
+): Promise<CollectionArchive[]> => {
+  const db = await openDB();
+  const tx = db.transaction("collectionArchives", "readonly");
+  const store = tx.objectStore("collectionArchives");
+
+  return new Promise((resolve, reject) => {
+    const request = store.getAll();
+    request.onsuccess = () => {
+      const result = request.result as CollectionArchive[];
+      resolve(includeDeleted ? result : result.filter((item) => !item.deletedAt));
+    };
+    request.onerror = () => reject(request.error);
+  });
+};
+
+export const getCollectionArchive = async (
+  id: number,
+): Promise<CollectionArchive | undefined> => {
+  const db = await openDB();
+  const tx = db.transaction("collectionArchives", "readonly");
+  const store = tx.objectStore("collectionArchives");
+
+  return new Promise((resolve, reject) => {
+    const request = store.get(id);
+    request.onsuccess = () => resolve(request.result);
+    request.onerror = () => reject(request.error);
+  });
+};
+
+/**
+ * 合并导入合集档案。用于 WebDAV / JSON 恢复。
+ *
+ * 合并原则：
+ * - 本地有删除标记时，不被远端旧记录复活；
+ * - 远端有删除标记时，删除动作可以覆盖本地未删除记录；
+ * - 其余情况保留归档时间更晚的一份，避免旧备份覆盖新快照。
+ */
+export const importCollectionArchives = async (
+  archives: CollectionArchive[],
+): Promise<{ merged: number; skipped: number }> => {
+  if (archives.length === 0) return { merged: 0, skipped: 0 };
+
+  const db = await openDB();
+  const readTx = db.transaction("collectionArchives", "readonly");
+  const stored = (await requestResult(
+    readTx.objectStore("collectionArchives").getAll(),
+  )) as CollectionArchive[];
+  const localById = new Map(stored.map((item) => [item.id, item]));
+
+  const writeTx = db.transaction("collectionArchives", "readwrite");
+  const store = writeTx.objectStore("collectionArchives");
+  let merged = 0;
+  let skipped = 0;
+
+  for (const incoming of archives) {
+    if (!incoming || typeof incoming.id !== "number") {
+      skipped += 1;
+      continue;
+    }
+    const local = localById.get(incoming.id);
+    if (local) {
+      const localDeletedAt = local.deletedAt ?? 0;
+      const incomingDeletedAt = incoming.deletedAt ?? 0;
+      const keepIncoming =
+        incomingDeletedAt > localDeletedAt ||
+        (incomingDeletedAt === localDeletedAt && incoming.archivedAt > local.archivedAt);
+      if (!keepIncoming) {
+        skipped += 1;
+        continue;
+      }
+    }
+    store.put(incoming);
+    merged += 1;
+  }
+
+  await transactionDone(writeTx);
+  return { merged, skipped };
+};
+
+/**
+ * 删除合集档案（软删除）。保留视频条目与档案记录，5 秒内可撤销；
+ * 真正跨过撤销窗口后由页面调用 `deleteCollectionArchiveResources` 清掉条目。
+ */
+export const deleteCollectionArchives = async (ids: number[]): Promise<void> => {
+  if (ids.length === 0) return;
+  const db = await openDB();
+  const tx = db.transaction("collectionArchives", "readwrite");
+  const store = tx.objectStore("collectionArchives");
+  const deletedAt = Date.now();
+
+  return new Promise((resolve, reject) => {
+    ids.forEach((id) => {
+      const request = store.get(id);
+      request.onsuccess = () => {
+        const archive = request.result as CollectionArchive | undefined;
+        if (archive) store.put({ ...archive, deletedAt });
+      };
+    });
+    tx.oncomplete = () => resolve();
+    tx.onerror = () => reject(tx.error);
+  });
+};
+
+/** 撤销删除：清掉 deletedAt 即可，视频条目本来就没删。 */
+export const restoreCollectionArchives = async (ids: number[]): Promise<void> => {
+  if (ids.length === 0) return;
+  const db = await openDB();
+  const tx = db.transaction("collectionArchives", "readwrite");
+  const store = tx.objectStore("collectionArchives");
+
+  return new Promise((resolve, reject) => {
+    ids.forEach((id) => {
+      const request = store.get(id);
+      request.onsuccess = () => {
+        const archive = request.result as CollectionArchive | undefined;
+        if (!archive) return;
+        const rest = { ...archive };
+        delete rest.deletedAt;
+        store.put(rest);
+      };
+    });
+    tx.oncomplete = () => resolve();
+    tx.onerror = () => reject(tx.error);
+  });
+};
+
+/** 撤销窗口结束后真正清理归档视频条目（合集壳记录保留 deletedAt 作为 tombstone）。 */
+export const deleteCollectionArchiveResources = async (
+  collectionId: number,
+): Promise<void> => {
+  const db = await openDB();
+  const tx = db.transaction("subscribedCollectionResources", "readwrite");
+  const index = tx.objectStore("subscribedCollectionResources").index("collection_id");
+
+  return new Promise((resolve, reject) => {
+    const request = index.openKeyCursor(collectionId);
+    request.onsuccess = () => {
+      const cursor = request.result;
+      if (!cursor) return;
+      tx.objectStore("subscribedCollectionResources").delete(cursor.primaryKey);
+      cursor.continue();
+    };
+    request.onerror = () => reject(request.error);
+    tx.oncomplete = () => resolve();
+    tx.onerror = () => reject(tx.error);
+  });
+};
+
+/** 同步队列写入本地条数，用于下一次只按 media_count 判断是否跳过。 */
+export const updateCollectionArchiveSyncState = async (
+  collectionId: number,
+  resourceCount: number,
+  lastSyncedMediaCount: number,
+): Promise<void> => {
+  const db = await openDB();
+  const tx = db.transaction("collectionArchives", "readwrite");
+  const store = tx.objectStore("collectionArchives");
+
+  return new Promise((resolve, reject) => {
+    const request = store.get(collectionId);
+    request.onsuccess = () => {
+      const archive = request.result as CollectionArchive | undefined;
+      if (archive) store.put({ ...archive, resourceCount, lastSyncedMediaCount });
+    };
+    request.onerror = () => reject(request.error);
+    tx.oncomplete = () => resolve();
+    tx.onerror = () => reject(tx.error);
   });
 };
 
@@ -2637,6 +3004,66 @@ export const getFollowingItem = async (mid: number): Promise<FollowingItem | und
   return mergeFormerNameRecord(item, record);
 };
 
+/** 读取全部曾用名独立存档。关注列表之外（已取关/已注销）的名字也在这里。 */
+export const getAllFormerNames = async (): Promise<FormerNameRecord[]> => {
+  const db = await openDB();
+  const tx = db.transaction("formerNames", "readonly");
+  return (await requestResult(tx.objectStore("formerNames").getAll())) as FormerNameRecord[];
+};
+
+/**
+ * 合并导入曾用名存档。
+ *
+ * `formerNames` 是独立 store：只备份 following 条目会漏掉已取关账号的名字。
+ * 名字只增不减，查询时间取较大值；展示下标以 `updatedAt` 较新的一份为准。
+ */
+export const importFormerNames = async (
+  records: FormerNameRecord[],
+): Promise<{ merged: number; skipped: number }> => {
+  if (records.length === 0) return { merged: 0, skipped: 0 };
+
+  const db = await openDB();
+  const readTx = db.transaction("formerNames", "readonly");
+  const stored = (await requestResult(
+    readTx.objectStore("formerNames").getAll(),
+  )) as FormerNameRecord[];
+  const localByMid = new Map(stored.map((item) => [item.mid, item]));
+
+  const writeTx = db.transaction("formerNames", "readwrite");
+  const store = writeTx.objectStore("formerNames");
+  let merged = 0;
+  let skipped = 0;
+
+  for (const incoming of records) {
+    if (!incoming || typeof incoming.mid !== "number" || !Array.isArray(incoming.names)) {
+      skipped += 1;
+      continue;
+    }
+    const local = localByMid.get(incoming.mid);
+    if (!local) {
+      store.put(incoming);
+      merged += 1;
+      continue;
+    }
+
+    const names = Array.from(new Set([...(local.names ?? []), ...incoming.names]));
+    const incomingIsNewer = (incoming.updatedAt ?? 0) >= (local.updatedAt ?? 0);
+    store.put({
+      mid: incoming.mid,
+      names,
+      queriedAt: Math.max(local.queriedAt ?? 0, incoming.queriedAt ?? 0),
+      displayIndex: incomingIsNewer
+        ? (incoming.displayIndex ?? local.displayIndex)
+        : local.displayIndex,
+      updatedAt: Date.now(),
+    });
+    merged += 1;
+  }
+
+  await transactionDone(writeTx);
+  return { merged, skipped };
+};
+
 export const countFollowing = async (): Promise<number> => {
   const db = await openDB();
   const tx = db.transaction("following", "readonly");
@@ -2955,20 +3382,26 @@ export const getBackupLocalIds = async (): Promise<Record<string, Set<string>>> 
     resources,
     collections,
     collectionResources,
+    collectionArchives,
     following,
+    formerNames,
     events,
     vanished,
     interactions,
+    vanishArchive,
   ] = await Promise.all([
     getAllLikedMusic(),
     getAllFavFolders(),
     getAllFavResources(),
     getAllSubscribedCollections(),
     getAllSubscribedCollectionResources(),
+    getAllCollectionArchives(true),
     getAllFollowing(),
+    getAllFormerNames(),
     getAllFollowingEvents(),
     getAllVanishedFavResources(),
     getAllInteractions(),
+    getAllVanishArchive(),
   ]);
 
   return {
@@ -2979,10 +3412,13 @@ export const getBackupLocalIds = async (): Promise<Record<string, Set<string>>> 
     subscribedCollectionResources: new Set(
       collectionResources.map((item) => String(item.id)),
     ),
+    collectionArchives: new Set(collectionArchives.map((item) => String(item.id))),
     following: new Set(following.map((item) => String(item.mid))),
+    formerNames: new Set(formerNames.map((item) => String(item.mid))),
     followingEvents: new Set(events.map((event) => String(event.event_id))),
     vanishedFavResources: new Set(vanished.map((item) => `${item.folder_id}:${item.id}`)),
     interactions: new Set(interactions.map((item) => String(item.id))),
+    vanishArchive: new Set(vanishArchive.map((item) => item.id)),
   };
 };
 
@@ -3015,10 +3451,14 @@ export const clearAssets = async (): Promise<void> => {
  *
  * 用 `kind` 索引走游标逐个删，而不是 `getAll()` 后再删：
  * `assets` 里是真实图片字节，一次全读进内存在大库上会明显卡顿甚至爆内存。
- * 每 `ASSET_DELETE_BATCH` 条让出一次事件循环，避免长时间阻塞界面。
+ *
+ * 注意：不要在这里用 `setTimeout(() => cursor.continue(), 0)` 分批让出事件循环。
+ * IndexedDB 事务一旦回到事件循环且没有挂起请求就会自动提交，下一帧再
+ * `cursor.continue()` 会抛 `TransactionInactiveError`；而这个异常发生在
+ * timeout 回调里，外层 Promise 永远不会 settle，界面就会一直卡在「正在清理」。
+ * 游标本身的 success 回调已经是异步任务，浏览器有机会在两次回调之间渲染，
+ * 直接同步 `continue()` 即可。
  */
-const ASSET_DELETE_BATCH = 200;
-
 export const clearAssetsByKind = async (
   kind: AssetKind,
 ): Promise<{ deleted: number; freedBytes: number }> => {
@@ -3039,18 +3479,21 @@ export const clearAssetsByKind = async (
       const record = cursor.value as AssetRecord;
       freedBytes += record?.blob?.size ?? 0;
       deleted += 1;
-      cursor.delete();
-      if (deleted % ASSET_DELETE_BATCH === 0) {
-        // 让出一帧再继续，长任务不至于把设置页卡住
-        setTimeout(() => cursor.continue(), 0);
-        return;
+      try {
+        cursor.delete();
+        cursor.continue();
+      } catch (cursorError) {
+        // 事务已结束时 cursor.continue() 会同步抛错；必须 reject，否则外层
+        // Promise 永远不 settle，界面会卡在「正在清理」。
+        reject(cursorError);
       }
-      cursor.continue();
     };
     request.onerror = () => reject(request.error);
     tx.onabort = () => reject(tx.error);
+    tx.onerror = () => reject(tx.error);
   });
 
+  await transactionDone(tx);
   return { deleted, freedBytes };
 };
 

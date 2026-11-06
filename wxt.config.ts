@@ -40,12 +40,6 @@ export default defineConfig({
       ],
     },
     host_permissions: ["<all_urls>"],
-    web_accessible_resources: [
-      {
-        resources: ["injected.js"],
-        matches: ["*://*.bilibili.com/*"],
-      },
-    ],
     action: {},
 
     // Firefox 专用：AMO 要求扩展有固定的 gecko id，否则无法稳定签名与后续更新。

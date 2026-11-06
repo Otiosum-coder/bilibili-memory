@@ -1,4 +1,5 @@
 import type { FollowingEvent, FollowingEventType, FollowingItem, FollowingStatus } from "./types";
+import { isPlaceholderImage } from "./imageUrl";
 
 /**
  * 关注列表的变动判定（纯函数，不依赖 IndexedDB 与网络，可直接单测）。
@@ -182,10 +183,21 @@ export const diffFollowing = (
       }
     }
 
+    // 头像只保留地址，不保存字节：
+    // - 接口给的是真实头像 → 更新为当前地址
+    // - 已注销后 face 变成 noface → 保留上一轮的真实地址
+    // - 旧记录没有 avatarSourceUrl 时，用上一轮真实 face 兜底
+    const realFace =
+      entry.face && !isPlaceholderImage(entry.face) ? entry.face : "";
+    const previousAvatarSourceUrl =
+      previous?.avatarSourceUrl ??
+      (previous?.face && !isPlaceholderImage(previous.face) ? previous.face : undefined);
+
     next.push({
       mid,
       name: nextName,
       face: entry.face || previous?.face || "",
+      avatarSourceUrl: realFace || previousAvatarSourceUrl,
       avatarAssetId: previous?.avatarAssetId,
       sign: typeof entry.sign === "string" ? entry.sign : (previous?.sign ?? ""),
       mtime: resolveMtimeSeconds(entry, previous?.mtime ?? 0),

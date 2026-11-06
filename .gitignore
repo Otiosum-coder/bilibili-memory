@@ -19,6 +19,8 @@ stats-*.json
 .env
 .env.*
 *.local
+# 本机 AI 工具连接配置，不随仓库发布
+.mcp.json
 
 # 开发过程文档：不随仓库发布
 # - CLAUDE.md 是给 AI 助手看的项目说明，含内部评审过程
@@ -26,11 +28,9 @@ stats-*.json
 CLAUDE.md
 docs/
 
-# 品牌素材的中间产物：都能由 branding/*.py 从品牌源图重新生成
-# （只保留 wordmark.png —— 它是重拼 lockup 的输入，源图里没有独立文件）
-branding/assets/icon-source.png
-branding/assets/lockup-full.png
-branding/assets/icon-512.png
+# 品牌素材生成脚本与源图：只在本机保留，不随仓库发布
+# 仓库里只保留 public/brand/lockup.png（README / 关于页 / 欢迎页实际使用）
+branding/
 
 # 构建缓存
 *.tsbuildinfo
@@ -45,9 +45,7 @@ local-data/
 hname-*.json
 
 # Editor directories and files
-.vscode/*
-!.vscode/extensions.json
-!.vscode/settings.json
+.vscode/
 .idea
 .DS_Store
 *.suo

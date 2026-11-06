@@ -3,7 +3,6 @@ import {
   HAS_FULL_FAV_SYNC,
   HISTORY_LAST_SYNC,
   SYNC_INTERVAL,
-  IS_SYNC_DELETE_FROM_BILIBILI,
   WEBDAV_LAST_SYNC,
   WEBDAV_AUTO_SYNC_ENABLED,
   WEBDAV_AUTO_SYNC_INTERVAL,
@@ -20,7 +19,6 @@ import {
   FOLLOWING_AUTO_SYNC_ENABLED,
   FOLLOWING_SYNC_INTERVAL,
   FOLLOWING_SYNC_PROGRESS,
-  FOLLOWING_AVATAR_ARCHIVE_PROGRESS,
   FAV_COVER_ARCHIVE_PROGRESS,
   FAV_RECOVERY_PROGRESS,
   FAV_RECOVERY_FINAL_RETRY_DELAY_MS,
@@ -33,6 +31,9 @@ import {
   DEFAULT_FAV_SYNC_INTERVAL_MINUTES,
   DEFAULT_FAV_FULL_SYNC_INTERVAL_MINUTES,
   COLLECTION_COVER_ARCHIVE_PROGRESS,
+  COLLECTION_ARCHIVE_SYNC_PROGRESS,
+  COLLECTION_ARCHIVE_PAGE_DELAY_MS,
+  COLLECTION_ARCHIVE_SYNC_STALE_MS,
   DEFAULT_FOLLOWING_AUTO_SYNC_ENABLED,
   DEFAULT_FOLLOWING_SYNC_INTERVAL_MINUTES,
   INTERACTIONS_LAST_SYNC,
@@ -48,7 +49,6 @@ import {
   THIRD_PARTY_NAME_LOOKUP_PROGRESS,
 } from "../utils/constants";
 import {
-  deleteHistoryContent,
   saveFavFolders,
   replaceFavFolders,
   saveFavResources,
@@ -69,6 +69,12 @@ import {
   replaceSubscribedCollections,
   replaceSubscribedCollectionResources,
   getSubscribedCollectionResources,
+  getSubscribedCollectionResourceCount,
+  getAllCollectionArchives,
+  importCollectionArchives,
+  deleteCollectionArchives,
+  restoreCollectionArchives,
+  deleteCollectionArchiveResources,
   putVanishArchive,
   getAllVanishArchive,
   smartMergeVanishArchive,
@@ -77,6 +83,8 @@ import {
   mergeHistoryV2Backup,
   upsertHistorySnapshots,
   getAllFollowing,
+  getAllFormerNames,
+  importFormerNames,
   getAllFollowingEvents,
   getFollowingEventsByDay,
   getAllVanishedFavResources,
@@ -200,11 +208,7 @@ import {
   type FollowingSyncOutcome,
   type FollowingSyncProgress,
 } from "../utils/followingSync";
-import {
-  runAvatarArchive,
-  type AvatarArchiveProgress,
-} from "../utils/followingAssetArchive";
-import { archiveAvatar, archiveCover } from "../utils/assetArchive";
+import { archiveCover } from "../utils/assetArchive";
 import {
   runCoverArchive,
   type CoverArchiveProgress,
@@ -389,9 +393,8 @@ export default defineBackground(() => {
   browser.alarms.create("syncFollowing", {
     periodInMinutes: 1,
   });
-  browser.alarms.create("archiveFollowingAvatars", {
-    periodInMinutes: 1,
-  });
+  // 头像只保存最后一次真实地址，不再下载图片字节；清掉旧版本可能留下的定时任务
+  void browser.alarms.clear("archiveFollowingAvatars");
   browser.alarms.create("archiveFavCovers", {
     periodInMinutes: 1,
   });
@@ -424,10 +427,8 @@ export default defineBackground(() => {
     browser.alarms.create("syncFollowing", {
       periodInMinutes: 1,
     });
-    // 设置每分钟推进一次头像字节归档，归档完成后自动停止
-    browser.alarms.create("archiveFollowingAvatars", {
-      periodInMinutes: 1,
-    });
+    // 头像只保存地址，不再归档字节
+    void browser.alarms.clear("archiveFollowingAvatars");
     // 设置每分钟推进一次收藏封面字节归档，归档完成后自动停止
     browser.alarms.create("archiveFavCovers", {
       periodInMinutes: 1,
@@ -577,21 +578,6 @@ export default defineBackground(() => {
         void startFollowingSync();
       } catch (error) {
         console.error("关注列表定时同步失败:", error);
-      }
-    } else if (alarm.name === "archiveFollowingAvatars") {
-      try {
-        // 全部归档完成后不再每分钟读整张表
-        const progress = await readAvatarArchiveProgress();
-        if (progress?.status === "completed") return;
-
-        const task = startAvatarArchive();
-        if (!task) return;
-        const result = await task;
-        console.log(
-          `头像归档：累计 ${result.archived} 张，失败 ${result.failed}，剩余 ${result.remaining}`,
-        );
-      } catch (error) {
-        console.error("头像归档失败:", error);
       }
     } else if (alarm.name === "archiveFavCovers") {
       try {
@@ -1410,37 +1396,6 @@ export default defineBackground(() => {
     }
   };
 
-  // 处理删除历史记录的消息
-  const handleDeleteHistoryItem = async (message: any, sendResponse: (response: any) => void) => {
-    const id = Number(message?.id);
-    const business = message?.business as HistoryItem["business"] | undefined;
-    const validBusinesses: HistoryItem["business"][] = [
-      "archive",
-      "pgc",
-      "article",
-      "article-list",
-      "live",
-      "cheese",
-    ];
-    if (!Number.isSafeInteger(id) || id <= 0 || !business || !validBusinesses.includes(business)) {
-      sendResponse({ success: false, error: "历史记录信息不完整" });
-      return;
-    }
-    try {
-      const syncDeleteFromBilibili = await getStorageValue(IS_SYNC_DELETE_FROM_BILIBILI, false);
-      if (!syncDeleteFromBilibili) {
-        sendResponse({ success: true, message: "同步删除未开启" });
-        return;
-      }
-      await deleteHistoryContent(business, id, "bilibili-page");
-      sendResponse({ success: true, message: "历史记录删除成功" });
-    } catch (error) {
-      sendResponse({
-        success: false,
-        error: error instanceof Error ? error.message : "删除失败",
-      });
-    }
-  };
 
   const handleRunLocalHistoryBackup = async (
     message: LocalHistoryBackupRequest,
@@ -1466,9 +1421,6 @@ export default defineBackground(() => {
         sendResponse({ success: true, cookies });
       });
       return true;
-    } else if (message.action === "deleteHistoryItem") {
-      handleDeleteHistoryItem(message, sendResponse);
-      return true; // 保持消息通道开放
     } else if (message.action === "syncFavorites") {
       handleSyncFavorites(sendResponse);
       return true;
@@ -1493,14 +1445,32 @@ export default defineBackground(() => {
     } else if (message.action === "syncSubscribedCollectionResources") {
       handleSyncSubscribedCollectionResources(message, sendResponse);
       return true;
+    } else if (message.action === "startCollectionArchiveSync") {
+      handleStartCollectionArchiveSync(sendResponse);
+      return true;
+    } else if (message.action === "cancelCollectionArchiveSync") {
+      handleCancelCollectionArchiveSync(sendResponse);
+      return true;
+    } else if (message.action === "getCollectionArchiveSyncProgress") {
+      handleGetCollectionArchiveSyncProgress(sendResponse);
+      return true;
+    } else if (message.action === "getCollectionArchives") {
+      handleGetCollectionArchives(message, sendResponse);
+      return true;
+    } else if (message.action === "deleteCollectionArchives") {
+      handleDeleteCollectionArchives(message, sendResponse);
+      return true;
+    } else if (message.action === "restoreCollectionArchives") {
+      handleRestoreCollectionArchives(message, sendResponse);
+      return true;
+    } else if (message.action === "finalizeCollectionArchiveDeletion") {
+      handleFinalizeCollectionArchiveDeletion(message, sendResponse);
+      return true;
     } else if (message.action === "runLocalHistoryBackup") {
       handleRunLocalHistoryBackup(message as LocalHistoryBackupRequest, sendResponse);
       return true;
     } else if (message.action === "syncFollowing") {
       handleSyncFollowing(sendResponse);
-      return true;
-    } else if (message.action === "archiveFollowingAvatars") {
-      handleAvatarArchive(sendResponse);
       return true;
     } else if (message.action === "archiveFavCovers") {
       handleCoverArchive(sendResponse);
@@ -2337,8 +2307,6 @@ export default defineBackground(() => {
 
         // 完整与否都记录时间：否则超出页数上限的账号会被每分钟反复重试
         await setStorageValue(FOLLOWING_LAST_SYNC, Date.now());
-        // 新增关注可能带来未归档的头像，复位归档状态让归档任务重新启动
-        await resetAvatarArchiveIfCompleted();
         // 新收藏的条目也可能还没归档封面
         await resetCoverArchiveIfCompleted();
 
@@ -2450,62 +2418,6 @@ export default defineBackground(() => {
         success: false,
         error: error instanceof Error ? error.message : "未知错误",
       });
-    }
-  };
-
-  // ---------------------------------------------------------------------------
-  // 关注头像的字节归档
-  //
-  // 动机（Phase 1b 实测）：账号注销后 B 站会把头像换成 noface.jpg，真实头像立即丢失。
-  // 所以必须在图片还正常时抓下来。任务是**持续**的、且越早跑越好。
-  //
-  // 可续跑性来自筛选条件：已归档的记录 avatarAssetId 非空，下一轮自然跳过，
-  // 因此不需要游标，Service Worker 中途被杀也不丢进度。
-  // ---------------------------------------------------------------------------
-  let avatarArchivePromise: Promise<AvatarArchiveProgress> | null = null;
-
-  const readAvatarArchiveProgress = async (): Promise<AvatarArchiveProgress | null> =>
-    await getStorageValue<AvatarArchiveProgress | null>(FOLLOWING_AVATAR_ARCHIVE_PROGRESS, null);
-
-  const startAvatarArchive = (): Promise<AvatarArchiveProgress> | null => {
-    if (avatarArchivePromise) return null;
-
-    const task = (async (): Promise<AvatarArchiveProgress> => {
-      const previous = await readAvatarArchiveProgress();
-      // 上一轮没跑完时累计计数；上一轮已完成则重新计数
-      const carryOver = previous && previous.status !== "completed" ? previous : null;
-
-      return await runAvatarArchive(
-        {
-          loadFollowing: () => getAllFollowing(),
-          patchFollowing: (mids, patch) => patchFollowingItems(mids, patch),
-          saveProgress: async (progress) => {
-            await setStorageValue(FOLLOWING_AVATAR_ARCHIVE_PROGRESS, progress);
-          },
-          now: () => Date.now(),
-          delay: (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
-          archive: (face) => archiveAvatar(face),
-        },
-        {
-          baseArchived: carryOver?.archived ?? 0,
-          baseFailed: carryOver?.failed ?? 0,
-        },
-      );
-    })();
-
-    avatarArchivePromise = task;
-    const clear = () => {
-      if (avatarArchivePromise === task) avatarArchivePromise = null;
-    };
-    task.then(clear, clear);
-    return task;
-  };
-
-  /** 关注同步后可能有新账号需要归档，把状态从 completed 复位以重新启动归档 */
-  const resetAvatarArchiveIfCompleted = async (): Promise<void> => {
-    const progress = await readAvatarArchiveProgress();
-    if (progress?.status === "completed") {
-      await setStorageValue(FOLLOWING_AVATAR_ARCHIVE_PROGRESS, { ...progress, status: "idle" });
     }
   };
 
@@ -2665,32 +2577,6 @@ export default defineBackground(() => {
       sendResponse({
         success: false,
         error: error instanceof Error ? error.message : "合集封面归档失败",
-      });
-    }
-  };
-
-  const handleAvatarArchive = async (sendResponse: (response: any) => void) => {
-    const task = startAvatarArchive();
-    if (!task) {
-      sendResponse({ success: false, error: "头像归档正在进行中，请稍后再试" });
-      return;
-    }
-
-    try {
-      const result = await task;
-      sendResponse({
-        success: true,
-        archived: result.archived,
-        failed: result.failed,
-        remaining: result.remaining,
-        status: result.status,
-        message: `本轮归档 ${result.pending - result.remaining} 张，剩余 ${result.remaining} 张`,
-      });
-    } catch (error) {
-      console.error("头像归档失败:", error);
-      sendResponse({
-        success: false,
-        error: error instanceof Error ? error.message : "头像归档失败",
       });
     }
   };
@@ -3827,6 +3713,9 @@ export default defineBackground(() => {
     }
 
     await replaceSubscribedCollections(collections);
+    // 目录同步完成后自动排队首次全量。不能 await：合集内容可能很多，
+    // 目录同步的响应要立刻返回；进度写进 storage，页面可以轮询。
+    void startCollectionArchiveSync();
   }
 
   async function syncSubscribedCollectionResources(collectionId: number): Promise<void> {
@@ -3872,6 +3761,11 @@ export default defineBackground(() => {
       hasMore = Boolean(data.data?.has_more);
       if (hasMore && medias.length === 0) break; // 空页保护，防止接口异常导致死循环
       page += 1;
+      if (hasMore) {
+        await new Promise((resolve) =>
+          setTimeout(resolve, COLLECTION_ARCHIVE_PAGE_DELAY_MS),
+        );
+      }
     }
 
     // 整夹替换前**先把本轮要消失的条目留档**。
@@ -3924,6 +3818,276 @@ export default defineBackground(() => {
     await replaceSubscribedCollectionResources(collectionId, resources);
   }
 
+  type CollectionArchiveSyncProgress = {
+    status: "idle" | "running" | "completed" | "cancelled";
+    total: number;
+    processed: number;
+    skipped: number;
+    synced: number;
+    failed: number;
+    currentCollectionId?: number;
+    currentCollectionTitle?: string;
+    startedAt: number;
+    updatedAt: number;
+    message?: string;
+  };
+
+  let collectionArchiveSyncPromise: Promise<void> | null = null;
+  let collectionArchiveSyncCancelRequested = false;
+
+  const writeCollectionArchiveProgress = async (
+    progress: CollectionArchiveSyncProgress,
+  ): Promise<void> => {
+    await setStorageValue(COLLECTION_ARCHIVE_SYNC_PROGRESS, {
+      ...progress,
+      updatedAt: Date.now(),
+    });
+  };
+
+  const getCollectionArchiveSyncProgress = async (): Promise<
+    CollectionArchiveSyncProgress | null
+  > => {
+    const progress = await getStorageValue<CollectionArchiveSyncProgress | null>(
+      COLLECTION_ARCHIVE_SYNC_PROGRESS,
+      null,
+    );
+    if (
+      progress?.status === "running" &&
+      Date.now() - (progress.updatedAt || 0) > COLLECTION_ARCHIVE_SYNC_STALE_MS
+    ) {
+      const interrupted: CollectionArchiveSyncProgress = {
+        ...progress,
+        status: "cancelled",
+        updatedAt: Date.now(),
+        message: "后台任务已中断，可重新开始",
+      };
+      await writeCollectionArchiveProgress(interrupted);
+      return interrupted;
+    }
+    return progress;
+  };
+
+  const startCollectionArchiveSync = async (): Promise<void> => {
+    if (collectionArchiveSyncPromise) return collectionArchiveSyncPromise;
+
+    collectionArchiveSyncCancelRequested = false;
+    collectionArchiveSyncPromise = (async () => {
+      const collections = await getAllSubscribedCollections();
+      const targets: SubscribedCollection[] = [];
+      let skipped = 0;
+
+      for (const collection of collections) {
+        if (collection.media_count <= 0) {
+          skipped++;
+          continue;
+        }
+        const localCount = await getSubscribedCollectionResourceCount(collection.id);
+        if (localCount >= collection.media_count) {
+          skipped++;
+          continue;
+        }
+        targets.push(collection);
+      }
+
+      const base: CollectionArchiveSyncProgress = {
+        status: "running",
+        total: targets.length,
+        processed: 0,
+        skipped,
+        synced: 0,
+        failed: 0,
+        startedAt: Date.now(),
+        updatedAt: Date.now(),
+      };
+      await writeCollectionArchiveProgress(base);
+
+      let synced = 0;
+      let failed = 0;
+      for (let index = 0; index < targets.length; index += 1) {
+        if (collectionArchiveSyncCancelRequested) break;
+        const collection = targets[index];
+        await writeCollectionArchiveProgress({
+          ...base,
+          processed: index,
+          synced,
+          failed,
+          currentCollectionId: collection.id,
+          currentCollectionTitle: collection.title,
+        });
+
+        try {
+          await syncSubscribedCollectionResources(collection.id);
+          synced++;
+        } catch (error) {
+          failed++;
+          console.warn(
+            `合集内容首次全量失败（${collection.id} ${collection.title}）：`,
+            error,
+          );
+        }
+
+        await writeCollectionArchiveProgress({
+          ...base,
+          processed: index + 1,
+          synced,
+          failed,
+          currentCollectionId: collection.id,
+          currentCollectionTitle: collection.title,
+        });
+      }
+
+      const cancelled = collectionArchiveSyncCancelRequested;
+      await writeCollectionArchiveProgress({
+        ...base,
+        status: cancelled ? "cancelled" : "completed",
+        processed: cancelled ? base.processed : targets.length,
+        synced,
+        failed,
+        message: cancelled ? "已取消" : "合集内容全量同步完成",
+      });
+    })().finally(() => {
+      collectionArchiveSyncPromise = null;
+    });
+
+    return collectionArchiveSyncPromise;
+  };
+
+  const handleGetCollectionArchiveSyncProgress = async (
+    sendResponse: (response: any) => void,
+  ) => {
+    try {
+      sendResponse({ success: true, progress: await getCollectionArchiveSyncProgress() });
+    } catch (error) {
+      sendResponse({
+        success: false,
+        error: error instanceof Error ? error.message : "读取进度失败",
+      });
+    }
+  };
+
+  const handleStartCollectionArchiveSync = async (
+    sendResponse: (response: any) => void,
+  ) => {
+    try {
+      const alreadyRunning = Boolean(collectionArchiveSyncPromise);
+      void startCollectionArchiveSync();
+      sendResponse({
+        success: true,
+        started: !alreadyRunning,
+        message: alreadyRunning ? "合集内容同步正在进行中" : "已开始同步合集内容",
+      });
+    } catch (error) {
+      sendResponse({
+        success: false,
+        error: error instanceof Error ? error.message : "启动失败",
+      });
+    }
+  };
+
+  const handleCancelCollectionArchiveSync = async (
+    sendResponse: (response: any) => void,
+  ) => {
+    try {
+      collectionArchiveSyncCancelRequested = true;
+      const progress = await getCollectionArchiveSyncProgress();
+      if (progress?.status === "running") {
+        await writeCollectionArchiveProgress({
+          ...progress,
+          status: "cancelled",
+          message: "已取消",
+        });
+      }
+      sendResponse({ success: true, message: "已请求取消" });
+    } catch (error) {
+      sendResponse({
+        success: false,
+        error: error instanceof Error ? error.message : "取消失败",
+      });
+    }
+  };
+
+  const handleGetCollectionArchives = async (
+    message: any,
+    sendResponse: (response: any) => void,
+  ) => {
+    try {
+      const includeDeleted = Boolean(message?.includeDeleted);
+      sendResponse({
+        success: true,
+        archives: await getAllCollectionArchives(includeDeleted),
+      });
+    } catch (error) {
+      sendResponse({
+        success: false,
+        error: error instanceof Error ? error.message : "读取合集档案失败",
+      });
+    }
+  };
+
+  const handleDeleteCollectionArchives = async (
+    message: any,
+    sendResponse: (response: any) => void,
+  ) => {
+    const ids = Array.isArray(message?.ids)
+      ? message.ids.map(Number).filter((id: number) => Number.isSafeInteger(id) && id > 0)
+      : [];
+    if (ids.length === 0) {
+      sendResponse({ success: false, error: "没有要删除的合集" });
+      return;
+    }
+    try {
+      await deleteCollectionArchives(ids);
+      sendResponse({ success: true, deleted: ids.length });
+    } catch (error) {
+      sendResponse({
+        success: false,
+        error: error instanceof Error ? error.message : "删除失败",
+      });
+    }
+  };
+
+  const handleRestoreCollectionArchives = async (
+    message: any,
+    sendResponse: (response: any) => void,
+  ) => {
+    const ids = Array.isArray(message?.ids)
+      ? message.ids.map(Number).filter((id: number) => Number.isSafeInteger(id) && id > 0)
+      : [];
+    if (ids.length === 0) {
+      sendResponse({ success: false, error: "没有要撤销的合集" });
+      return;
+    }
+    try {
+      await restoreCollectionArchives(ids);
+      sendResponse({ success: true, restored: ids.length });
+    } catch (error) {
+      sendResponse({
+        success: false,
+        error: error instanceof Error ? error.message : "撤销失败",
+      });
+    }
+  };
+
+  const handleFinalizeCollectionArchiveDeletion = async (
+    message: any,
+    sendResponse: (response: any) => void,
+  ) => {
+    const ids = Array.isArray(message?.ids)
+      ? message.ids.map(Number).filter((id: number) => Number.isSafeInteger(id) && id > 0)
+      : [];
+    try {
+      for (const id of ids) {
+        await deleteCollectionArchiveResources(id);
+      }
+      sendResponse({ success: true, finalized: ids.length });
+    } catch (error) {
+      sendResponse({
+        success: false,
+        error: error instanceof Error ? error.message : "清理失败",
+      });
+    }
+  };
+
   // WebDAV 同步数据项定义：文件名、本地读取与远端合并策略（与 WebDavSync 页面保持一致）
   const WEBDAV_DATA_ITEMS: {
     key: WebDavSyncKey;
@@ -3968,11 +4132,25 @@ export default defineBackground(() => {
       merge: smartMergeSubscribedCollectionResources,
     },
     {
+      key: "collectionArchives",
+      label: "合集档案",
+      file: "collectionArchives.json",
+      getAll: () => getAllCollectionArchives(true),
+      merge: importCollectionArchives,
+    },
+    {
       key: "following",
       label: "关注",
       file: "following.json",
       getAll: getAllFollowing,
       merge: smartMergeFollowing,
+    },
+    {
+      key: "formerNames",
+      label: "曾用名存档",
+      file: "formerNames.json",
+      getAll: getAllFormerNames,
+      merge: importFormerNames,
     },
     {
       key: "followingEvents",
@@ -4013,10 +4191,16 @@ export default defineBackground(() => {
         return;
       }
 
-      const syncItems = await getStorageValue<WebDavSyncItems>(
+      const savedSyncItems = await getStorageValue<WebDavSyncItems>(
         WEBDAV_SYNC_ITEMS,
         DEFAULT_WEBDAV_SYNC_ITEMS,
       );
+      // 旧版本保存过勾选时不会有新键；与页面加载逻辑一致，先合并默认值，
+      // 否则新增的合集档案/曾用名存档在后台自动同步里会永远是 undefined。
+      const syncItems: WebDavSyncItems = {
+        ...DEFAULT_WEBDAV_SYNC_ITEMS,
+        ...savedSyncItems,
+      };
       const items = WEBDAV_DATA_ITEMS.filter((item) => syncItems[item.key]);
       if (items.length === 0) {
         console.log("WebDAV 同步数据项均未勾选，跳过自动同步");

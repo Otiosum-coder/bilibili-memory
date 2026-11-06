@@ -93,8 +93,20 @@ export const StorageBreakdownModal = ({
 
   const runCleanup = async () => {
     setStep("running");
+    let timeoutId: number | undefined;
     try {
-      const outcome = await onCleanup(selected);
+      /**
+       * 兜底：清理本身是 IndexedDB 游标任务，正常情况下几秒内结束。
+       * 如果底层 Promise 因为事务异常/浏览器回收没有 settle，不能让弹窗
+       * 永远停在「正在清理」——给一个可见的超时错误，至少允许用户关闭。
+       */
+      const timeout = new Promise<never>((_, reject) => {
+        timeoutId = window.setTimeout(
+          () => reject(new Error("清理超时，请刷新页面后重试（已删除的图片不会自动恢复）")),
+          60_000,
+        );
+      });
+      const outcome = await Promise.race([onCleanup(selected), timeout]);
       const freed = outcome.reduce((total, entry) => total + entry.freedBytes, 0);
       const deleted = outcome.reduce((total, entry) => total + entry.deleted, 0);
       setResult(`已清理 ${formatCount(deleted)} 张图片，释放约 ${formatStorageSize(freed)}。`);
@@ -106,6 +118,8 @@ export const StorageBreakdownModal = ({
         cleanupError instanceof Error ? `清理失败：${cleanupError.message}` : "清理失败，请重试。",
       );
       setStep("done");
+    } finally {
+      if (timeoutId !== undefined) window.clearTimeout(timeoutId);
     }
   };
 

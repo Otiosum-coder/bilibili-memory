@@ -1,8 +1,28 @@
 import { useEffect, useRef, useState } from "react";
 import toast from "react-hot-toast";
-import { getSubscribedCollectionResources, getSubscribedCollections } from "../utils/db";
-import { SubscribedCollection, SubscribedCollectionResource } from "../utils/types";
-import { ChevronDownIcon, LibraryBig, RefreshCw, Search, X } from "lucide-react";
+import {
+  deleteCollectionArchiveResources,
+  deleteCollectionArchives,
+  getAllCollectionArchives,
+  getSubscribedCollectionResources,
+  getSubscribedCollections,
+  restoreCollectionArchives,
+} from "../utils/db";
+import {
+  CollectionArchive,
+  SubscribedCollection,
+  SubscribedCollectionResource,
+} from "../utils/types";
+import {
+  Archive as ArchiveIcon,
+  ChevronDownIcon,
+  LibraryBig,
+  RefreshCw,
+  RotateCcw,
+  Search,
+  Trash2,
+  X,
+} from "lucide-react";
 import { Pagination } from "../components/Pagination";
 import { formatInteractionDuration } from "../utils/interactionQuery";
 
@@ -26,9 +46,128 @@ export const SubscribedCollections = () => {
   const [keyword, setKeyword] = useState("");
   const [searchType, setSearchType] = useState<SearchType>("all");
   const [isSearchKindDropdownOpen, setIsSearchKindDropdownOpen] = useState(false);
+  const [collectionArchives, setCollectionArchives] = useState<CollectionArchive[]>([]);
+  const [archiveDetail, setArchiveDetail] = useState<CollectionArchive | null>(null);
+  const [archiveResources, setArchiveResources] = useState<SubscribedCollectionResource[]>([]);
+  const [archiveLoading, setArchiveLoading] = useState(false);
+  const [archiveDeleteConfirm, setArchiveDeleteConfirm] = useState(false);
+  const [archiveDeleting, setArchiveDeleting] = useState(false);
+  const [archiveUndo, setArchiveUndo] = useState<{
+    item: CollectionArchive;
+    remaining: number;
+  } | null>(null);
   const contentRef = useRef<HTMLDivElement>(null);
   const hasRefreshedCollectionDirectoryRef = useRef(false);
+  const pendingArchiveRef = useRef<CollectionArchive | null>(null);
+  const archiveUndoTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const archiveUndoIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const pageSize = 50;
+
+  const clearArchiveUndoTimers = () => {
+    if (archiveUndoTimerRef.current) {
+      clearTimeout(archiveUndoTimerRef.current);
+      archiveUndoTimerRef.current = null;
+    }
+    if (archiveUndoIntervalRef.current) {
+      clearInterval(archiveUndoIntervalRef.current);
+      archiveUndoIntervalRef.current = null;
+    }
+  };
+
+  const loadArchives = async () => {
+    const list = await getAllCollectionArchives();
+    setCollectionArchives(list.sort((a, b) => b.archivedAt - a.archivedAt));
+  };
+
+  const openArchiveDetail = async (archive: CollectionArchive) => {
+    setArchiveDetail(archive);
+    setArchiveDeleteConfirm(false);
+    setArchiveLoading(true);
+    try {
+      const list = await getSubscribedCollectionResources(archive.id);
+      setArchiveResources(list.sort((a, b) => a.index - b.index));
+    } catch {
+      setArchiveResources([]);
+      toast.error("加载合集备份内容失败");
+    } finally {
+      setArchiveLoading(false);
+    }
+  };
+
+  const finalizeArchiveDeletion = async () => {
+    const pending = pendingArchiveRef.current;
+    clearArchiveUndoTimers();
+    pendingArchiveRef.current = null;
+    setArchiveUndo(null);
+    if (!pending) return;
+    try {
+      await deleteCollectionArchiveResources(pending.id);
+    } catch (error) {
+      console.warn("清理合集备份内容失败", error);
+    }
+  };
+
+  const handleArchiveDelete = async () => {
+    if (!archiveDetail || archiveDeleting) return;
+    setArchiveDeleting(true);
+    try {
+      await deleteCollectionArchives([archiveDetail.id]);
+      pendingArchiveRef.current = archiveDetail;
+      setCollectionArchives((current) =>
+        current.filter((item) => item.id !== archiveDetail.id),
+      );
+      setArchiveDeleteConfirm(false);
+      setArchiveDetail(null);
+      setArchiveResources([]);
+      setArchiveUndo({ item: archiveDetail, remaining: 5 });
+      clearArchiveUndoTimers();
+      archiveUndoTimerRef.current = setTimeout(() => {
+        void finalizeArchiveDeletion();
+      }, 5000);
+      archiveUndoIntervalRef.current = setInterval(() => {
+        setArchiveUndo((current) => {
+          if (!current) return null;
+          if (current.remaining <= 1) return { ...current, remaining: 0 };
+          return { ...current, remaining: current.remaining - 1 };
+        });
+      }, 1000);
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : "删除合集备份失败");
+    } finally {
+      setArchiveDeleting(false);
+    }
+  };
+
+  const handleArchiveUndo = async () => {
+    if (!archiveUndo) return;
+    const item = archiveUndo.item;
+    clearArchiveUndoTimers();
+    pendingArchiveRef.current = null;
+    try {
+      await restoreCollectionArchives([item.id]);
+      setCollectionArchives((current) =>
+        [item, ...current].sort((a, b) => b.archivedAt - a.archivedAt),
+      );
+      setArchiveUndo(null);
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : "撤销删除失败");
+    }
+  };
+
+  useEffect(() => {
+    return () => {
+      const pending = pendingArchiveRef.current;
+      clearArchiveUndoTimers();
+      if (pending) void deleteCollectionArchiveResources(pending.id);
+    };
+  }, []);
+
+  const formatArchiveDate = (value: number) =>
+    new Date(value).toLocaleString("zh-CN", {
+      year: "numeric",
+      month: "2-digit",
+      day: "2-digit",
+    });
 
   const selectedCollection = collections.find(
     (collection) => collection.id === selectedCollectionId,
@@ -58,6 +197,7 @@ export const SubscribedCollections = () => {
       const response = await browser.runtime.sendMessage({ action: "syncSubscribedCollections" });
       if (!response?.success) throw new Error(response?.error || "同步订阅合集失败");
       await loadCollections();
+      await loadArchives();
     } catch (error) {
       toast.error(error instanceof Error ? error.message : "同步订阅合集失败");
     } finally {
@@ -89,6 +229,7 @@ export const SubscribedCollections = () => {
     const initializeCollections = async () => {
       // 与收藏夹保持一致：先展示本地缓存，再从网络刷新目录。
       await loadCollections().catch(() => toast.error("加载订阅合集缓存失败"));
+      await loadArchives().catch(() => toast.error("加载合集备份失败"));
       await refreshCollections();
     };
 
@@ -144,8 +285,8 @@ export const SubscribedCollections = () => {
           </h2>
           <button
             type="button"
-            title="同步订阅合集"
-            aria-label="同步订阅合集"
+            title="同步订阅合集目录并补全内容"
+            aria-label="同步订阅合集目录并补全内容"
             onClick={refreshCollections}
             disabled={isSyncingCollections}
             className="p-2 rounded-md text-gray-500 hover:bg-gray-100 hover:text-pink-500 disabled:opacity-50 dark:text-neutral-400 dark:hover:bg-neutral-800 dark:hover:text-pink-400 transition-colors"
@@ -173,7 +314,29 @@ export const SubscribedCollections = () => {
             </button>
           ))}
 
-          {!isSyncingCollections && collections.length === 0 && (
+          {collectionArchives.map((archive) => (
+            <button
+              key={archive.id}
+              type="button"
+              onClick={() => void openArchiveDetail(archive)}
+              className="mb-1 w-full rounded-lg p-3 text-left transition-colors hover:bg-amber-50 dark:hover:bg-amber-500/10"
+            >
+              <div className="flex min-w-0 items-center gap-2">
+                <span className="truncate font-medium text-gray-700 dark:text-neutral-300">
+                  {archive.title || `合集 ${archive.id}`}
+                </span>
+                <span className="shrink-0 rounded-full bg-amber-50 px-1.5 py-0.5 text-[10px] font-medium text-amber-600 dark:bg-amber-500/10 dark:text-amber-400">
+                  本地备份
+                </span>
+              </div>
+              <div className="mt-1 truncate text-xs text-gray-400 dark:text-neutral-500">
+                {archive.reason === "collection_gone" ? "已离开订阅" : "合集已失效"} ·{" "}
+                {archive.resourceCount} 条
+              </div>
+            </button>
+          ))}
+
+          {!isSyncingCollections && collections.length === 0 && collectionArchives.length === 0 && (
             <div className="p-5 text-center text-sm text-gray-400 dark:text-neutral-500">
               暂无订阅合集
             </div>
@@ -273,16 +436,12 @@ export const SubscribedCollections = () => {
                     )}
                   </div>
 
-                  <button
-                    type="button"
-                    title="同步合集内容"
-                    aria-label="同步合集内容"
-                    onClick={() => refreshResources(selectedCollection)}
-                    disabled={isSyncingResources}
-                    className="p-2.5 rounded-full text-gray-500 bg-gray-50 border border-gray-200 hover:bg-gray-100 hover:text-pink-500 disabled:opacity-50 dark:text-neutral-400 dark:bg-neutral-800 dark:border-neutral-700 dark:hover:bg-neutral-700 dark:hover:text-pink-400 transition-colors"
-                  >
-                    <RefreshCw className={`w-4 h-4 ${isSyncingResources ? "animate-spin" : ""}`} />
-                  </button>
+                  {isSyncingResources && (
+                    <span className="flex items-center gap-1.5 whitespace-nowrap text-xs text-gray-400 dark:text-neutral-500">
+                      <RefreshCw className="w-3.5 h-3.5 animate-spin" />
+                      同步中
+                    </span>
+                  )}
                 </div>
               </section>
 
@@ -378,11 +537,165 @@ export const SubscribedCollections = () => {
           ) : (
             <div className="h-full min-h-[24rem] flex flex-col items-center justify-center text-gray-400 dark:text-neutral-500">
               <LibraryBig className="w-12 h-12 mb-4" />
-              <p>{isSyncingCollections ? "正在同步订阅合集..." : "还没有订阅任何合集"}</p>
+              <p>
+                {isSyncingCollections
+                  ? "正在同步订阅合集..."
+                  : collectionArchives.length > 0
+                    ? "当前没有活跃的订阅合集，左侧「本地备份」仍保留。"
+                    : "还没有订阅任何合集"}
+              </p>
             </div>
           )}
         </div>
       </main>
+
+      {archiveDetail ? (
+        <div
+          className="fixed inset-0 z-[70] flex items-center justify-center bg-black/50 p-4"
+          onMouseDown={(event) => {
+            if (event.target === event.currentTarget) setArchiveDetail(null);
+          }}
+        >
+          <div className="flex max-h-[85vh] w-full max-w-3xl flex-col overflow-hidden rounded-2xl bg-white shadow-2xl dark:bg-neutral-900">
+            <div className="flex items-start gap-4 border-b border-gray-100 p-5 dark:border-neutral-800">
+              <div className="flex h-16 w-28 shrink-0 items-center justify-center overflow-hidden rounded-lg bg-gray-100 dark:bg-neutral-800">
+                {archiveDetail.cover ? (
+                  <img
+                    src={archiveDetail.cover.replace("http:", "https:")}
+                    alt={archiveDetail.title}
+                    className="h-full w-full object-cover"
+                  />
+                ) : (
+                  <ArchiveIcon className="h-7 w-7 text-gray-400" />
+                )}
+              </div>
+              <div className="min-w-0 flex-1">
+                <div className="flex flex-wrap items-center gap-2">
+                  <h2 className="truncate text-lg font-bold">
+                    {archiveDetail.title || `合集 ${archiveDetail.id}`}
+                  </h2>
+                  <span className="rounded-full bg-amber-50 px-2 py-0.5 text-xs font-medium text-amber-600 dark:bg-amber-500/10 dark:text-amber-400">
+                    本地备份
+                  </span>
+                  <span className="rounded-full bg-gray-100 px-2 py-0.5 text-xs text-gray-500 dark:bg-neutral-800 dark:text-neutral-400">
+                    {archiveDetail.reason === "collection_gone" ? "已离开订阅" : "合集已失效"}
+                  </span>
+                </div>
+                <div className="mt-1 text-sm text-gray-500 dark:text-neutral-400">
+                  {archiveDetail.upper?.name || "未知 UP 主"} · 合集 ID {archiveDetail.id}
+                </div>
+                <div className="mt-1 text-xs text-gray-400 dark:text-neutral-500">
+                  归档于 {formatArchiveDate(archiveDetail.archivedAt)} · 本地保存{" "}
+                  {archiveDetail.resourceCount || archiveResources.length} 条
+                </div>
+              </div>
+              <button
+                type="button"
+                aria-label="关闭合集备份详情"
+                onClick={() => setArchiveDetail(null)}
+                className="rounded-md p-1.5 text-gray-400 hover:bg-gray-100 hover:text-gray-600 dark:hover:bg-neutral-800 dark:hover:text-neutral-300"
+              >
+                <X className="h-5 w-5" />
+              </button>
+            </div>
+
+            <div className="flex items-center justify-between gap-3 border-b border-gray-100 px-5 py-3 dark:border-neutral-800">
+              <p className="text-xs text-gray-400 dark:text-neutral-500">
+                删除只清理本地备份，不会取消 B 站订阅；5 秒内可撤销。
+              </p>
+              <button
+                type="button"
+                onClick={() => setArchiveDeleteConfirm(true)}
+                className="flex shrink-0 items-center gap-1.5 rounded-lg border border-red-200 px-3 py-1.5 text-sm text-red-500 transition-colors hover:bg-red-50 dark:border-red-500/30 dark:hover:bg-red-500/10"
+              >
+                <Trash2 className="h-4 w-4" />
+                删除备份
+              </button>
+            </div>
+
+            <div className="min-h-0 flex-1 overflow-y-auto p-5">
+              {archiveLoading ? (
+                <div className="py-10 text-center text-sm text-gray-400 dark:text-neutral-500">
+                  正在加载备份内容...
+                </div>
+              ) : archiveResources.length === 0 ? (
+                <div className="py-10 text-center text-sm text-gray-400 dark:text-neutral-500">
+                  本地没有保存到这个合集的内容
+                </div>
+              ) : (
+                <div className="space-y-2">
+                  {archiveResources.map((resource) => (
+                    <a
+                      key={resource.id}
+                      href={`https://www.bilibili.com/video/${resource.bvid}`}
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      className="flex items-center gap-3 rounded-lg border border-gray-100 p-3 text-inherit no-underline transition-colors hover:bg-gray-50 dark:border-neutral-800 dark:hover:bg-neutral-800/60"
+                    >
+                      <span className="min-w-0 flex-1 truncate text-sm">
+                        {resource.title || "已失效视频"}
+                      </span>
+                      <span className="shrink-0 font-mono text-xs text-gray-400 dark:text-neutral-500">
+                        {resource.bvid}
+                      </span>
+                      <span className="shrink-0 text-xs text-gray-400 dark:text-neutral-500">
+                        {resource.pubdate
+                          ? new Date(resource.pubdate * 1000).toLocaleDateString()
+                          : ""}
+                      </span>
+                    </a>
+                  ))}
+                </div>
+              )}
+            </div>
+          </div>
+        </div>
+      ) : null}
+
+      {archiveDeleteConfirm && archiveDetail ? (
+        <div className="fixed inset-0 z-[80] flex items-center justify-center bg-black/50 p-4">
+          <div className="w-full max-w-md rounded-2xl bg-white p-6 shadow-2xl dark:bg-neutral-900">
+            <h3 className="text-lg font-bold">删除这个合集备份？</h3>
+            <p className="mt-2 text-sm leading-6 text-gray-500 dark:text-neutral-400">
+              「{archiveDetail.title || `合集 ${archiveDetail.id}`}」的本地备份和已保存的{" "}
+              {archiveDetail.resourceCount || archiveResources.length} 条内容会被清理。
+              不会取消 B 站订阅，5 秒内可以撤销。
+            </p>
+            <div className="mt-5 flex justify-end gap-2">
+              <button
+                type="button"
+                disabled={archiveDeleting}
+                onClick={() => setArchiveDeleteConfirm(false)}
+                className="rounded-lg border border-gray-200 px-4 py-2 text-sm text-gray-600 hover:bg-gray-50 disabled:opacity-50 dark:border-neutral-700 dark:text-neutral-300 dark:hover:bg-neutral-800"
+              >
+                取消
+              </button>
+              <button
+                type="button"
+                disabled={archiveDeleting}
+                onClick={() => void handleArchiveDelete()}
+                className="rounded-lg bg-red-500 px-4 py-2 text-sm font-medium text-white hover:bg-red-600 disabled:opacity-50"
+              >
+                {archiveDeleting ? "删除中..." : "确认删除"}
+              </button>
+            </div>
+          </div>
+        </div>
+      ) : null}
+
+      {archiveUndo ? (
+        <div className="fixed bottom-6 left-1/2 z-[90] flex -translate-x-1/2 items-center gap-4 rounded-xl bg-neutral-900 px-5 py-3 text-sm text-white shadow-2xl dark:bg-white dark:text-neutral-900">
+          <span>已删除「{archiveUndo.item.title || `合集 ${archiveUndo.item.id}`}」的本地备份</span>
+          <button
+            type="button"
+            onClick={() => void handleArchiveUndo()}
+            className="flex items-center gap-1 font-medium text-amber-400 hover:text-amber-300 dark:text-amber-600 dark:hover:text-amber-500"
+          >
+            <RotateCcw className="h-3.5 w-3.5" />
+            撤销 {archiveUndo.remaining}s
+          </button>
+        </div>
+      ) : null}
     </div>
   );
 };

@@ -7,7 +7,6 @@ import {
   FOLLOWING_SYNC_INTERVAL,
   FOLLOWING_SYNC_PROGRESS,
   INTERACTIONS_SYNC_PROGRESS,
-  FOLLOWING_AVATAR_ARCHIVE_PROGRESS,
   FAV_COVER_ARCHIVE_PROGRESS,
   COLLECTION_COVER_ARCHIVE_PROGRESS,
   HAS_FULL_FOLLOWING_SYNC,
@@ -80,7 +79,6 @@ import { getStorageValue, setStorageValue } from "../utils/storage";
 import type { FollowingEvent, FollowingItem, HistoryEvent } from "../utils/types";
 import type { FollowingSyncProgress } from "../utils/followingSync";
 import type { InteractionSyncProgress } from "../utils/interactionSync";
-import type { AvatarArchiveProgress } from "../utils/followingAssetArchive";
 import type { CoverArchiveProgress } from "../utils/favCoverArchive";
 import { FollowingChangeDetailModal } from "../components/FollowingChangeDetailModal";
 import { FollowingChangeListModal } from "../components/FollowingChangeListModal";
@@ -137,6 +135,16 @@ const AUTHOR_RECENT_OPTIONS = [
   { days: 90, label: "近 90 天" },
 ] as const;
 
+/** 报告清单里的统计周期说明 */
+const REPORT_KIND_WINDOW_LABEL: Record<ReportKind, string> = {
+  week: "最近 7 天",
+  month: "最近 30 天",
+  year: "自然年",
+};
+
+/** 总览「最近在看的 UP 主」最多展示几位，用来和右侧报告区高度对齐 */
+const DASHBOARD_TOP_AUTHOR_LIMIT = 9;
+
 // 星期分布已废弃：周几看得多对回顾没有指导意义，改画"时段分布"
 
 /** "2026-10-08" → "10/8" */
@@ -164,6 +172,41 @@ const formatRelativeDay = (day: string): string => {
   const today = new Date();
   const todayDay = `${today.getFullYear()}-${`${today.getMonth() + 1}`.padStart(2, "0")}-${`${today.getDate()}`.padStart(2, "0")}`;
   return day === todayDay ? "今天" : day;
+};
+
+const clamp = (value: number, min: number, max: number): number =>
+  Math.min(max, Math.max(min, value));
+
+/** Catmull-Rom 转三次贝塞尔，让折线不再是一段段生硬的折角 */
+const buildSmoothPath = (
+  coords: Array<{ x: number; y: number }>,
+  minY: number,
+  maxY: number,
+): string => {
+  if (coords.length === 0) return "";
+  if (coords.length === 1) return `M ${coords[0].x} ${coords[0].y}`;
+
+  const points = coords.map((point) => ({
+    x: point.x,
+    y: clamp(point.y, minY, maxY),
+  }));
+  let path = `M ${points[0].x.toFixed(1)} ${points[0].y.toFixed(1)}`;
+
+  for (let index = 0; index < points.length - 1; index += 1) {
+    const p0 = points[index - 1] ?? points[index];
+    const p1 = points[index];
+    const p2 = points[index + 1];
+    const p3 = points[index + 2] ?? p2;
+    const cp1x = p1.x + (p2.x - p0.x) / 6;
+    const cp1y = clamp(p1.y + (p2.y - p0.y) / 6, minY, maxY);
+    const cp2x = p2.x - (p3.x - p1.x) / 6;
+    const cp2y = clamp(p2.y - (p3.y - p1.y) / 6, minY, maxY);
+    path += ` C ${cp1x.toFixed(1)} ${cp1y.toFixed(1)}, ${cp2x.toFixed(1)} ${cp2y.toFixed(
+      1,
+    )}, ${p2.x.toFixed(1)} ${p2.y.toFixed(1)}`;
+  }
+
+  return path;
 };
 
 const STACK_ORDER = ["followed", "unfollowed", "renamed", "accountGone"] as const;
@@ -296,7 +339,8 @@ const DailyViewChart = ({ points }: { points: DailyViewPoint[] }) => {
       <defs>
         <linearGradient id="dailyBarGradient" x1="0" y1="0" x2="0" y2="1">
           <stop offset="0%" stopColor="#f472b6" />
-          <stop offset="100%" stopColor="#db2777" />
+          <stop offset="55%" stopColor="#ec4899" />
+          <stop offset="100%" stopColor="#9d174d" />
         </linearGradient>
       </defs>
 
@@ -340,8 +384,9 @@ const DailyViewChart = ({ points }: { points: DailyViewPoint[] }) => {
               y={padTop + plotHeight - barHeight}
               width={barWidth}
               height={point.uniqueContents > 0 ? Math.max(barHeight, 2) : 0}
-              rx={1}
+              rx={Math.min(3, barWidth / 2)}
               fill="url(#dailyBarGradient)"
+              fillOpacity={0.92}
             />
             {/* 柱身只有几像素宽时鼠标很难命中，用整列透明热区承载原生提示 */}
             <rect
@@ -404,10 +449,11 @@ const DailyViewLineChart = ({ points }: { points: DailyViewPoint[] }) => {
     x: padLeft + index * step,
     y: padTop + plotHeight * (1 - point.uniqueContents / max),
   }));
-  const line = coords.map((point) => `${point.x.toFixed(1)},${point.y.toFixed(1)}`).join(" ");
-  const area = `${padLeft},${padTop + plotHeight} ${line} ${
-    padLeft + Math.max(0, points.length - 1) * step
-  },${padTop + plotHeight}`;
+  const baseline = padTop + plotHeight;
+  const curve = buildSmoothPath(coords, padTop, baseline);
+  const area = `${curve} L ${coords[coords.length - 1]?.x ?? padLeft} ${baseline} L ${
+    coords[0]?.x ?? padLeft
+  } ${baseline} Z`;
 
   return (
     <svg
@@ -416,13 +462,6 @@ const DailyViewLineChart = ({ points }: { points: DailyViewPoint[] }) => {
       role="img"
       aria-label="每日观看的视频数（折线）"
     >
-      <defs>
-        <linearGradient id="dailyLineArea" x1="0" y1="0" x2="0" y2="1">
-          <stop offset="0%" stopColor="#ec4899" stopOpacity={0.32} />
-          <stop offset="100%" stopColor="#ec4899" stopOpacity={0.02} />
-        </linearGradient>
-      </defs>
-
       {[0, 0.5, 1].map((ratio) => {
         const y = padTop + plotHeight * (1 - ratio);
         return (
@@ -450,19 +489,37 @@ const DailyViewLineChart = ({ points }: { points: DailyViewPoint[] }) => {
         );
       })}
 
-      <polygon points={area} fill="url(#dailyLineArea)" />
-      <polyline
-        points={line}
+      <path d={area} fill="#ec4899" fillOpacity={0.07} />
+      <path
+        d={curve}
         fill="none"
         stroke="#ec4899"
-        strokeWidth={2}
+        strokeWidth={6}
+        strokeOpacity={0.1}
+        strokeLinejoin="round"
+        strokeLinecap="round"
+      />
+      <path
+        d={curve}
+        fill="none"
+        stroke="#ec4899"
+        strokeWidth={2.4}
         strokeLinejoin="round"
         strokeLinecap="round"
       />
 
       {coords.map((point) => (
         <g key={point.day}>
-          <circle cx={point.x} cy={point.y} r={2.5} fill="#ec4899" />
+          {point.value > 0 ? (
+            <circle
+              cx={point.x}
+              cy={point.y}
+              r={2.5}
+              fill="#fff"
+              stroke="#db2777"
+              strokeWidth={1.4}
+            />
+          ) : null}
           {/* 命中区：点太小时用一整列承载原生提示 */}
           <rect
             x={point.x - step / 2}
@@ -1237,7 +1294,6 @@ export const Dashboard = () => {
   const [assetCount, setAssetCount] = useState(0);
   const [avatarAssetCount, setAvatarAssetCount] = useState(0);
   const [coverAssetCount, setCoverAssetCount] = useState(0);
-  const [archiveProgress, setArchiveProgress] = useState<AvatarArchiveProgress | null>(null);
   const [coverArchiveProgress, setCoverArchiveProgress] = useState<CoverArchiveProgress | null>(null);
   const [collectionCoverArchiveProgress, setCollectionCoverArchiveProgress] =
     useState<CoverArchiveProgress | null>(null);
@@ -1261,7 +1317,6 @@ export const Dashboard = () => {
         assets,
         avatarAssets,
         coverAssets,
-        savedArchiveProgress,
         savedCoverArchiveProgress,
         savedCollectionCoverArchiveProgress,
         viewEventList,
@@ -1288,7 +1343,6 @@ export const Dashboard = () => {
         // 进度只是个累加值，一旦没存住，面板就会显示 0 张而库里其实已有上千张
         countAssets("avatar"),
         countAssets("cover"),
-        getStorageValue<AvatarArchiveProgress | null>(FOLLOWING_AVATAR_ARCHIVE_PROGRESS, null),
         getStorageValue<CoverArchiveProgress | null>(FAV_COVER_ARCHIVE_PROGRESS, null),
         getStorageValue<CoverArchiveProgress | null>(COLLECTION_COVER_ARCHIVE_PROGRESS, null),
         // 只读最近一年的事件：观看事件表比 history 投影大一个数量级，
@@ -1323,6 +1377,12 @@ export const Dashboard = () => {
         ),
       );
       const vanishedCount = archiveItems.filter((item) => item.source === "favorites").length;
+      // 合集内容只统计当前仍订阅的合集。已取消/已删除合集的资源会保留给
+      // 消失档案详情使用，不能算进「当前合集内容」，否则 KPI 会虚高。
+      const currentCollectionIds = new Set(collections.map((collection) => collection.id));
+      const collectionResourceCount = collectionResources.filter((resource) =>
+        currentCollectionIds.has(resource.collection_id),
+      ).length;
       const favoriteCoverCandidates = favorites.filter((item) => Boolean(item.cover));
       setFavoriteCoverStats({
         archived: favoriteCoverCandidates.filter((item) => Boolean(item.coverAssetId)).length,
@@ -1334,7 +1394,7 @@ export const Dashboard = () => {
         favoriteCount: favorites.length,
         folderCount: folders.length,
         collectionCount: collections.length,
-        collectionResourceCount: collectionResources.length,
+        collectionResourceCount,
         vanishedCount,
       });
       setFollowing(followingList);
@@ -1346,7 +1406,6 @@ export const Dashboard = () => {
       setAssetCount(assets);
       setAvatarAssetCount(avatarAssets);
       setCoverAssetCount(coverAssets);
-      setArchiveProgress(savedArchiveProgress);
       setCoverArchiveProgress(savedCoverArchiveProgress);
       setCollectionCoverArchiveProgress(savedCollectionCoverArchiveProgress);
       setViewEvents(viewEventList);
@@ -1358,7 +1417,7 @@ export const Dashboard = () => {
         historyCount,
         favoriteCount: favorites.length,
         collectionCount: collections.length,
-        collectionResourceCount: collectionResources.length,
+        collectionResourceCount,
         followingCount: followingList.length,
         vanishedCount,
       };
@@ -1393,16 +1452,14 @@ export const Dashboard = () => {
    * 用户不必对着静止的界面干等。
    */
   const refreshArchiveStats = useCallback(async () => {
-    const [savedAvatar, savedCover, savedCollectionCover, avatarCount, coverCount, total] =
+    const [savedCover, savedCollectionCover, avatarCount, coverCount, total] =
       await Promise.all([
-      getStorageValue<AvatarArchiveProgress | null>(FOLLOWING_AVATAR_ARCHIVE_PROGRESS, null),
       getStorageValue<CoverArchiveProgress | null>(FAV_COVER_ARCHIVE_PROGRESS, null),
       getStorageValue<CoverArchiveProgress | null>(COLLECTION_COVER_ARCHIVE_PROGRESS, null),
       countAssets("avatar"),
       countAssets("cover"),
       countAssets(),
     ]);
-    setArchiveProgress(savedAvatar);
     setCoverArchiveProgress(savedCover);
     setCollectionCoverArchiveProgress(savedCollectionCover);
     setAvatarAssetCount(avatarCount);
@@ -1412,10 +1469,7 @@ export const Dashboard = () => {
 
   useEffect(() => {
     const listener = (changes: Record<string, unknown>) => {
-      if (
-        FOLLOWING_AVATAR_ARCHIVE_PROGRESS in changes ||
-        FAV_COVER_ARCHIVE_PROGRESS in changes
-      ) {
+      if (FAV_COVER_ARCHIVE_PROGRESS in changes) {
         void refreshArchiveStats();
       }
     };
@@ -1473,15 +1527,13 @@ export const Dashboard = () => {
   const handleArchive = useCallback(async () => {
     setArchiving(true);
     try {
-      // 两类图片一起触发：关注头像与收藏封面都归档到同一个 assets store
-      const [avatarResponse, coverResponse, collectionResponse] = await Promise.all([
-        browser.runtime.sendMessage({ action: "archiveFollowingAvatars" }),
+      // 只归档封面；头像现在只保存 URL，不再下载图片字节
+      const [coverResponse, collectionResponse] = await Promise.all([
         browser.runtime.sendMessage({ action: "archiveFavCovers" }),
         browser.runtime.sendMessage({ action: "archiveCollectionCovers" }),
       ]);
 
       const messages: string[] = [];
-      if (avatarResponse?.success) messages.push(avatarResponse.message ?? "头像归档完成");
       if (coverResponse?.success) messages.push(coverResponse.message ?? "封面归档完成");
       if (collectionResponse?.success) {
         messages.push(collectionResponse.message ?? "合集封面归档完成");
@@ -1489,7 +1541,7 @@ export const Dashboard = () => {
 
       if (messages.length === 0) {
         throw new Error(
-          avatarResponse?.error ?? coverResponse?.error ?? collectionResponse?.error ?? "图片归档失败",
+          coverResponse?.error ?? collectionResponse?.error ?? "图片归档失败",
         );
       }
       toast.success(messages.join("；"));
@@ -1512,6 +1564,21 @@ export const Dashboard = () => {
     () => buildDailyViewSeries(statsEvents, viewWindowDays, Date.now()),
     [statsEvents, viewWindowDays],
   );
+
+  /**
+   * 图表只从“窗口内第一次真正有观看记录”的那天开始画。
+   *
+   * dailySeries 会把窗口内每一天都补成 0，这是为了日期轴连续；但插件刚开始记录之前
+   * 的那些 0 并不是“那天没看”，而是“那天还没记录”。把这段空白画成 0 会让人误读，
+   * 也会让柱状/折线/热力图大半幅面全是空的。这里只裁前导空白，不裁中间断档。
+   */
+  const chartSeries = useMemo(() => {
+    const firstIndex = dailySeries.findIndex(
+      (point) => point.uniqueContents > 0 || point.views > 0,
+    );
+    if (firstIndex === -1) return [];
+    return firstIndex > 0 ? dailySeries.slice(firstIndex) : dailySeries;
+  }, [dailySeries]);
 
   /**
    * 实时记录开始的时刻。
@@ -1561,7 +1628,7 @@ export const Dashboard = () => {
 
   const topAuthors = useMemo(
     () =>
-      buildTopAuthors(statsEvents, 5, {
+      buildTopAuthors(statsEvents, DASHBOARD_TOP_AUTHOR_LIMIT, {
         recentSinceSec: startOfLocalDaySec(Date.now()) - (authorRecentDays - 1) * (DAY_MS / 1000),
         nameByMid: authorNameByMid,
       }),
@@ -1669,13 +1736,6 @@ export const Dashboard = () => {
 
   const runningArchiveTasks = (() => {
     const tasks: Array<{ label: string; done: number; total: number }> = [];
-    if (archiveProgress && archiveProgress.status !== "completed" && archiveProgress.remaining > 0) {
-      tasks.push({
-        label: "头像",
-        done: avatarAssetCount,
-        total: avatarAssetCount + archiveProgress.remaining,
-      });
-    }
     if (coverArchivePending > 0) {
       tasks.push({
         label: "封面",
@@ -1752,7 +1812,7 @@ export const Dashboard = () => {
                       ? `收藏内容分布在 ${metrics.folderCount} 个收藏夹。`
                       : "本地保存的收藏内容条数。"
                     : metric.key === "collectionResourceCount"
-                      ? "只统计本地已同步的合集条目；合集内容不会随目录自动抓取，打开合集后才会更新。"
+                      ? "只统计当前订阅合集在本地已同步的条目；已取消或已删除合集的旧内容不会计入。"
                       : metric.key === "vanishedCount"
                         ? "收藏夹来源的失效内容；点击卡片可进入消失档案。"
                         : null;
@@ -1877,15 +1937,26 @@ export const Dashboard = () => {
                 窗口内：活跃 {windowSummary.activeDays} 天 · 视频 {windowSummary.uniqueContents} 个 ·
                 完整播放 {windowSummary.completedPlays} 次 · 单日最高{" "}
                 {peakDay ? `${formatDayLabel(peakDay.day)} · ${peakDay.uniqueContents} 个视频` : "—"}
+                {chartSeries.length > 0 && chartSeries.length < dailySeries.length
+                  ? ` · 图表从 ${formatDayLabel(chartSeries[0].day)} 开始`
+                  : ""}
                 {trendChart === "heatmap" && viewWindowDays < 90
                   ? "（热力图更适合「近 90 天」或「近一年」）"
                   : ""}
               </p>
 
               <div className="mt-3">
-                {trendChart === "bar" ? <DailyViewChart points={dailySeries} /> : null}
-                {trendChart === "line" ? <DailyViewLineChart points={dailySeries} /> : null}
-                {trendChart === "heatmap" ? <DailyViewHeatmap points={dailySeries} /> : null}
+                {chartSeries.length === 0 ? (
+                  <div className="flex h-[190px] items-center justify-center rounded-xl border border-dashed border-gray-200 text-sm text-gray-400 dark:border-neutral-800 dark:text-neutral-500">
+                    这个窗口里还没有观看记录
+                  </div>
+                ) : (
+                  <>
+                    {trendChart === "bar" ? <DailyViewChart points={chartSeries} /> : null}
+                    {trendChart === "line" ? <DailyViewLineChart points={chartSeries} /> : null}
+                    {trendChart === "heatmap" ? <DailyViewHeatmap points={chartSeries} /> : null}
+                  </>
+                )}
               </div>
 
               {/* 「最爱时段」不再单独占一张卡片：它就是这张分布图上的最高点，
@@ -1971,37 +2042,57 @@ export const Dashboard = () => {
                   </ul>
                 </div>
 
-                <div>
-                  <p className="mb-2 text-sm font-medium text-gray-700 dark:text-neutral-200">
+                <div className="flex h-full flex-col">
+                  <p className="text-sm font-medium text-gray-700 dark:text-neutral-200">
                     观看报告
                   </p>
+                  <p className="mt-1 text-xs leading-relaxed text-gray-400 dark:text-neutral-500">
+                    把这段时间的观看记录整理成一份可保存的回顾。
+                  </p>
+
                   {availableReportKinds.length > 0 ? (
-                    <>
-                      <div className="flex flex-wrap gap-2">
-                        {availableReportKinds.map((kind) => (
-                          <button
-                            key={kind}
-                            type="button"
-                            onClick={() => setReportKind(kind)}
-                            className="inline-flex items-center gap-1.5 rounded-full border border-gray-200 px-3.5 py-1.5 text-sm text-gray-600 transition-colors hover:border-pink-300 hover:text-pink-500 dark:border-neutral-700 dark:text-neutral-300 dark:hover:text-pink-400"
-                          >
-                            <FileText className="h-3.5 w-3.5" />
-                            生成{REPORT_KIND_LABEL[kind]}
-                          </button>
-                        ))}
-                      </div>
-                      <p className="mt-2 text-xs leading-relaxed text-gray-400 dark:text-neutral-500">
-                        已记录 {reportAvailability.coverageDays} 天。周报按最近 7 天、月报按最近 30 天、年报按自然年统计。
+                    <div className="mt-3 space-y-2">
+                      {availableReportKinds.map((kind) => (
+                        <button
+                          key={kind}
+                          type="button"
+                          onClick={() => setReportKind(kind)}
+                          aria-label={`生成${REPORT_KIND_LABEL[kind]}`}
+                          className="group flex w-full items-center justify-between gap-3 rounded-lg border border-gray-200 px-3 py-2 text-left transition-colors hover:border-pink-300 hover:bg-pink-50/40 dark:border-neutral-700 dark:hover:border-pink-500/50 dark:hover:bg-pink-500/5"
+                        >
+                          <span className="flex min-w-0 items-center gap-2">
+                            <FileText className="h-4 w-4 shrink-0 text-pink-500" />
+                            <span className="min-w-0">
+                              <span className="block text-sm font-medium text-gray-700 dark:text-neutral-200">
+                                {REPORT_KIND_LABEL[kind]}
+                              </span>
+                              <span className="mt-0.5 block text-[11px] text-gray-400 dark:text-neutral-500">
+                                {REPORT_KIND_WINDOW_LABEL[kind]}
+                              </span>
+                            </span>
+                          </span>
+                          <span className="shrink-0 rounded-full bg-pink-50 px-2.5 py-1 text-xs font-medium text-pink-600 dark:bg-pink-500/10 dark:text-pink-400">
+                            生成
+                          </span>
+                        </button>
+                      ))}
+                    </div>
+                  ) : null}
+
+                  <div className="mt-auto pt-3">
+                    {availableReportKinds.length === 0 ? (
+                      <p className="mb-1.5 text-[11px] leading-relaxed text-gray-400 dark:text-neutral-500">
+                        周报需满 {REQUIRED_COVERAGE_DAYS.week} 天、月报满{" "}
+                        {REQUIRED_COVERAGE_DAYS.month} 天、年报满 {REQUIRED_COVERAGE_DAYS.year} 天。
                       </p>
-                    </>
-                  ) : (
-                    <p className="text-xs leading-relaxed text-gray-400 dark:text-neutral-500">
-                      已记录 {reportAvailability.coverageDays} 天。周报需要满{" "}
-                      {REQUIRED_COVERAGE_DAYS.week} 天、月报满 {REQUIRED_COVERAGE_DAYS.month}{" "}
-                      天、年报满 {REQUIRED_COVERAGE_DAYS.year}{" "}
-                      天才会出现生成按钮——天数不够时不给一份看不出东西的报告。
+                    ) : null}
+                    <p className="text-[11px] leading-relaxed text-gray-400 dark:text-neutral-500">
+                      报告包含：观看趋势、时段分布、UP 主 Top5、关注变动。
                     </p>
-                  )}
+                    <p className="mt-1 text-[11px] text-gray-400 dark:text-neutral-500">
+                      已记录 {reportAvailability.coverageDays} 天
+                    </p>
+                  </div>
                 </div>
               </div>
             </Panel>
@@ -2237,11 +2328,9 @@ export const Dashboard = () => {
                         value: formatDateTime(nextRunAt ?? undefined),
                       },
                       {
-                        label: "头像归档",
-                        value:
-                          archiveProgress && archiveProgress.remaining > 0
-                            ? `${avatarAssetCount} 张 · 待归档 ${archiveProgress.remaining}`
-                            : `${avatarAssetCount} 张`,
+                        label: "头像缓存（历史）",
+                        value: `${avatarAssetCount} 张`,
+                        tip: "旧版本保存的头像图片；现在头像只保存最后一次真实地址，不再下载图片字节。",
                       },
                       {
                         label: "封面归档",

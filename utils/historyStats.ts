@@ -478,6 +478,9 @@ export const buildTopAuthors = (
       recentVideos: value.recentContents.size,
       lastViewedAt: value.lastViewedAt > 0 ? value.lastViewedAt : null,
     }))
+    // 「最近在看的」只保留窗口内真正看过的作者。否则近期只有 2 个人有记录时，
+    // 榜单仍会补到 5 行，后 3 行显示「0 个视频」，看起来像统计出错。
+    .filter((author) => recentSinceSec <= 0 || author.recentVideos > 0)
     .sort((a, b) => {
       // 近期优先：不传窗口时 recentVideos 等于 uniqueContents，等价于按视频数排序
       if (b.recentVideos !== a.recentVideos) return b.recentVideos - a.recentVideos;

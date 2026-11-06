@@ -3,7 +3,7 @@ import toast from "react-hot-toast";
 import { BadgeCheck, ChevronDown, RefreshCw, Search, Users, Wand2, X } from "lucide-react";
 import { Pagination } from "../components/Pagination";
 import { NameHistoryPopover } from "../components/NameHistoryPopover";
-import { createAssetObjectUrl } from "../utils/assetArchive";
+import { isPlaceholderImage } from "../utils/imageUrl";
 import {
   DEFAULT_THIRD_PARTY_NAME_LOOKUP_ENABLED,
   FOLLOWING_LAST_SYNC,
@@ -79,39 +79,24 @@ const statusBadgeClass = (status: FollowingItem["status"]): string => {
 };
 
 /**
- * 头像：优先用本地归档的字节，其次回退原始 URL，最后回退占位图。
- * UP 主注销后 B 站会把头像换成 noface.jpg，届时归档的字节仍然可用。
+ * 头像：只使用 URL，不读本地图片字节。
+ *
+ * - 仍在关注：优先当前头像地址，UP 主换头像后立即跟随
+ * - 已注销/已取关：使用最后一次真实头像地址（avatarSourceUrl）
+ * - 地址失效或没有记录：回退默认头像
  */
 const FollowingAvatar = ({ item, size = 64 }: { item: FollowingItem; size?: number }) => {
-  const [assetUrl, setAssetUrl] = useState<string | null>(null);
+  const [failed, setFailed] = useState(false);
 
   useEffect(() => {
-    let active = true;
-    let created: string | null = null;
+    setFailed(false);
+  }, [item.mid, item.face, item.avatarSourceUrl, item.status]);
 
-    if (item.avatarAssetId) {
-      createAssetObjectUrl(item.avatarAssetId)
-        .then((url) => {
-          if (!url) return;
-          if (!active) {
-            URL.revokeObjectURL(url);
-            return;
-          }
-          created = url;
-          setAssetUrl(url);
-        })
-        .catch(() => undefined);
-    } else {
-      setAssetUrl(null);
-    }
-
-    return () => {
-      active = false;
-      if (created) URL.revokeObjectURL(created);
-    };
-  }, [item.avatarAssetId]);
-
-  const fallback = item.face ? item.face.replace(/^http:/, "https:") : "/noface.jpg";
+  const currentFace = item.face && !isPlaceholderImage(item.face) ? item.face : "";
+  // 已注销后 face 会被 B 站替换成 noface；这时必须用注销前保存的地址。
+  const source =
+    item.status === "following" ? currentFace || item.avatarSourceUrl || "" : item.avatarSourceUrl || currentFace;
+  const src = !failed && source ? source.replace(/^http:/, "https:") : "/noface.jpg";
 
   return (
     /* 悬停放大：外层 div 保持原始尺寸，所以卡片排版不会跳动；
@@ -119,15 +104,12 @@ const FollowingAvatar = ({ item, size = 64 }: { item: FollowingItem; size?: numb
        z-index 只在悬停时抬起，否则放大后的头像会被相邻卡片盖住。 */
     <div className="group/avatar relative shrink-0" style={{ width: size, height: size }}>
       <img
-        src={assetUrl ?? fallback}
+        src={src}
         alt=""
         loading="lazy"
         style={{ width: size, height: size }}
         className="relative z-0 block rounded-full object-cover transition-transform duration-200 ease-out group-hover/avatar:z-20 group-hover/avatar:scale-150 group-hover/avatar:shadow-lg group-hover/avatar:ring-2 group-hover/avatar:ring-pink-300 motion-reduce:transition-none dark:group-hover/avatar:ring-pink-500/60"
-        onError={(event) => {
-          const image = event.currentTarget;
-          if (!image.src.endsWith("noface.jpg")) image.src = "/noface.jpg";
-        }}
+        onError={() => setFailed(true)}
       />
     </div>
   );

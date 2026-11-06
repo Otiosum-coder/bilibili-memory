@@ -1,24 +1,32 @@
-import { useState, useEffect } from "react";
+import { useState, useEffect, useLayoutEffect, useRef } from "react";
 import {
-  AlertTriangle,
-  ArrowDown,
-  ArrowUp,
   Check,
   ChevronDown,
+  GripVertical,
   HardDrive,
+  LoaderCircle,
+  RotateCcw,
   RefreshCw,
+  ShieldAlert,
 } from "lucide-react";
-import { clearAllDatabaseTables, clearAssetsByKind, getTotalHistoryCount } from "../utils/db";
+import {
+  clearAllDatabaseTables,
+  clearAssetsByKind,
+  getAllFavFolders,
+  getTotalHistoryCount,
+} from "../utils/db";
 import type { AssetKind } from "../utils/types";
 import { getStorageValue, setStorageValue } from "../utils/storage";
 import {
-  IS_SYNC_DELETE,
   SYNC_INTERVAL,
-  IS_SYNC_DELETE_FROM_BILIBILI,
   HIDE_USER_INFO,
   HIDDEN_MENUS,
   SIDEBAR_MENU_ORDER,
   HISTORY_EVENT_MIGRATION_REPORT,
+  HISTORY_LAST_SYNC,
+  FOLLOWING_LAST_SYNC,
+  FAVORITES_LAST_SYNC,
+  INTERACTIONS_LAST_SYNC,
   FOLLOWING_AUTO_SYNC_ENABLED,
   FOLLOWING_SYNC_INTERVAL,
   FAVORITES_AUTO_SYNC_ENABLED,
@@ -36,22 +44,11 @@ import {
   THIRD_PARTY_NAME_LOOKUP_CONSENT,
 } from "../utils/constants";
 import toast from "react-hot-toast";
-import { Checkbox } from "../components/Checkbox";
-import { Select } from "../components/Select";
 import { HIDEABLE_MENU_TITLES, SIDEBAR_MENU_TITLES } from "../components/Sidebar";
 import { checkStorageHealth, formatStorageSize, StorageHealthReport } from "../utils/storageHealth";
 import { buildStorageBreakdown, type StorageBreakdown } from "../utils/storageBreakdown";
 import { StorageBreakdownModal } from "../components/StorageBreakdownModal";
-
-/**
- * 危险操作的反悔窗口（秒）。
- *
- * 重置扩展会清空整个 IndexedDB 与全部配置，没法"做完了再撤销"——
- * 真撤销就得先把几十 MB 数据快照下来，既慢又脆。所以改成**推迟执行**：
- * 确认后先走倒计时，这段时间里点「撤销」就当作没发生过。
- * 同样思路也适用于删记录时同步删 B站 记录（B站 没有"加回历史"的接口，删了就没了）。
- */
-const RESET_UNDO_SECONDS = 5;
+import { Checkbox } from "../components/Checkbox";
 
 /**
  * 历史记录同步间隔预设。
@@ -118,14 +115,86 @@ const normalizeMenuOrder = (stored: string[]): string[] => {
   return [...kept, ...missing];
 };
 
+type SettingsSyncKey = "history" | "following" | "favorites" | "interactions";
+type DangerAction = "defaults" | "data" | "reset";
+
+const DANGER_COPY: Record<
+  DangerAction,
+  { title: string; description: string; confirmWord: string; button: string }
+> = {
+  defaults: {
+    title: "恢复默认设置",
+    description:
+      "只清空偏好设置：同步间隔、第三方查询开关、侧边栏顺序、WebDAV 凭据等。历史记录、收藏、关注等本地数据不会删除。",
+    confirmWord: "恢复",
+    button: "恢复默认设置",
+  },
+  data: {
+    title: "清除全部本地数据",
+    description:
+      "清空 IndexedDB 中的历史记录、收藏、关注、消失档案和图片归档。偏好设置会保留，操作不可撤销。",
+    confirmWord: "清除",
+    button: "清除本地数据",
+  },
+  reset: {
+    title: "彻底重置扩展",
+    description:
+      "清空全部本地数据和偏好设置，包括 WebDAV 凭据。已授权的本地备份目录本身会保留，但需要重新配置。",
+    confirmWord: "重置",
+    button: "彻底重置",
+  },
+};
+
+const formatSyncTime = (timestamp: number | null): string => {
+  if (!timestamp) return "尚未同步";
+  return new Date(timestamp).toLocaleString("zh-CN", {
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    hour12: false,
+  });
+};
+
+const formatNextSync = (
+  timestamp: number | null,
+  intervalMinutes: number,
+  enabled = true,
+): string => {
+  if (!enabled) return "自动同步已关闭";
+  if (!timestamp || !Number.isFinite(intervalMinutes) || intervalMinutes <= 0) return "等待首次同步";
+  return `约 ${new Date(timestamp + intervalMinutes * 60_000).toLocaleString("zh-CN", {
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    hour12: false,
+  })}`;
+};
+
 const Settings = () => {
-  const [showConfirmDialog, setShowConfirmDialog] = useState(false);
-  const [resetCountdown, setResetCountdown] = useState<number | null>(null);
-  const [isSyncDelete, setIsSyncDelete] = useState(false);
-  const [isSyncDeleteFromBilibili, setIsSyncDeleteFromBilibili] = useState(false);
+  const [dangerAction, setDangerAction] = useState<DangerAction | null>(null);
+  const [dangerConfirmText, setDangerConfirmText] = useState("");
+  const [syncBusy, setSyncBusy] = useState<Record<SettingsSyncKey, boolean>>({
+    history: false,
+    following: false,
+    favorites: false,
+    interactions: false,
+  });
+  const [lastSyncMap, setLastSyncMap] = useState<Record<SettingsSyncKey, number | null>>({
+    history: null,
+    following: null,
+    favorites: null,
+    interactions: null,
+  });
   const [isHideUserInfo, setIsHideUserInfo] = useState(false);
   const [hiddenMenus, setHiddenMenus] = useState<string[]>([]);
   const [menuOrder, setMenuOrder] = useState<string[]>(SIDEBAR_MENU_TITLES);
+  const [draggedMenu, setDraggedMenu] = useState<string | null>(null);
+  const menuItemRefs = useRef<Map<string, HTMLLIElement>>(new Map());
+  const previousMenuRects = useRef<Map<string, number>>(new Map());
+  const menuOrderRef = useRef(menuOrder);
+  const menuOrderDirtyRef = useRef(false);
 
   const [favAutoSync, setFavAutoSync] = useState<boolean>(DEFAULT_FAV_AUTO_SYNC_ENABLED);
   const [favIntervalMinutes, setFavIntervalMinutes] = useState<number>(
@@ -190,6 +259,18 @@ const Settings = () => {
         HISTORY_EVENT_MIGRATION_REPORT,
         {},
       );
+      const [historyLast, followingLast, favoritesLast, interactionsLast] = await Promise.all([
+        getStorageValue<number | null>(HISTORY_LAST_SYNC, null),
+        getStorageValue<number | null>(FOLLOWING_LAST_SYNC, null),
+        getStorageValue<number | null>(FAVORITES_LAST_SYNC, null),
+        getStorageValue<number | null>(INTERACTIONS_LAST_SYNC, null),
+      ]);
+      setLastSyncMap({
+        history: historyLast,
+        following: followingLast,
+        favorites: favoritesLast,
+        interactions: interactionsLast,
+      });
       setHistoryMigrationSkipped(Number(migrationReport.skipped) || 0);
       if (showSuccess) toast.success("存储保护状态已刷新");
     } catch (error) {
@@ -244,25 +325,9 @@ const Settings = () => {
     return outcome;
   };
 
-  // 倒计时：每秒减一，归零才真正执行
-  useEffect(() => {
-    if (resetCountdown === null) return;
-    if (resetCountdown <= 0) {
-      void executeReset();
-      return;
-    }
-    const timer = window.setTimeout(
-      () => setResetCountdown((current) => (current === null ? null : current - 1)),
-      1000,
-    );
-    return () => window.clearTimeout(timer);
-  }, [resetCountdown]);
-
   useEffect(() => {
     // 加载设置
     const loadSettings = async () => {
-      const syncDelete = await getStorageValue(IS_SYNC_DELETE, false);
-      const syncDeleteFromBilibili = await getStorageValue(IS_SYNC_DELETE_FROM_BILIBILI, false);
       const hideUserInfo = await getStorageValue(HIDE_USER_INFO, false);
       const menus = await getStorageValue<string[]>(HIDDEN_MENUS, []);
       const storedOrder = await getStorageValue<string[]>(SIDEBAR_MENU_ORDER, []);
@@ -296,8 +361,6 @@ const Settings = () => {
         {},
       );
 
-      setIsSyncDelete(syncDelete);
-      setIsSyncDeleteFromBilibili(syncDeleteFromBilibili);
       setIsHideUserInfo(hideUserInfo);
       setHiddenMenus(
         menus.includes("WebDAV") && !menus.includes("数据备份") ? [...menus, "数据备份"] : menus,
@@ -336,27 +399,121 @@ const Settings = () => {
     void refreshStorageHealth();
   }, []);
 
-  const handleSyncDeleteChange = async (e: React.ChangeEvent<HTMLInputElement>) => {
-    const newValue = e.target.checked;
-    setIsSyncDelete(newValue);
-    await setStorageValue(IS_SYNC_DELETE, newValue);
+  useEffect(() => {
+    menuOrderRef.current = menuOrder;
+  }, [menuOrder]);
+
+  /** 记录重排前每一行的布局位置，供下方的 FLIP 动画计算位移 */
+  const captureMenuRects = () => {
+    const positions = new Map<string, number>();
+    menuItemRefs.current.forEach((element, title) => {
+      // offsetTop 不受正在进行的 transform 影响，连续拖动时不会把动画中途位置当成起点。
+      positions.set(title, element.offsetTop);
+    });
+    previousMenuRects.current = positions;
   };
 
-  const handleSyncDeleteFromBilibiliChange = async (e: React.ChangeEvent<HTMLInputElement>) => {
-    const newValue = e.target.checked;
-    setIsSyncDeleteFromBilibili(newValue);
-    await setStorageValue(IS_SYNC_DELETE_FROM_BILIBILI, newValue);
+  /**
+   * FLIP：重排后先让每行瞬间回到旧位置，再用 transform 动画滑到新位置。
+   * 这样拖动时其他行会真实地上下让位，而不是只画一个目标高亮。
+   */
+  useLayoutEffect(() => {
+    const previous = previousMenuRects.current;
+    if (previous.size === 0) return;
+    previousMenuRects.current = new Map();
+
+    const timers: number[] = [];
+    menuItemRefs.current.forEach((element, title) => {
+      const before = previous.get(title);
+      if (before === undefined) return;
+      const after = element.offsetTop;
+      const offset = before - after;
+      if (Math.abs(offset) < 1) return;
+
+      element.style.transition = "none";
+      element.style.transform = `translateY(${offset}px)`;
+      // 强制读取一次布局，确保浏览器把旧位置作为动画起点。
+      void element.offsetHeight;
+      element.style.transition = "transform 180ms cubic-bezier(0.2, 0, 0, 1)";
+      element.style.transform = "";
+
+      timers.push(
+        window.setTimeout(() => {
+          element.style.transition = "";
+          element.style.transform = "";
+        }, 220),
+      );
+    });
+
+    return () => {
+      timers.forEach((timer) => window.clearTimeout(timer));
+    };
+  }, [menuOrder]);
+
+  const persistMenuOrder = (next: string[]) => {
+    menuOrderRef.current = next;
+    void setStorageValue(SIDEBAR_MENU_ORDER, next);
   };
 
-  /** 上移 / 下移一位并落盘。侧边栏订阅了 storage 变化，所以立即生效、无需刷新 */
-  const moveMenuItem = async (index: number, delta: number) => {
-    const target = index + delta;
-    if (target < 0 || target >= menuOrder.length) return;
-    const next = [...menuOrder];
-    const [moved] = next.splice(index, 1);
-    next.splice(target, 0, moved);
+  const handleMenuDragStart = (event: React.DragEvent<HTMLElement>, title: string) => {
+    const row = menuItemRefs.current.get(title);
+    if (row) {
+      // 用原行做拖动图，但把抓取点换算成行内坐标：
+      // 手抓在右侧手柄时，拖动图仍然从原来的左边缘开始，而不是跳到鼠标右侧。
+      const rect = row.getBoundingClientRect();
+      const grabX = Math.max(0, Math.min(rect.width, event.clientX - rect.left));
+      const grabY = Math.max(0, Math.min(rect.height, event.clientY - rect.top));
+      event.dataTransfer.setDragImage(row, grabX, grabY);
+    }
+    setDraggedMenu(title);
+    menuOrderDirtyRef.current = false;
+    captureMenuRects();
+    event.dataTransfer.effectAllowed = "move";
+    event.dataTransfer.setData("text/plain", title);
+  };
+
+  const handleMenuDragOver = (event: React.DragEvent<HTMLElement>, title: string) => {
+    event.preventDefault();
+    event.dataTransfer.dropEffect = "move";
+    if (!draggedMenu || draggedMenu === title) return;
+
+    const target = menuItemRefs.current.get(title);
+    if (!target) return;
+
+    const rect = target.getBoundingClientRect();
+    const dropAfter = event.clientY > rect.top + rect.height / 2;
+    const from = menuOrderRef.current.indexOf(draggedMenu);
+    const over = menuOrderRef.current.indexOf(title);
+    if (from < 0 || over < 0) return;
+
+    let insertAt = dropAfter ? over + 1 : over;
+    if (insertAt > from) insertAt -= 1;
+    if (insertAt === from) return;
+
+    captureMenuRects();
+    const next = [...menuOrderRef.current];
+    const [moved] = next.splice(from, 1);
+    next.splice(insertAt, 0, moved);
+    menuOrderRef.current = next;
+    menuOrderDirtyRef.current = true;
     setMenuOrder(next);
-    await setStorageValue(SIDEBAR_MENU_ORDER, next);
+  };
+
+  const handleMenuDrop = (event: React.DragEvent<HTMLElement>) => {
+    event.preventDefault();
+    if (menuOrderDirtyRef.current) {
+      persistMenuOrder(menuOrderRef.current);
+      menuOrderDirtyRef.current = false;
+    }
+    setDraggedMenu(null);
+  };
+
+  const handleMenuDragEnd = () => {
+    if (menuOrderDirtyRef.current) {
+      persistMenuOrder(menuOrderRef.current);
+      menuOrderDirtyRef.current = false;
+    }
+    setDraggedMenu(null);
   };
 
   const handleFollowingAutoSyncChange = async (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -466,78 +623,130 @@ const Settings = () => {
     }
   };
 
-  /** 确认后不立刻执行，先给一个可反悔的倒计时窗口 */
-  const startResetCountdown = () => {
-    setShowConfirmDialog(false);
-    setResetCountdown(RESET_UNDO_SECONDS);
+  const runManualSync = async (key: SettingsSyncKey) => {
+    if (syncBusy[key]) return;
+    setSyncBusy((current) => ({ ...current, [key]: true }));
+    try {
+      let response: { success?: boolean; error?: string; message?: string } | undefined;
+      if (key === "history") {
+        response = await browser.runtime.sendMessage({ action: "syncHistory", isFullSync: false });
+      } else if (key === "following") {
+        response = await browser.runtime.sendMessage({ action: "syncFollowing" });
+      } else if (key === "interactions") {
+        response = await browser.runtime.sendMessage({ action: "syncInteractions" });
+      } else {
+        const folders = await getAllFavFolders();
+        if (folders.length === 0) {
+          toast.error("还没有收藏夹，请先在收藏夹页同步一次");
+          return;
+        }
+        response = await browser.runtime.sendMessage({
+          action: "syncAllFavoriteFolders",
+          folders: folders.map((folder) => ({ id: folder.id, title: folder.title })),
+          isFullSync: false,
+        });
+      }
+
+      if (response?.success === false) {
+        throw new Error(response.error || "同步失败");
+      }
+
+      const now = Date.now();
+      setLastSyncMap((current) => ({ ...current, [key]: now }));
+      const storageKey =
+        key === "history"
+          ? HISTORY_LAST_SYNC
+          : key === "following"
+            ? FOLLOWING_LAST_SYNC
+            : key === "favorites"
+              ? FAVORITES_LAST_SYNC
+              : INTERACTIONS_LAST_SYNC;
+      await setStorageValue(storageKey, now);
+      toast.success(response?.message || "同步完成");
+    } catch (error) {
+      console.error("手动同步失败:", error);
+      toast.error(error instanceof Error ? error.message : "同步失败，请稍后重试");
+    } finally {
+      setSyncBusy((current) => ({ ...current, [key]: false }));
+    }
   };
 
-  const cancelReset = () => {
-    setResetCountdown(null);
-    toast.success("已撤销，数据没有任何变化");
-  };
+  const executeDangerAction = async () => {
+    if (!dangerAction) return;
+    const copy = DANGER_COPY[dangerAction];
+    if (dangerConfirmText.trim() !== copy.confirmWord) return;
 
-  const executeReset = async () => {
-    setResetCountdown(null);
     try {
       setIsResetLoading(true);
       setResetSucceeded(false);
-      setResetStatus("正在清空本地数据...");
-      await clearAllDatabaseTables();
-      setResetStatus("正在清理偏好设置...");
-      await browser.storage.local.clear();
-      setResetStatus("正在完成重置...");
+
+      if (dangerAction === "defaults") {
+        setResetStatus("正在恢复默认设置...");
+        await browser.storage.local.clear();
+        setResetResult("默认设置已恢复，本地数据没有删除。");
+      } else if (dangerAction === "data") {
+        setResetStatus("正在清除本地数据...");
+        await clearAllDatabaseTables();
+        setResetResult("本地数据已清除，偏好设置保留。");
+      } else {
+        setResetStatus("正在清除本地数据...");
+        await clearAllDatabaseTables();
+        setResetStatus("正在清理偏好设置...");
+        await browser.storage.local.clear();
+        setResetResult("彻底重置完成，本地数据与设置已清空。");
+      }
+
       setResetSucceeded(true);
-      setResetResult("重置完成，本地数据与设置已清空。");
+      setDangerAction(null);
+      setDangerConfirmText("");
     } catch (error) {
-      console.error("重置扩展失败:", error);
+      console.error("执行清理操作失败:", error);
       setResetSucceeded(false);
-      setResetResult(error instanceof Error ? error.message : "重置失败，请重试！");
+      setResetResult(error instanceof Error ? error.message : "操作失败，请重试");
     } finally {
       setIsResetLoading(false);
       setResetStatus("");
       setShowResetResultDialog(true);
-      setShowConfirmDialog(false);
     }
   };
 
   return (
-    <div className="p-6 pb-20 min-h-screen bg-gray-50/30 dark:bg-[#0a0a0a] text-gray-900 dark:text-neutral-100 max-w-7xl mx-auto">
-      <div className="grid grid-cols-1 md:grid-cols-2 gap-6 items-start">
-        {/* 左列：数据与存储管理 */}
+    <div className="p-6 pb-20 min-h-screen bg-gray-50/30 dark:bg-[#0a0a0a] text-gray-900 dark:text-neutral-100 max-w-6xl mx-auto">
+      <div className="mb-6">
+        <h1 className="text-xl font-bold text-gray-900 dark:text-neutral-100">设置</h1>
+        <p className="mt-1 text-sm text-gray-500 dark:text-neutral-400">
+          数据、同步与界面偏好。改动会立即生效，不需要保存。
+        </p>
+      </div>
+
+      <div className="grid grid-cols-1 gap-6 items-start lg:grid-cols-2">
         <div className="space-y-6">
-          <div className="border-b border-gray-200 dark:border-neutral-800 pb-2 mb-4">
-            <h2 className="text-base font-bold text-gray-800 dark:text-neutral-200 flex items-center gap-2">
-              <HardDrive className="w-5 h-5 text-blue-500" />
-              数据与存储管理
+          <div className="border-b border-gray-200 pb-2 dark:border-neutral-800">
+            <h2 className="flex items-center gap-2 text-base font-bold text-gray-800 dark:text-neutral-200">
+              <HardDrive className="h-5 w-5 text-blue-500" />
+              数据与存储
             </h2>
           </div>
 
-          {/* Edge/Chromium 存储保护 */}
-          <div className="w-full rounded-xl bg-gray-50 dark:bg-neutral-900 shadow-sm border border-gray-100 dark:border-neutral-800">
+          <div className="w-full rounded-xl border border-gray-100 bg-gray-50 shadow-sm dark:border-neutral-800 dark:bg-neutral-900">
             <div className="p-5">
-              <div className="flex items-start justify-between gap-4 mb-5">
-                <div className="flex items-start gap-3">
-                  <div className="p-2 rounded-lg bg-blue-50 dark:bg-blue-500/10 text-blue-600 dark:text-blue-400">
-                    <HardDrive className="w-5 h-5" />
-                  </div>
-                  <div>
-                    <h3 className="text-lg font-bold text-gray-800 dark:text-neutral-100 mb-1">
-                      本地存储保护
-                    </h3>
-                    <p className="text-sm text-gray-500 dark:text-neutral-400">
-                      检查 IndexedDB 持久化状态和可用容量
-                    </p>
-                  </div>
+              <div className="mb-5 flex items-start justify-between gap-4">
+                <div>
+                  <h3 className="text-base font-bold text-gray-800 dark:text-neutral-100">
+                    本地存储保护
+                  </h3>
+                  <p className="mt-1 text-xs text-gray-500 dark:text-neutral-400">
+                    检查 IndexedDB 持久化状态和浏览器可用容量
+                  </p>
                 </div>
                 <button
                   type="button"
                   onClick={() => void refreshStorageHealth(true)}
                   disabled={isCheckingStorage}
-                  className="p-2 rounded-lg text-gray-500 dark:text-neutral-400 hover:text-blue-600 dark:hover:text-blue-400 hover:bg-blue-50 dark:hover:bg-blue-500/10 transition-colors disabled:opacity-50"
+                  className="rounded-lg p-2 text-gray-500 transition-colors hover:bg-blue-50 hover:text-blue-600 disabled:opacity-50 dark:text-neutral-400 dark:hover:bg-blue-500/10 dark:hover:text-blue-400"
                   title="刷新存储保护状态"
                 >
-                  <RefreshCw className={`w-4 h-4 ${isCheckingStorage ? "animate-spin" : ""}`} />
+                  <RefreshCw className={`h-4 w-4 ${isCheckingStorage ? "animate-spin" : ""}`} />
                 </button>
               </div>
 
@@ -584,60 +793,46 @@ const Settings = () => {
                     </span>
                   </div>
 
-                  {/* 明细入口。上面的"当前使用量"是整个站点的总量（含缓存等），
-                      看不出本扩展到底把空间花在哪，所以单给一个按类别拆开的入口。 */}
-                  <div className="flex items-center justify-between gap-3 border-t border-gray-100 pt-3 dark:border-neutral-800">
-                    <span className="min-w-0 text-xs leading-relaxed text-gray-500 dark:text-neutral-400">
-                      「当前使用量」是整个站点的总量，含不属于本扩展的缓存。
-                      想看本扩展的空间花在哪、以及清理图片归档，点右侧。
-                    </span>
-                    <button
-                      type="button"
-                      onClick={() => void handleOpenBreakdown()}
-                      className="shrink-0 rounded-full border border-gray-200 px-3 py-1 text-xs text-gray-600 transition-colors hover:border-pink-300 hover:text-pink-500 dark:border-neutral-700 dark:text-neutral-300 dark:hover:border-pink-500/50 dark:hover:text-pink-400"
-                    >
-                      查看存储明细
-                    </button>
-                  </div>
+                  <p className="border-t border-gray-100 pt-3 text-xs leading-relaxed text-gray-500 dark:border-neutral-800 dark:text-neutral-400">
+                    「当前使用量」是浏览器统计的整个扩展占用，包含数据库和文件开销；
+                    本扩展业务数据的估算请查看「存储明细」。
+                  </p>
+                  <button
+                    type="button"
+                    onClick={() => void handleOpenBreakdown()}
+                    className="w-full rounded-lg border border-gray-200 px-3 py-2 text-sm text-gray-700 transition-colors hover:border-pink-300 hover:text-pink-600 dark:border-neutral-700 dark:text-neutral-200 dark:hover:border-pink-500/50 dark:hover:text-pink-300"
+                  >
+                    查看存储明细
+                  </button>
 
-                  {storageHealth.unlimitedStorageGranted && !storageHealth.persisted && (
-                    <div className="rounded-lg border border-blue-200 dark:border-blue-500/20 bg-blue-50 dark:bg-blue-500/10 px-3 py-2 text-blue-700 dark:text-blue-300">
-                      unlimitedStorage
-                      权限已生效。浏览器未单独标记持久化存储不影响扩展存储保护，无需手动授权。
-                    </div>
-                  )}
-
-                  {!storageHealth.storageProtected && (
-                    <div className="rounded-lg border border-amber-200 dark:border-amber-500/20 bg-amber-50 dark:bg-amber-500/10 px-3 py-2 text-amber-700 dark:text-amber-300">
-                      未检测到 unlimitedStorage
-                      权限或浏览器持久化存储。请先重新加载扩展，并建议定期导出 JSON 或配置 WebDAV
-                      备份。
-                    </div>
-                  )}
-
+                  {storageHealth.unlimitedStorageGranted && !storageHealth.persisted ? (
+                    <p className="rounded-lg border border-blue-200 bg-blue-50 px-3 py-2 text-xs text-blue-700 dark:border-blue-500/20 dark:bg-blue-500/10 dark:text-blue-300">
+                      unlimitedStorage 权限已生效；浏览器未单独标记持久化存储不影响扩展存储保护。
+                    </p>
+                  ) : null}
+                  {!storageHealth.storageProtected ? (
+                    <p className="rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-700 dark:border-amber-500/20 dark:bg-amber-500/10 dark:text-amber-300">
+                      未检测到 unlimitedStorage 权限或持久化存储，请重新加载扩展，并定期备份。
+                    </p>
+                  ) : null}
                   {(storageHealth.errors.length > 0 || storageHealthError) && (
-                    <div className="rounded-lg border border-red-200 dark:border-red-500/20 bg-red-50 dark:bg-red-500/10 px-3 py-2 text-red-700 dark:text-red-300">
-                      存储状态检测出现异常：
+                    <p className="rounded-lg border border-red-200 bg-red-50 px-3 py-2 text-xs text-red-700 dark:border-red-500/20 dark:bg-red-500/10 dark:text-red-300">
+                      存储状态检测异常：
                       {storageHealthError ||
                         storageHealth.errors.map((error) => error.name).join("、")}
-                      。建议立即导出 JSON 或检查 WebDAV 备份。
-                    </div>
+                    </p>
                   )}
-
-                  {storageHealth.lastWarning && (
-                    <div className="rounded-lg border border-red-200 dark:border-red-500/20 bg-red-50 dark:bg-red-500/10 px-3 py-2 text-red-700 dark:text-red-300">
-                      最近一次存储写入异常：{storageHealth.lastWarning.name}（
-                      {new Date(storageHealth.lastWarning.timestamp).toLocaleString()}
-                      ）。建议立即检查备份。
-                    </div>
-                  )}
-
-                  {historyMigrationSkipped > 0 && (
-                    <div className="rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-amber-700 dark:border-amber-500/20 dark:bg-amber-500/10 dark:text-amber-300">
-                      数据升级时有 {historyMigrationSkipped}
-                      条历史记录因字段不完整未转换为观看事件。原始记录仍保留，建议先导出备份。
-                    </div>
-                  )}
+                  {storageHealth.lastWarning ? (
+                    <p className="rounded-lg border border-red-200 bg-red-50 px-3 py-2 text-xs text-red-700 dark:border-red-500/20 dark:bg-red-500/10 dark:text-red-300">
+                      最近一次写入异常：{storageHealth.lastWarning.name}（
+                      {new Date(storageHealth.lastWarning.timestamp).toLocaleString()}）
+                    </p>
+                  ) : null}
+                  {historyMigrationSkipped > 0 ? (
+                    <p className="rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-700 dark:border-amber-500/20 dark:bg-amber-500/10 dark:text-amber-300">
+                      数据升级时有 {historyMigrationSkipped} 条历史记录字段不完整，原始记录仍保留。
+                    </p>
+                  ) : null}
                 </div>
               ) : (
                 <p className="text-sm text-gray-500 dark:text-neutral-400">
@@ -647,106 +842,113 @@ const Settings = () => {
             </div>
           </div>
 
-          {/* 危险区：把不可逆操作集中隔离。
-              此前「同步删除」排在右栏「同步与界面偏好」里、只有一行小字说明，
-              而它实际会调用 B站 接口永久删掉账号里的观看记录；重置扩展同样不可逆。 */}
           <div className="w-full rounded-xl border border-red-200 bg-red-50/40 dark:border-red-500/30 dark:bg-red-500/5">
             <div className="border-b border-red-100 p-5 dark:border-red-500/20">
               <h3 className="flex items-center gap-2 text-base font-bold text-red-700 dark:text-red-300">
-                <AlertTriangle className="h-4 w-4" />
-                危险操作
+                <ShieldAlert className="h-4 w-4" />
+                高级操作
               </h3>
               <p className="mt-1 text-xs leading-relaxed text-red-600/90 dark:text-red-300/80">
-                下面这些操作不可逆。重置有 {RESET_UNDO_SECONDS} 秒反悔时间，删除类操作请确认后再开启。
+                这些操作会清空本地数据或设置，执行后不能撤销，需要手动输入确认。
               </p>
             </div>
-
-            <div className="space-y-5 p-5">
-              <div className="flex items-start justify-between gap-4">
-                <div className="min-w-0">
+            <div className="divide-y divide-red-100/80 dark:divide-red-500/20">
+              <div className="flex items-start justify-between gap-4 p-5">
+                <div>
                   <p className="text-sm font-medium text-gray-800 dark:text-neutral-100">
-                    删除本地记录时，同时删除 B站 上的记录
+                    恢复默认设置
                   </p>
                   <p className="mt-1 text-xs leading-relaxed text-gray-500 dark:text-neutral-400">
-                    开启后，在「历史记录」页删除一条记录会调用 B站 接口，把这条记录从你的 B站
-                    账号里删掉，
-                    <span className="font-medium text-red-600 dark:text-red-300">无法恢复</span>
-                    。默认关闭。
-                  </p>
-                </div>
-                <label className="relative mt-1 inline-flex shrink-0 cursor-pointer items-center">
-                  <input
-                    type="checkbox"
-                    className="sr-only peer"
-                    checked={isSyncDelete}
-                    onChange={handleSyncDeleteChange}
-                  />
-                  <div className="h-6 w-11 rounded-full bg-gray-200 after:absolute after:left-[2px] after:top-[2px] after:h-5 after:w-5 after:rounded-full after:border after:border-gray-300 after:bg-white after:transition-all after:content-[''] peer peer-checked:after:translate-x-full peer-checked:after:border-white peer-checked:bg-red-600 peer-focus:outline-none dark:bg-neutral-700 dark:after:border-neutral-600"></div>
-                </label>
-              </div>
-
-              <div className="flex items-start justify-between gap-4">
-                <div className="min-w-0">
-                  <p className="text-sm font-medium text-gray-800 dark:text-neutral-100">
-                    B站 上删除记录时，同时删除本地记录
-                  </p>
-                  <p className="mt-1 text-xs leading-relaxed text-gray-500 dark:text-neutral-400">
-                    你在 B站 网页端删掉一条观看记录后，本地该内容的全部观看记录也会被删除。
-                    默认关闭。
-                  </p>
-                </div>
-                <label className="relative mt-1 inline-flex shrink-0 cursor-pointer items-center">
-                  <input
-                    type="checkbox"
-                    className="sr-only peer"
-                    checked={isSyncDeleteFromBilibili}
-                    onChange={handleSyncDeleteFromBilibiliChange}
-                  />
-                  <div className="h-6 w-11 rounded-full bg-gray-200 after:absolute after:left-[2px] after:top-[2px] after:h-5 after:w-5 after:rounded-full after:border after:border-gray-300 after:bg-white after:transition-all after:content-[''] peer peer-checked:after:translate-x-full peer-checked:after:border-white peer-checked:bg-red-600 peer-focus:outline-none dark:bg-neutral-700 dark:after:border-neutral-600"></div>
-                </label>
-              </div>
-
-              <div className="flex items-start justify-between gap-4 border-t border-red-100 pt-5 dark:border-red-500/20">
-                <div className="min-w-0">
-                  <p className="text-sm font-medium text-gray-800 dark:text-neutral-100">重置扩展</p>
-                  <p className="mt-1 text-xs leading-relaxed text-gray-500 dark:text-neutral-400">
-                    清空全部本地数据与设置：历史记录、收藏、关注，以及 WebDAV 凭据。
-                    仅保留本地备份目录授权。确认后有 {RESET_UNDO_SECONDS} 秒可以撤销。
+                    只清空同步、界面与备份配置，本地记录保留。
                   </p>
                 </div>
                 <button
                   type="button"
-                  onClick={() => setShowConfirmDialog(true)}
-                  disabled={isResetLoading}
-                  className="shrink-0 rounded-lg border border-red-300 bg-white px-4 py-2 text-sm font-medium text-red-600 transition-colors hover:bg-red-50 disabled:opacity-50 dark:border-red-500/40 dark:bg-transparent dark:text-red-300 dark:hover:bg-red-500/10"
+                  onClick={() => {
+                    setDangerAction("defaults");
+                    setDangerConfirmText("");
+                  }}
+                  className="shrink-0 rounded-lg border border-gray-300 bg-white px-3 py-1.5 text-sm text-gray-700 transition-colors hover:bg-gray-50 dark:border-neutral-600 dark:bg-transparent dark:text-neutral-200 dark:hover:bg-neutral-800"
                 >
-                  重置扩展
+                  重置设置
+                </button>
+              </div>
+              <div className="flex items-start justify-between gap-4 p-5">
+                <div>
+                  <p className="text-sm font-medium text-gray-800 dark:text-neutral-100">
+                    清除全部本地数据
+                  </p>
+                  <p className="mt-1 text-xs leading-relaxed text-gray-500 dark:text-neutral-400">
+                    清空历史、收藏、关注、档案和图片归档，偏好设置保留。
+                  </p>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => {
+                    setDangerAction("data");
+                    setDangerConfirmText("");
+                  }}
+                  className="shrink-0 rounded-lg border border-red-300 bg-white px-3 py-1.5 text-sm text-red-600 transition-colors hover:bg-red-50 dark:border-red-500/40 dark:bg-transparent dark:text-red-300 dark:hover:bg-red-500/10"
+                >
+                  清除数据
+                </button>
+              </div>
+              <div className="flex items-start justify-between gap-4 p-5">
+                <div>
+                  <p className="text-sm font-medium text-gray-800 dark:text-neutral-100">
+                    彻底重置
+                  </p>
+                  <p className="mt-1 text-xs leading-relaxed text-gray-500 dark:text-neutral-400">
+                    清空全部数据和设置，包括 WebDAV 凭据；本地备份目录授权仍在。
+                  </p>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => {
+                    setDangerAction("reset");
+                    setDangerConfirmText("");
+                  }}
+                  className="shrink-0 rounded-lg bg-red-600 px-3 py-1.5 text-sm font-medium text-white transition-colors hover:bg-red-700"
+                >
+                  彻底重置
                 </button>
               </div>
             </div>
           </div>
         </div>
 
-        {/* 右列：同步与界面偏好 */}
         <div className="space-y-6">
-          <div className="border-b border-gray-200 dark:border-neutral-800 pb-2 mb-4">
-            <h2 className="text-base font-bold text-gray-800 dark:text-neutral-200 flex items-center gap-2">
-              <RefreshCw className="w-5 h-5 text-fuchsia-500" />
-              同步与界面偏好
+          <div className="border-b border-gray-200 pb-2 dark:border-neutral-800">
+            <h2 className="flex items-center gap-2 text-base font-bold text-gray-800 dark:text-neutral-200">
+              <RefreshCw className="h-5 w-5 text-fuchsia-500" />
+              自动同步
             </h2>
           </div>
 
-          {/* 历史记录同步间隔。
-              旧版把 ± 步进器当主控件：一次只走 1 分钟（设 30 分钟要点 29 次）、
-              "单位：分钟"孤零零挂在标题下、预设还挤在底部一条浅色横条里。
-              新版：预设胶囊为主（语义化标签 + 明确的选中态），自定义才展开输入框。 */}
           <div className="w-full rounded-xl border border-gray-100 bg-gray-50 p-5 shadow-sm dark:border-neutral-800 dark:bg-neutral-900">
-            <h3 className="text-base font-medium text-gray-800 dark:text-neutral-100">
-              历史记录同步间隔
-            </h3>
-            <p className="mt-1 text-xs text-gray-500 dark:text-neutral-400">
-              每隔多久自动拉取一次你的 B站 观看历史
-            </p>
+            <div className="flex flex-wrap items-start justify-between gap-3">
+              <div>
+                <h3 className="text-base font-medium text-gray-800 dark:text-neutral-100">
+                  历史记录
+                </h3>
+                <p className="mt-1 text-xs text-gray-500 dark:text-neutral-400">
+                  每隔多久自动拉取一次观看历史
+                </p>
+              </div>
+              <button
+                type="button"
+                onClick={() => void runManualSync("history")}
+                disabled={syncBusy.history}
+                className="inline-flex items-center gap-1.5 rounded-lg bg-fuchsia-500 px-3 py-1.5 text-xs font-medium text-white transition-colors hover:bg-fuchsia-600 disabled:opacity-60"
+              >
+                {syncBusy.history ? (
+                  <LoaderCircle className="h-3.5 w-3.5 animate-spin" />
+                ) : (
+                  <RefreshCw className="h-3.5 w-3.5" />
+                )}
+                {syncBusy.history ? "同步中…" : "立即同步"}
+              </button>
+            </div>
 
             <div className="mt-4 flex flex-wrap items-center gap-2">
               {SYNC_INTERVAL_PRESETS.map((option) => {
@@ -767,7 +969,6 @@ const Settings = () => {
                   </button>
                 );
               })}
-
               <button
                 type="button"
                 aria-pressed={showCustomInterval}
@@ -781,9 +982,7 @@ const Settings = () => {
               >
                 自定义
                 <ChevronDown
-                  className={`h-3 w-3 transition-transform ${
-                    showCustomInterval ? "rotate-180" : ""
-                  }`}
+                  className={`h-3 w-3 transition-transform ${showCustomInterval ? "rotate-180" : ""}`}
                 />
               </button>
             </div>
@@ -799,106 +998,245 @@ const Settings = () => {
                   className="w-24 rounded-lg border border-gray-200 bg-white px-3 py-1.5 text-sm tabular-nums text-gray-800 outline-none transition-colors focus:border-fuchsia-400 dark:border-neutral-700 dark:bg-neutral-950 dark:text-neutral-100"
                 />
                 <span className="text-sm text-gray-500 dark:text-neutral-400">分钟</span>
-                {Number(syncInterval) === 1 ? (
-                  <span className="text-xs text-amber-600 dark:text-amber-400">
-                    每分钟一次，对 B站 的请求最频繁
-                  </span>
-                ) : null}
               </div>
             ) : null}
 
-            <p className="mt-4 text-xs leading-relaxed text-gray-400 dark:text-neutral-500">
-              间隔越短，同一视频的重复观看越不容易漏记，但请求 B站 也越频繁。
-              后台每分钟检查一次任务，到点才真正抓取。
+            <div className="mt-4 grid grid-cols-2 gap-2 rounded-lg bg-white/70 px-3 py-2 text-xs dark:bg-neutral-950/50">
+              <span className="text-gray-500 dark:text-neutral-400">
+                上次：{formatSyncTime(lastSyncMap.history)}
+              </span>
+              <span className="text-right text-gray-500 dark:text-neutral-400">
+                下次：{formatNextSync(lastSyncMap.history, Number(syncInterval))}
+              </span>
+            </div>
+            <p className="mt-3 text-xs leading-relaxed text-gray-400 dark:text-neutral-500">
+              间隔越短，重复观看越不容易漏记，但请求 B站 也越频繁。后台每分钟检查一次，到点才抓取。
             </p>
           </div>
 
-          {/* 关注列表自动同步。后台早就在读这两个键了（默认开启 / 每天一次），
-              只是界面上一直没有入口——想关掉自动请求 B站 都做不到。 */}
-          <div className="w-full rounded-xl bg-gray-50 dark:bg-neutral-900 shadow-sm border border-gray-100 dark:border-neutral-800">
-            <div className="flex items-center justify-between p-5">
-              <div className="pr-4">
-                <h3 className="text-base font-medium text-gray-800 dark:text-neutral-100">
-                  关注列表自动同步
-                </h3>
-                <p className="mt-1 text-xs text-gray-400 dark:text-neutral-500">
-                  关闭后不再自动抓取关注变化，仍可在「关注列表」页手动同步
-                </p>
-              </div>
-              <label className="relative inline-flex shrink-0 cursor-pointer items-center">
-                <input
-                  type="checkbox"
-                  className="sr-only peer"
-                  checked={followingAutoSync}
-                  onChange={handleFollowingAutoSyncChange}
-                />
-                <div className="w-11 h-6 bg-gray-200 dark:bg-neutral-700 peer-focus:outline-none rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border-gray-300 dark:after:border-neutral-600 after:border after:rounded-full after:h-5 after:w-5 after:transition-all peer-checked:bg-blue-600"></div>
-              </label>
+          <div className="w-full rounded-xl border border-gray-100 bg-gray-50 shadow-sm dark:border-neutral-800 dark:bg-neutral-900">
+            <div className="border-b border-gray-100 p-5 dark:border-neutral-800">
+              <h3 className="text-base font-medium text-gray-800 dark:text-neutral-100">
+                其他自动同步
+              </h3>
+              <p className="mt-1 text-xs text-gray-500 dark:text-neutral-400">
+                关闭自动同步后仍可在对应页面手动同步；这里也可以直接立即同步。
+              </p>
             </div>
 
-            <div className="border-t border-gray-100 px-5 py-4 dark:border-neutral-800">
-              <p className="text-xs text-gray-500 dark:text-neutral-400">同步间隔</p>
-              <div className="mt-2 flex flex-wrap gap-2">
-                {FOLLOWING_INTERVAL_PRESETS.map((minutes) => (
+            <div className="divide-y divide-gray-100 dark:divide-neutral-800">
+              <div className="p-5">
+                <div className="flex items-start justify-between gap-4">
+                  <div>
+                    <p className="text-sm font-medium text-gray-800 dark:text-neutral-100">关注列表</p>
+                    <p className="mt-1 text-xs text-gray-500 dark:text-neutral-400">
+                      取关、改名、注销只在同步时才会被发现
+                    </p>
+                  </div>
+                  <label className="relative mt-0.5 inline-flex shrink-0 cursor-pointer items-center">
+                    <input
+                      type="checkbox"
+                      className="peer sr-only"
+                      checked={followingAutoSync}
+                      onChange={handleFollowingAutoSyncChange}
+                    />
+                    <div className="h-6 w-11 rounded-full bg-gray-200 after:absolute after:left-[2px] after:top-[2px] after:h-5 after:w-5 after:rounded-full after:border after:border-gray-300 after:bg-white after:transition-all after:content-[''] peer-checked:after:translate-x-full peer-checked:after:border-white peer-checked:bg-blue-600 dark:bg-neutral-700 dark:after:border-neutral-600"></div>
+                  </label>
+                </div>
+                <div className="mt-3 flex flex-wrap gap-2">
+                  {FOLLOWING_INTERVAL_PRESETS.map((minutes) => (
+                    <button
+                      key={minutes}
+                      type="button"
+                      disabled={!followingAutoSync}
+                      onClick={() => void handleFollowingIntervalChange(minutes)}
+                      className={`rounded-full px-3 py-1 text-xs transition-colors disabled:cursor-not-allowed disabled:opacity-40 ${
+                        followingIntervalMinutes === minutes
+                          ? "bg-blue-50 font-medium text-blue-600 dark:bg-blue-500/10 dark:text-blue-300"
+                          : "text-gray-500 hover:bg-gray-100 dark:text-neutral-400 dark:hover:bg-neutral-800"
+                      }`}
+                    >
+                      {FOLLOWING_INTERVAL_LABELS[minutes]}
+                    </button>
+                  ))}
+                </div>
+                <div className="mt-3 flex flex-wrap items-center justify-between gap-2 text-xs text-gray-500 dark:text-neutral-400">
+                  <span>
+                    上次：{formatSyncTime(lastSyncMap.following)} · 下次：
+                    {formatNextSync(lastSyncMap.following, followingIntervalMinutes, followingAutoSync)}
+                  </span>
                   <button
-                    key={minutes}
                     type="button"
-                    disabled={!followingAutoSync}
-                    onClick={() => void handleFollowingIntervalChange(minutes)}
-                    className={`rounded-full px-3 py-1 text-xs transition-colors disabled:cursor-not-allowed disabled:opacity-50 ${
-                      followingIntervalMinutes === minutes
-                        ? "bg-blue-50 font-medium text-blue-600 dark:bg-blue-500/10 dark:text-blue-300"
-                        : "text-gray-500 hover:bg-gray-100 dark:text-neutral-400 dark:hover:bg-neutral-800"
-                    }`}
+                    onClick={() => void runManualSync("following")}
+                    disabled={syncBusy.following}
+                    className="inline-flex items-center gap-1 rounded-lg border border-gray-200 px-2.5 py-1 text-xs text-gray-600 transition-colors hover:border-blue-300 hover:text-blue-600 disabled:opacity-60 dark:border-neutral-700 dark:text-neutral-300 dark:hover:border-blue-500/40"
                   >
-                    {FOLLOWING_INTERVAL_LABELS[minutes]}
+                    {syncBusy.following ? (
+                      <LoaderCircle className="h-3 w-3 animate-spin" />
+                    ) : (
+                      <RefreshCw className="h-3 w-3" />
+                    )}
+                    {syncBusy.following ? "同步中…" : "立即同步"}
                   </button>
-                ))}
+                </div>
               </div>
-              <p className="mt-2 text-xs leading-relaxed text-gray-400 dark:text-neutral-500">
-                关注变动（取关 / 改名 / 注销）只在同步时才会被发现，间隔越长越可能漏掉中间变化。
-              </p>
+
+              <div className="p-5">
+                <div className="flex items-start justify-between gap-4">
+                  <div>
+                    <p className="text-sm font-medium text-gray-800 dark:text-neutral-100">收藏夹</p>
+                    <p className="mt-1 text-xs text-gray-500 dark:text-neutral-400">
+                      日常增量，每 7 天一次全量来发现消失内容
+                    </p>
+                  </div>
+                  <label className="relative mt-0.5 inline-flex shrink-0 cursor-pointer items-center">
+                    <input
+                      type="checkbox"
+                      className="peer sr-only"
+                      checked={favAutoSync}
+                      onChange={handleFavAutoSyncChange}
+                    />
+                    <div className="h-6 w-11 rounded-full bg-gray-200 after:absolute after:left-[2px] after:top-[2px] after:h-5 after:w-5 after:rounded-full after:border after:border-gray-300 after:bg-white after:transition-all after:content-[''] peer-checked:after:translate-x-full peer-checked:after:border-white peer-checked:bg-blue-600 dark:bg-neutral-700 dark:after:border-neutral-600"></div>
+                  </label>
+                </div>
+                <div className="mt-3 flex flex-wrap gap-2">
+                  {FAV_INTERVAL_PRESETS.map((minutes) => (
+                    <button
+                      key={minutes}
+                      type="button"
+                      disabled={!favAutoSync}
+                      onClick={() => void handleFavIntervalChange(minutes)}
+                      className={`rounded-full px-3 py-1 text-xs transition-colors disabled:cursor-not-allowed disabled:opacity-40 ${
+                        favIntervalMinutes === minutes
+                          ? "bg-blue-50 font-medium text-blue-600 dark:bg-blue-500/10 dark:text-blue-300"
+                          : "text-gray-500 hover:bg-gray-100 dark:text-neutral-400 dark:hover:bg-neutral-800"
+                      }`}
+                    >
+                      {FAV_INTERVAL_LABELS[minutes]}
+                    </button>
+                  ))}
+                </div>
+                <div className="mt-3 flex flex-wrap items-center justify-between gap-2 text-xs text-gray-500 dark:text-neutral-400">
+                  <span>
+                    上次：{formatSyncTime(lastSyncMap.favorites)} · 下次：
+                    {formatNextSync(lastSyncMap.favorites, favIntervalMinutes, favAutoSync)}
+                  </span>
+                  <button
+                    type="button"
+                    onClick={() => void runManualSync("favorites")}
+                    disabled={syncBusy.favorites}
+                    className="inline-flex items-center gap-1 rounded-lg border border-gray-200 px-2.5 py-1 text-xs text-gray-600 transition-colors hover:border-blue-300 hover:text-blue-600 disabled:opacity-60 dark:border-neutral-700 dark:text-neutral-300 dark:hover:border-blue-500/40"
+                  >
+                    {syncBusy.favorites ? (
+                      <LoaderCircle className="h-3 w-3 animate-spin" />
+                    ) : (
+                      <RefreshCw className="h-3 w-3" />
+                    )}
+                    {syncBusy.favorites ? "同步中…" : "立即同步"}
+                  </button>
+                </div>
+              </div>
+
+              <div className="p-5">
+                <div className="flex items-start justify-between gap-4">
+                  <div>
+                    <p className="text-sm font-medium text-gray-800 dark:text-neutral-100">点赞与投币</p>
+                    <p className="mt-1 text-xs text-gray-500 dark:text-neutral-400">
+                      B站 只保留最近 20 条，间隔太长会永久漏记
+                    </p>
+                  </div>
+                  <label className="relative mt-0.5 inline-flex shrink-0 cursor-pointer items-center">
+                    <input
+                      type="checkbox"
+                      className="peer sr-only"
+                      checked={interactionAutoSync}
+                      onChange={handleInteractionAutoSyncChange}
+                    />
+                    <div className="h-6 w-11 rounded-full bg-gray-200 after:absolute after:left-[2px] after:top-[2px] after:h-5 after:w-5 after:rounded-full after:border after:border-gray-300 after:bg-white after:transition-all after:content-[''] peer-checked:after:translate-x-full peer-checked:after:border-white peer-checked:bg-pink-500 dark:bg-neutral-700 dark:after:border-neutral-600"></div>
+                  </label>
+                </div>
+                <div className="mt-3 flex flex-wrap gap-2">
+                  {INTERACTION_INTERVAL_PRESETS.map((minutes) => (
+                    <button
+                      key={minutes}
+                      type="button"
+                      disabled={!interactionAutoSync}
+                      onClick={() => void handleInteractionIntervalChange(minutes)}
+                      className={`rounded-full px-3 py-1 text-xs transition-colors disabled:cursor-not-allowed disabled:opacity-40 ${
+                        interactionIntervalMinutes === minutes
+                          ? "bg-pink-50 font-medium text-pink-600 dark:bg-pink-500/10 dark:text-pink-300"
+                          : "text-gray-500 hover:bg-gray-100 dark:text-neutral-400 dark:hover:bg-neutral-800"
+                      }`}
+                    >
+                      {INTERACTION_INTERVAL_LABELS[minutes]}
+                    </button>
+                  ))}
+                </div>
+                <div className="mt-3 flex flex-wrap items-center justify-between gap-2 text-xs text-gray-500 dark:text-neutral-400">
+                  <span>
+                    上次：{formatSyncTime(lastSyncMap.interactions)} · 下次：
+                    {formatNextSync(lastSyncMap.interactions, interactionIntervalMinutes, interactionAutoSync)}
+                  </span>
+                  <button
+                    type="button"
+                    onClick={() => void runManualSync("interactions")}
+                    disabled={syncBusy.interactions}
+                    className="inline-flex items-center gap-1 rounded-lg border border-gray-200 px-2.5 py-1 text-xs text-gray-600 transition-colors hover:border-pink-300 hover:text-pink-600 disabled:opacity-60 dark:border-neutral-700 dark:text-neutral-300 dark:hover:border-pink-500/40"
+                  >
+                    {syncBusy.interactions ? (
+                      <LoaderCircle className="h-3 w-3 animate-spin" />
+                    ) : (
+                      <RefreshCw className="h-3 w-3" />
+                    )}
+                    {syncBusy.interactions ? "同步中…" : "立即同步"}
+                  </button>
+                </div>
+              </div>
             </div>
           </div>
 
-          {/* 第三方曾用名查询（aicu.cc）。默认关闭，首次开启必须知情同意：
-              这是本扩展唯一会把数据发到本机之外的功能（只发关注用户的 UID）。 */}
-          <div className="w-full rounded-xl bg-gray-50 dark:bg-neutral-900 shadow-sm border border-gray-100 dark:border-neutral-800">
+      <div className="border-b border-gray-200 pb-2 dark:border-neutral-800">
+        <h2 className="flex items-center gap-2 text-base font-bold text-gray-800 dark:text-neutral-200">
+          <ShieldAlert className="h-5 w-5 text-pink-500" />
+          隐私与第三方
+            </h2>
+          </div>
+
+          <div className="w-full rounded-xl border border-gray-100 bg-gray-50 shadow-sm dark:border-neutral-800 dark:bg-neutral-900">
             <div className="flex items-center justify-between p-5">
               <div className="pr-4">
                 <h3 className="text-base font-medium text-gray-800 dark:text-neutral-100">
                   关注列表曾用名查询（第三方）
                 </h3>
                 <p className="mt-1 text-xs text-gray-400 dark:text-neutral-500">
-                  默认关闭。开启后可在「关注列表」页手动查询曾用名；查询会把该关注用户的 UID
-                  发送给第三方站点 aicu.cc，逐条限速、可随时停止，查到的名字只存本机。
+                  默认关闭。开启后手动查询时，会把关注用户的 UID 发送给 aicu.cc，逐条限速、可随时停止。
                   <a
                     className="ml-1 text-blue-500 hover:underline dark:text-blue-400"
                     href="https://www.aicu.cc/"
                     target="_blank"
                     rel="noopener noreferrer"
                   >
-                    前往 aicu.cc 查看更多
+                    前往 aicu.cc
                   </a>
                 </p>
               </div>
               <label className="relative inline-flex shrink-0 cursor-pointer items-center">
                 <input
                   type="checkbox"
-                  className="sr-only peer"
+                  className="peer sr-only"
                   checked={thirdPartyLookupEnabled}
                   onChange={handleThirdPartyLookupChange}
                 />
-                <div className="w-11 h-6 bg-gray-200 dark:bg-neutral-700 peer-focus:outline-none rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border-gray-300 dark:after:border-neutral-600 after:border after:rounded-full after:h-5 after:w-5 after:transition-all peer-checked:bg-blue-600"></div>
+                <div className="h-6 w-11 rounded-full bg-gray-200 after:absolute after:left-[2px] after:top-[2px] after:h-5 after:w-5 after:rounded-full after:border after:border-gray-300 after:bg-white after:transition-all after:content-[''] peer-checked:after:translate-x-full peer-checked:after:border-white peer-checked:bg-blue-600 dark:bg-neutral-700 dark:after:border-neutral-600"></div>
               </label>
             </div>
 
             {showThirdPartyConsent ? (
               <div className="border-t border-pink-200 bg-pink-50/60 px-5 py-4 dark:border-pink-500/30 dark:bg-pink-500/10">
                 <p className="text-xs leading-relaxed text-gray-600 dark:text-neutral-300">
-                  启用后，你在关注列表里查询某个用户的曾用名时，会把该用户的 UID 发送给第三方站点
-                  aicu.cc。该站点由第三方维护、可能随时失效；返回的名字没有时间信息，顺序也不保证，
-                  「未收录」不代表没改过名。所有查询都由你手动触发，不会自动运行。
+                  启用后，查询某个用户的曾用名时会把该用户的 UID 发送给第三方站点 aicu.cc。
+                  该站点由第三方维护、可能随时失效；返回的名字没有时间信息，顺序也不保证。
+                  所有查询都由你手动触发，不会自动运行。
                 </p>
                 <div className="mt-3 flex flex-wrap gap-2">
                   <button
@@ -918,294 +1256,176 @@ const Settings = () => {
                 </div>
               </div>
             ) : null}
-          </div>
+        </div>
 
-          {/* 收藏夹自动同步。与关注/互动同一套交互，但**默认关闭**：
-              只有全量同步才会做消失判定，而全量要翻完整个收藏夹并对消失条目逐条探测。
-              日常走增量（拉到本地边界就停），定期才全量一次。 */}
-          <div className="w-full rounded-xl bg-gray-50 dark:bg-neutral-900 shadow-sm border border-gray-100 dark:border-neutral-800">
-            <div className="flex items-center justify-between p-5">
-              <div className="pr-4">
-                <h3 className="text-base font-medium text-gray-800 dark:text-neutral-100">
-                  收藏夹自动同步
-                </h3>
-                <p className="mt-1 text-xs text-gray-400 dark:text-neutral-500">
-                  默认关闭。开启后按间隔自动抓取收藏夹变化，仍可在「收藏夹」页手动同步。
-                  日常只拉最新几页；每 7 天做一次全量，用来发现从收藏夹消失的视频。
-                </p>
-              </div>
-              <label className="relative inline-flex shrink-0 cursor-pointer items-center">
-                <input
-                  type="checkbox"
-                  className="sr-only peer"
-                  checked={favAutoSync}
-                  onChange={handleFavAutoSyncChange}
-                />
-                <div className="w-11 h-6 bg-gray-200 dark:bg-neutral-700 peer-focus:outline-none rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border-gray-300 dark:after:border-neutral-600 after:border after:rounded-full after:h-5 after:w-5 after:transition-all peer-checked:bg-blue-600"></div>
-              </label>
-            </div>
+      <div>
+        <div className="border-b border-gray-200 pb-2 dark:border-neutral-800">
+          <h2 className="flex items-center gap-2 text-base font-bold text-gray-800 dark:text-neutral-200">
+            <RotateCcw className="h-5 w-5 text-emerald-500" />
+            界面
+          </h2>
+        </div>
 
-            <div className="border-t border-gray-100 px-5 py-4 dark:border-neutral-800">
-              <p className="text-xs text-gray-500 dark:text-neutral-400">同步间隔</p>
-              <div className="mt-2 flex flex-wrap gap-2">
-                {FAV_INTERVAL_PRESETS.map((minutes) => (
-                  <button
-                    key={minutes}
-                    type="button"
-                    disabled={!favAutoSync}
-                    onClick={() => void handleFavIntervalChange(minutes)}
-                    className={`rounded-full px-3 py-1 text-xs transition-colors disabled:cursor-not-allowed disabled:opacity-50 ${
-                      favIntervalMinutes === minutes
-                        ? "bg-blue-50 font-medium text-blue-600 dark:bg-blue-500/10 dark:text-blue-300"
-                        : "text-gray-500 hover:bg-gray-100 dark:text-neutral-400 dark:hover:bg-neutral-800"
+        <div className="mt-4 w-full rounded-xl border border-gray-100 bg-gray-50 shadow-sm dark:border-neutral-800 dark:bg-neutral-900">
+          <div className="p-5">
+            <h3 className="mb-1 text-base font-bold text-gray-800 dark:text-neutral-100">
+              侧边栏与用户信息
+            </h3>
+            <p className="mb-4 text-xs text-gray-500 dark:text-neutral-400">
+              勾选要显示的菜单项，拖拽右侧手柄调整顺序；「设置」不可隐藏。
+            </p>
+
+            <ul className="space-y-1">
+              {menuOrder.map((title) => {
+                const hideable = HIDEABLE_MENU_TITLES.includes(title);
+                const shown = !hiddenMenus.includes(title);
+                const isDragging = draggedMenu === title;
+                return (
+                  <li
+                    key={title}
+                    ref={(element) => {
+                      if (element) {
+                        menuItemRefs.current.set(title, element);
+                      } else {
+                        menuItemRefs.current.delete(title);
+                      }
+                    }}
+                    onDragOver={(event) => handleMenuDragOver(event, title)}
+                    onDrop={handleMenuDrop}
+                    className={`flex items-center gap-2 rounded-lg border bg-white px-3 py-2 transition-colors dark:bg-neutral-900 ${
+                      isDragging
+                        ? "border-dashed border-pink-200 opacity-0 dark:border-pink-500/40"
+                        : "border-gray-200 dark:border-neutral-700"
                     }`}
                   >
-                    {FAV_INTERVAL_LABELS[minutes]}
-                  </button>
-                ))}
-              </div>
-              <p className="mt-2 text-xs leading-relaxed text-gray-400 dark:text-neutral-500">
-                视频从收藏夹消失（你取消收藏、或内容被删）只在同步时才会被发现；
-                间隔越长越可能漏掉中间变化。全量同步每 7 天自动跑一次。
-              </p>
-            </div>
-          </div>
-
-          {/* 点赞 / 投币互动记录自动同步。B 站只给最近 20 条，掉出窗口就永远拿不回来，
-              所以默认间隔比关注列表密得多。 */}
-          <div className="w-full rounded-xl bg-gray-50 dark:bg-neutral-900 shadow-sm border border-gray-100 dark:border-neutral-800">
-            <div className="flex items-center justify-between p-5">
-              <div className="pr-4">
-                <h3 className="text-base font-medium text-gray-800 dark:text-neutral-100">
-                  点赞与投币自动同步
-                </h3>
-                <p className="mt-1 text-xs text-gray-400 dark:text-neutral-500">
-                  B 站只保留最近 20 条点赞与投币记录，掉出这个窗口的条目在 B 站上再也查不到。
-                  关闭后不再自动抓取，仍可在「互动记录」页手动同步
-                </p>
-              </div>
-              <label className="relative inline-flex shrink-0 cursor-pointer items-center">
-                <input
-                  type="checkbox"
-                  className="sr-only peer"
-                  checked={interactionAutoSync}
-                  onChange={handleInteractionAutoSyncChange}
-                />
-                <div className="w-11 h-6 bg-gray-200 dark:bg-neutral-700 peer-focus:outline-none rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border-gray-300 dark:after:border-neutral-600 after:border after:rounded-full after:h-5 after:w-5 after:transition-all peer-checked:bg-pink-500"></div>
-              </label>
-            </div>
-
-            <div className="border-t border-gray-100 px-5 py-4 dark:border-neutral-800">
-              <p className="text-xs text-gray-500 dark:text-neutral-400">同步间隔</p>
-              <div className="mt-2 flex flex-wrap gap-2">
-                {INTERACTION_INTERVAL_PRESETS.map((minutes) => (
-                  <button
-                    key={minutes}
-                    type="button"
-                    disabled={!interactionAutoSync}
-                    onClick={() => void handleInteractionIntervalChange(minutes)}
-                    className={`rounded-full px-3 py-1 text-xs transition-colors disabled:cursor-not-allowed disabled:opacity-50 ${
-                      interactionIntervalMinutes === minutes
-                        ? "bg-pink-50 font-medium text-pink-600 dark:bg-pink-500/10 dark:text-pink-300"
-                        : "text-gray-500 hover:bg-gray-100 dark:text-neutral-400 dark:hover:bg-neutral-800"
-                    }`}
-                  >
-                    {INTERACTION_INTERVAL_LABELS[minutes]}
-                  </button>
-                ))}
-              </div>
-              <p className="mt-2 text-xs leading-relaxed text-gray-400 dark:text-neutral-500">
-                间隔越长，新点赞越可能在两次同步之间被挤出 20 条窗口，那条记录就永久丢失了。
-                同步时会顺带对掉出列表的条目做二次探测，因此间隔也不是越短越好。
-                另外，每次你访问 B 站个人主页（space.bilibili.com）时会顺手补抓一次
-                （半小时最多一次、只抓不判定），以降低窗口滑走导致丢记录的概率。
-              </p>
-            </div>
-          </div>
-
-          {/* 这里曾有「历史记录加载方式」与「界面管理（日期选择方式）」两张卡片。
-              两者都已删除：加载方式与每行列数属于**每次浏览历史时才会调整**的设置，
-              已经收在历史页工具栏的「历史视图设置」弹窗里（同一个 HISTORY_LOAD_MODE /
-              GRID_COLUMNS，两处入口只会互相打架：这边即时生效，那边草稿后保存）。
-              日期也只保留范围选择一种，`DATE_SELECTION_MODE` 连同单日分支一并移除。
-              设置页因此变短，留下的都是"装完一次就不动"的配置。 */}
-
-          {/* 侧边栏菜单管理：一行管一个菜单（显示开关 + 上下移动）。
-              原来拆成「显示」和「顺序」两张列表，同一个菜单出现两次，
-              卡片被撑到近千像素——合并后高度直接减半，也更符合"每行管一个菜单"的直觉。 */}
-          <div className="w-full rounded-xl border border-gray-100 bg-gray-50 shadow-sm dark:border-neutral-800 dark:bg-neutral-900">
-            <div className="p-5">
-              <h3 className="mb-1 text-lg font-bold text-gray-800 dark:text-neutral-100">
-                侧边栏菜单管理
-              </h3>
-              <p className="mb-4 text-sm text-gray-500 dark:text-neutral-400">
-                勾选要显示的菜单项，用箭头调整顺序
-              </p>
-
-              <ul className="space-y-1">
-                {menuOrder.map((title, index) => {
-                  const hideable = HIDEABLE_MENU_TITLES.includes(title);
-                  const shown = !hiddenMenus.includes(title);
-                  return (
-                    <li
-                      key={title}
-                      className="flex items-center gap-2 rounded-lg border border-gray-200 bg-white px-3 py-1.5 dark:border-neutral-700 dark:bg-neutral-900"
+                    <input
+                      type="checkbox"
+                      checked={shown}
+                      disabled={!hideable}
+                      onChange={(event) => void toggleHiddenMenu(title, !event.target.checked)}
+                      aria-label={`显示「${title}」`}
+                      className="h-4 w-4 shrink-0 accent-pink-600 disabled:opacity-40 dark:accent-pink-500"
+                    />
+                    <span
+                      className={`min-w-0 flex-1 truncate text-sm ${
+                        shown
+                          ? "text-gray-700 dark:text-neutral-200"
+                          : "text-gray-400 line-through dark:text-neutral-500"
+                      }`}
                     >
-                      <input
-                        type="checkbox"
-                        checked={shown}
-                        disabled={!hideable}
-                        onChange={(event) => void toggleHiddenMenu(title, !event.target.checked)}
-                        aria-label={`显示「${title}」`}
-                        title={hideable ? undefined : "「设置」不允许隐藏：隐藏后就没有入口改回来了"}
-                        className="h-4 w-4 shrink-0 accent-pink-600 disabled:opacity-40 dark:accent-pink-500"
-                      />
-                      <span
-                        className={`min-w-0 flex-1 truncate text-sm ${
-                          shown
-                            ? "text-gray-700 dark:text-neutral-200"
-                            : "text-gray-400 line-through dark:text-neutral-500"
-                        }`}
-                      >
-                        {title}
+                      {title}
+                    </span>
+                    {!hideable ? (
+                      <span className="shrink-0 text-[10px] text-gray-400 dark:text-neutral-500">
+                        不可隐藏
                       </span>
-                      {!hideable ? (
-                        <span className="shrink-0 text-[10px] text-gray-400 dark:text-neutral-500">
-                          不可隐藏
-                        </span>
-                      ) : null}
-                      <button
-                        type="button"
-                        disabled={index === 0}
-                        onClick={() => void moveMenuItem(index, -1)}
-                        title={`把「${title}」上移`}
-                        aria-label={`把「${title}」上移`}
-                        className="inline-flex h-6 w-6 shrink-0 items-center justify-center rounded text-gray-500 transition-colors hover:bg-gray-100 disabled:opacity-30 dark:text-neutral-400 dark:hover:bg-neutral-800"
-                      >
-                        <ArrowUp className="h-3.5 w-3.5" />
-                      </button>
-                      <button
-                        type="button"
-                        disabled={index === menuOrder.length - 1}
-                        onClick={() => void moveMenuItem(index, 1)}
-                        title={`把「${title}」下移`}
-                        aria-label={`把「${title}」下移`}
-                        className="inline-flex h-6 w-6 shrink-0 items-center justify-center rounded text-gray-500 transition-colors hover:bg-gray-100 disabled:opacity-30 dark:text-neutral-400 dark:hover:bg-neutral-800"
-                      >
-                        <ArrowDown className="h-3.5 w-3.5" />
-                      </button>
-                    </li>
-                  );
-                })}
-              </ul>
+                    ) : null}
+                    <span
+                      draggable
+                      onDragStart={(event) => handleMenuDragStart(event, title)}
+                      onDragEnd={handleMenuDragEnd}
+                      title={`拖拽调整「${title}」的顺序`}
+                      aria-label={`拖拽调整「${title}」的顺序`}
+                      className="inline-flex h-7 w-7 shrink-0 cursor-grab items-center justify-center rounded text-gray-400 transition-colors hover:bg-gray-100 hover:text-gray-600 active:cursor-grabbing dark:text-neutral-500 dark:hover:bg-neutral-800 dark:hover:text-neutral-300"
+                    >
+                      <GripVertical className="h-4 w-4" />
+                    </span>
+                  </li>
+                );
+              })}
+            </ul>
 
-              {/* 用户信息不是侧边栏菜单项（它固定在顶部），所以只有开关、没有排序 */}
-              <div className="mt-4 border-t border-gray-200 pt-4 dark:border-neutral-800">
-                <Checkbox
-                  label="隐藏用户信息"
-                  checked={isHideUserInfo}
-                  onChange={handleHideUserInfoChange}
-                />
-              </div>
+            <div className="mt-4 border-t border-gray-200 pt-4 dark:border-neutral-800">
+              <Checkbox
+                label="隐藏用户信息"
+                checked={isHideUserInfo}
+                onChange={handleHideUserInfoChange}
+              />
             </div>
           </div>
         </div>
       </div>
-
-      {/* 确认弹窗 */}
-      {/* ... (Dialog code) ... */}
-      {/* 反悔窗口：危险操作先走倒计时，这几秒内点「撤销」＝什么都没发生 */}
-      {resetCountdown !== null ? (
-        <div className="fixed inset-x-0 bottom-6 z-50 flex justify-center px-4">
-          <div className="flex flex-wrap items-center gap-3 rounded-xl border border-red-200 bg-white px-5 py-3 shadow-xl dark:border-red-500/40 dark:bg-neutral-900">
-            <p className="text-sm text-gray-800 dark:text-neutral-100">
-              将在{" "}
-              <span className="font-semibold tabular-nums text-red-600 dark:text-red-300">
-                {resetCountdown}
-              </span>{" "}
-              秒后重置扩展，届时全部本地数据与设置会被清空。
-            </p>
-            <button
-              type="button"
-              onClick={cancelReset}
-              className="rounded-lg border border-gray-300 px-3 py-1.5 text-sm font-medium text-gray-700 transition-colors hover:bg-gray-50 dark:border-neutral-600 dark:text-neutral-200 dark:hover:bg-neutral-800"
-            >
-              撤销
-            </button>
-            <button
-              type="button"
-              onClick={() => void executeReset()}
-              className="rounded-lg bg-red-600 px-3 py-1.5 text-sm font-medium text-white transition-colors hover:bg-red-700"
-            >
-              立即重置
-            </button>
-          </div>
         </div>
-      ) : null}
+      </div>
 
-      {showConfirmDialog && (
-        <div className="fixed inset-0 bg-black/60 backdrop-blur-sm flex items-center justify-center z-50 animate-in fade-in duration-200">
-          <div className="bg-white dark:bg-neutral-900 p-6 rounded-xl shadow-xl max-w-sm w-full mx-4 border border-transparent dark:border-neutral-800">
-            <h3 className="text-lg font-bold text-gray-900 dark:text-neutral-100 mb-2">
-              确认重置扩展？
+
+      {dangerAction ? (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-4 backdrop-blur-sm">
+          <div className="w-full max-w-md rounded-xl border border-transparent bg-white p-6 shadow-xl dark:border-neutral-800 dark:bg-neutral-900">
+            <h3 className="text-lg font-bold text-gray-900 dark:text-neutral-100">
+              {DANGER_COPY[dangerAction].title}
             </h3>
-            <div className="mb-6 space-y-2 text-sm leading-relaxed text-gray-600 dark:text-neutral-300">
-              <p>
-                此操作将<span className="font-medium text-red-600 dark:text-red-400">永久删除</span>
-                本地保存的全部数据：历史记录、收藏夹与收藏资源、订阅合集与合集视频、关注的 UP
-                主与关注变动、消失档案、点赞与投币记录，以及全部设置和 WebDAV 凭据。
-              </p>
-              <p className="text-gray-500 dark:text-neutral-400">
-                已选择的本地备份目录授权和目录中的备份文件会保留。
-              </p>
-              <p className="text-gray-500 dark:text-neutral-400">
-                确认后还有 {RESET_UNDO_SECONDS} 秒可以撤销。
-              </p>
-            </div>
-            {isResetLoading && (
-              <p className="text-blue-600 mb-4 text-sm animate-pulse">{resetStatus}</p>
-            )}
-            <div className="flex justify-end space-x-3">
+            <p className="mt-3 text-sm leading-relaxed text-gray-600 dark:text-neutral-300">
+              {DANGER_COPY[dangerAction].description}
+            </p>
+            <p className="mt-4 text-xs text-gray-500 dark:text-neutral-400">
+              请输入「
+              <span className="font-semibold text-red-600 dark:text-red-300">
+                {DANGER_COPY[dangerAction].confirmWord}
+              </span>
+              」确认：
+            </p>
+            <input
+              type="text"
+              value={dangerConfirmText}
+              onChange={(event) => setDangerConfirmText(event.target.value)}
+              autoFocus
+              className="mt-2 w-full rounded-lg border border-gray-200 bg-white px-3 py-2 text-sm text-gray-800 outline-none transition-colors focus:border-red-400 dark:border-neutral-700 dark:bg-neutral-950 dark:text-neutral-100"
+            />
+            {isResetLoading ? (
+              <p className="mt-3 animate-pulse text-xs text-blue-600">{resetStatus}</p>
+            ) : null}
+            <div className="mt-6 flex justify-end gap-3">
               <button
-                onClick={() => setShowConfirmDialog(false)}
-                className="px-4 py-2 text-sm text-gray-600 dark:text-neutral-300 hover:bg-gray-100 dark:hover:bg-neutral-800 rounded-lg transition-colors"
+                type="button"
+                onClick={() => {
+                  setDangerAction(null);
+                  setDangerConfirmText("");
+                }}
                 disabled={isResetLoading}
+                className="rounded-lg px-4 py-2 text-sm text-gray-600 transition-colors hover:bg-gray-100 disabled:opacity-50 dark:text-neutral-300 dark:hover:bg-neutral-800"
               >
                 取消
               </button>
               <button
-                onClick={startResetCountdown}
-                className="px-4 py-2 text-sm bg-red-600 text-white rounded-lg hover:bg-red-700 transition-colors shadow-sm"
-                disabled={isResetLoading}
+                type="button"
+                onClick={() => void executeDangerAction()}
+                disabled={
+                  isResetLoading ||
+                  dangerConfirmText.trim() !== DANGER_COPY[dangerAction].confirmWord
+                }
+                className="rounded-lg bg-red-600 px-4 py-2 text-sm font-medium text-white transition-colors hover:bg-red-700 disabled:cursor-not-allowed disabled:opacity-50"
               >
-                确认重置
+                {DANGER_COPY[dangerAction].button}
               </button>
             </div>
           </div>
         </div>
-      )}
+      ) : null}
 
-      {showResetResultDialog && (
-        <div className="fixed inset-0 bg-black/60 backdrop-blur-sm flex items-center justify-center z-50">
-          <div className="bg-white dark:bg-neutral-900 p-6 rounded-xl shadow-xl max-w-sm w-full mx-4 text-center border border-transparent dark:border-neutral-800">
-            <div className="w-12 h-12 bg-blue-100 dark:bg-blue-500/10 text-blue-600 dark:text-blue-400 rounded-full flex items-center justify-center mx-auto mb-4">
+      {showResetResultDialog ? (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm">
+          <div className="mx-4 w-full max-w-sm rounded-xl border border-transparent bg-white p-6 text-center shadow-xl dark:border-neutral-800 dark:bg-neutral-900">
+            <div className="mx-auto mb-4 flex h-12 w-12 items-center justify-center rounded-full bg-blue-100 text-blue-600 dark:bg-blue-500/10 dark:text-blue-400">
               <Check size={24} />
             </div>
-            <p className="text-lg text-gray-800 dark:text-neutral-100 mb-6 font-medium">
+            <p className="mb-6 text-base font-medium text-gray-800 dark:text-neutral-100">
               {resetResult}
             </p>
             <button
+              type="button"
               onClick={() => {
                 setShowResetResultDialog(false);
                 if (resetSucceeded) window.location.reload();
               }}
-              className="w-full px-4 py-2.5 bg-blue-600 text-white rounded-lg hover:bg-blue-700 transition-colors font-medium"
+              className="w-full rounded-lg bg-blue-600 px-4 py-2.5 font-medium text-white transition-colors hover:bg-blue-700"
             >
               {resetSucceeded ? "确定并重新加载" : "确定"}
             </button>
           </div>
         </div>
-      )}
+      ) : null}
+
       <StorageBreakdownModal
         open={breakdownOpen}
         breakdown={breakdown}

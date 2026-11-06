@@ -23,6 +23,29 @@ const IV_LENGTH = 12;
 const ENCRYPTION_KEY_SOURCE = "bilibili-history-wxt";
 
 /**
+ * 单次 WebDAV 请求的超时时间。
+ *
+ * 没有超时的话，服务器地址错误/网络黑洞时 fetch 可能一直挂着：
+ * 页面“测试连接”永远转圈，后台自动同步也会一直占着操作锁。
+ * 上传较大的 JSON（收藏/历史）给 60 秒余量。
+ */
+const WEBDAV_REQUEST_TIMEOUT_MS = 60_000;
+
+const fetchWithTimeout = async (
+  input: string,
+  init: RequestInit = {},
+  timeoutMs = WEBDAV_REQUEST_TIMEOUT_MS,
+): Promise<Response> => {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    return await fetch(input, { ...init, signal: controller.signal });
+  } finally {
+    clearTimeout(timer);
+  }
+};
+
+/**
  * 加密敏感信息（如 WebDAV 密码）。密钥由固定口令经 PBKDF2 派生并本地存储盐值，
  * 用于防止密码在 chrome.storage.local 中明文可读。注意：同一扩展环境下的代码
  * 仍可解密，这只是提高恶意扩展读取的门槛，并非端到端加密。
@@ -176,7 +199,7 @@ const getFullUrl = (config: WebDavConfig, filename?: string): string => {
 export const testConnection = async (config: WebDavConfig): Promise<boolean> => {
   try {
     const url = getFullUrl(config);
-    const response = await fetch(url, {
+    const response = await fetchWithTimeout(url, {
       method: "PROPFIND",
       headers: {
         ...getAuthHeaders(config),
@@ -197,18 +220,40 @@ export const testConnection = async (config: WebDavConfig): Promise<boolean> => 
  */
 export const ensureDirectory = async (config: WebDavConfig): Promise<boolean> => {
   try {
-    const url = getFullUrl(config);
-    const response = await fetch(url, {
-      method: "MKCOL",
-      headers: getAuthHeaders(config),
-    });
-    // 201 Created 或 405 Method Not Allowed（目录已存在）都表示成功
-    return (
-      response.status === 201 ||
-      response.status === 405 ||
-      response.status === 301 ||
-      response.status === 200
-    );
+    const serverUrl = config.serverUrl.replace(/\/+$/, "");
+    const segments = config.basePath
+      .split("/")
+      .map((segment) => segment.trim())
+      .filter(Boolean);
+
+    // basePath 为空时就是服务器根目录，不需要也无法 MKCOL
+    if (segments.length === 0) return true;
+
+    let path = "";
+    for (const segment of segments) {
+      path += `/${encodeURIComponent(segment)}`;
+      const url = `${serverUrl}${path}/`;
+      const response = await fetchWithTimeout(url, {
+        method: "MKCOL",
+        headers: getAuthHeaders(config),
+      });
+
+      // 201 Created / 405 Method Not Allowed（已存在）/ 301、200（重定向或已存在）
+      // 都表示这一级可用；遇到 401/403/409 等直接失败，避免把文件传到不存在的父目录。
+      const ok =
+        response.status === 201 ||
+        response.status === 405 ||
+        response.status === 301 ||
+        response.status === 200;
+      if (!ok) {
+        console.error(
+          `WebDAV 创建目录 ${path} 失败: HTTP ${response.status}`,
+        );
+        return false;
+      }
+    }
+
+    return true;
   } catch (error) {
     console.error("WebDAV 创建目录失败:", error);
     return false;
@@ -225,7 +270,7 @@ export const uploadFile = async (
 ): Promise<boolean> => {
   try {
     const url = getFullUrl(config, filename);
-    const response = await fetch(url, {
+    const response = await fetchWithTimeout(url, {
       method: "PUT",
       headers: {
         ...getAuthHeaders(config),
@@ -251,7 +296,7 @@ export const downloadFile = async (
 ): Promise<string | null> => {
   try {
     const url = getFullUrl(config, filename);
-    const response = await fetch(url, {
+    const response = await fetchWithTimeout(url, {
       method: "GET",
       headers: getAuthHeaders(config),
     });

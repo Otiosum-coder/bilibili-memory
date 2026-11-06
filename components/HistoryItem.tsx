@@ -3,9 +3,7 @@ import { formatDuration, getContentUrl, getTypeTag } from "../utils/common";
 import { LoaderCircle, Trash2 } from "lucide-react";
 import { checkIsFavorited, deleteHistoryContent, deleteHistoryEvent } from "../utils/db";
 import React, { useState, useEffect } from "react";
-import { getStorageValue } from "../utils/storage";
 import { toast } from "react-hot-toast";
-import { IS_SYNC_DELETE } from "../utils/constants";
 
 interface HistoryItemProps {
   item: HistoryListItem;
@@ -22,48 +20,7 @@ const historyDateFormatter = new Intl.DateTimeFormat("zh-CN", {
   hourCycle: "h23",
 });
 
-const deleteBilibiliHistory = async (business: string, id: number): Promise<void> => {
-  // 从background script获取cookie
-  const cookies = await new Promise<Browser.cookies.Cookie[]>((resolve, reject) => {
-    browser.runtime.sendMessage({ action: "getCookies" }, (response) => {
-      if (browser.runtime.lastError) {
-        reject(browser.runtime.lastError);
-        return;
-      }
-      if (response.success) {
-        resolve(response.cookies);
-      } else {
-        reject(new Error(response.error));
-      }
-    });
-  });
 
-  const bili_jct = cookies.find((cookie) => cookie.name === "bili_jct")?.value;
-  const SESSDATA = cookies.find((cookie) => cookie.name === "SESSDATA")?.value;
-
-  if (!bili_jct || !SESSDATA) {
-    throw new Error("未找到必要的Cookie,请先登录B站");
-  }
-
-  const kid = `${business}_${id}`;
-  const response = await fetch("https://api.bilibili.com/x/v2/history/delete", {
-    method: "POST",
-    credentials: "include",
-    headers: {
-      "Content-Type": "application/x-www-form-urlencoded",
-    },
-    body: `kid=${kid}&csrf=${bili_jct}`,
-  });
-
-  if (!response.ok) {
-    throw new Error(`删除 B 站历史记录失败：${response.statusText || response.status}`);
-  }
-
-  const data = await response.json();
-  if (data.code !== 0) {
-    throw new Error(data.message || "删除 B 站历史记录失败");
-  }
-};
 
 export const HistoryItem: React.FC<HistoryItemProps> = ({ item, displayMode, onDelete }) => {
   const [isFav, setIsFav] = useState(item.is_fav === true);
@@ -88,15 +45,6 @@ export const HistoryItem: React.FC<HistoryItemProps> = ({ item, displayMode, onD
         return;
       }
 
-      // 默认必须是 false。设置页读的是同一个键但默认 false（显示为"关闭"），
-      // 这里原来是 true —— 结果是**从未动过开关的用户，界面显示关闭，实际却在删 B 站服务器上的记录**。
-      // 对一个以"防丢失"为目的的扩展来说，这是最不能接受的默认值：宁可少删，不可多删。
-      const isSyncDelete = await getStorageValue(IS_SYNC_DELETE, false);
-      if (isSyncDelete) {
-        // 先删除B站服务器上的历史记录
-        await deleteBilibiliHistory(item.business, item.id);
-        console.log("删除B站服务器上的历史记录成功");
-      }
       await deleteHistoryContent(item.business, item.id);
       await onDelete?.();
     } catch (error) {

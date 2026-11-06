@@ -438,7 +438,7 @@ describe("最常看的 UP 主", () => {
 });
 
 describe("近期维度（最近在看的 UP 主）", () => {
-  it("按近期视频数优先：全时段多但近期没看的会被挤到后面", () => {
+  it("近期窗口内没看过的作者不会补进榜单", () => {
     const authors = buildTopAuthors(
       [
         // 甲：3 个视频，全是 40 天前看的
@@ -452,12 +452,10 @@ describe("近期维度（最近在看的 UP 主）", () => {
       5,
       { recentSinceSec: at(-29) },
     );
+    expect(authors).toHaveLength(1);
     expect(authors[0].mid).toBe(2);
     expect(authors[0].recentVideos).toBe(2);
     expect(authors[0].uniqueContents).toBe(2);
-    expect(authors[1].mid).toBe(1);
-    expect(authors[1].recentVideos).toBe(0);
-    expect(authors[1].uniqueContents).toBe(3);
   });
 
   it("窗口内重复看同一个视频只算 1 个", () => {

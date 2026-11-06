@@ -98,6 +98,11 @@ export interface DBConfig {
       keyPath: string;
       indexes: string[];
     };
+    /** 合集级消失档案（v13）：合集壳从订阅目录消失后单独保留 */
+    collectionArchives: {
+      keyPath: string;
+      indexes: string[];
+    };
     following: {
       keyPath: string;
       indexes: string[];
@@ -402,6 +407,39 @@ export interface SubscribedCollectionResource {
   invalidatedAt?: number;
 }
 
+/**
+ * 合集级消失档案。
+ *
+ * 合集从订阅目录里消失后，`subscribedCollections` 里已经没有这个壳，
+ * 视频条目也可能被清理；这里保存原来的合集元数据，详情页再按 id 去
+ * `subscribedCollectionResources` 读本地保留的视频列表。
+ */
+export interface CollectionArchive {
+  /** 合集 id（season_id） */
+  id: number;
+  title: string;
+  cover: string;
+  intro: string;
+  ctime: number;
+  mtime: number;
+  media_count: number;
+  upper: {
+    mid: number;
+    name: string;
+    face: string;
+  };
+  index: number;
+  /** 归档原因：从目录消失 / 接口返回失效占位 */
+  reason: "collection_gone" | "collection_invalid";
+  archivedAt: number;
+  /** 用户在消失档案里删除的时间；有值时不再自动恢复，也不再出现在默认列表 */
+  deletedAt?: number;
+  /** 归档时本地保存的视频条数 */
+  resourceCount: number;
+  /** 最近一次同步时接口给出的 media_count */
+  lastSyncedMediaCount: number;
+}
+
 // ---------------------------------------------------------------------------
 // 关注追踪（following / followingEvents）
 // ---------------------------------------------------------------------------
@@ -446,7 +484,15 @@ export interface FollowingItem {
   /** 最后一次已知的真实昵称；**永不写入空值或平台占位文案** */
   name: string;
   face: string;
-  /** 指向 assets store 的头像字节归档 */
+  /**
+   * 最后一次真实头像地址。
+   *
+   * 只保存地址，不保存图片字节；账号注销后 `face` 会变成 noface，
+   * 同步时保留这里的旧地址，用于继续显示注销前的头像。
+   * 地址本身失效时只能回退默认头像。
+   */
+  avatarSourceUrl?: string;
+  /** 历史遗留：指向 assets store 的头像字节归档；已停止写入，仅兼容旧数据 */
   avatarAssetId?: string;
   sign: string;
   /** 关注时间（接口字段，秒级时间戳）。注意：互关后会被刷新，不是稳定的关注时间 */
