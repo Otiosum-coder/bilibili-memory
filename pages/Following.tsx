@@ -934,9 +934,11 @@ export const Following = () => {
             </div>
           ) : items.length === 0 ? (
             <div className="py-20 text-center text-sm text-gray-400 dark:text-neutral-500">
-              <p>还没有关注数据。</p>
+              <p>{syncHealth || "还没有关注数据。"}</p>
               <p className="mt-2">
-                点上面的「立即同步」抓取一次。首次同步会建立基线，从第二次开始才会产生变动记录。
+                {syncHealth
+                  ? "按上面的提示重新同步；已有本地数据不会因为这次失败被删除。"
+                  : "点上面的「立即同步」抓取一次。首次同步会建立基线，从第二次开始才会产生变动记录。"}
               </p>
             </div>
           ) : filtered.length === 0 ? (

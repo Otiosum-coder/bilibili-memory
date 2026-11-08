@@ -4,7 +4,6 @@ import {
   Star,
   HistoryIcon,
   InfoIcon,
-  MessageCircleIcon,
   SettingsIcon,
   HardDriveDownload,
   Sun,
@@ -17,6 +16,7 @@ import {
 } from "lucide-react";
 import { UserInfo } from "./UserInfo";
 import ExpandableMenu from "./ExpandableMenu";
+import { ProjectInfoModal } from "./ProjectInfoModal";
 import {
   UPDATE_HISTORY,
   HIDE_USER_INFO,
@@ -72,11 +72,6 @@ const menuList = [
     to: "/about",
   },
   {
-    title: "反馈",
-    icon: <MessageCircleIcon className="w-4 h-4" />,
-    to: "/feedback",
-  },
-  {
     title: "数据备份",
     icon: <HardDriveDownload className="w-4 h-4" />,
     to: "/webdav-sync",
@@ -112,6 +107,7 @@ export const Sidebar = () => {
   const [hiddenMenus, setHiddenMenus] = useState<string[]>([]);
   const [menuOrder, setMenuOrder] = useState<string[]>([]);
   const [themeMode, setThemeMode] = useState<ThemeMode>("light");
+  const [showProjectCard, setShowProjectCard] = useState(false);
 
   useEffect(() => {
     getStorageValue(HIDE_USER_INFO, false).then(setHideUserInfo);
@@ -164,6 +160,11 @@ export const Sidebar = () => {
       browser.storage.onChanged.removeListener(handleStorageChange);
     };
   }, []);
+
+  // 切换页面时关闭项目信息弹窗，避免返回时还挂在旧页面上。
+  useEffect(() => {
+    setShowProjectCard(false);
+  }, [location.pathname]);
 
   /**
    * 按用户自定义顺序排列菜单。
@@ -234,14 +235,22 @@ export const Sidebar = () => {
         </button>
 
         {/* 品牌位：图标 + 名称/版本两行，占满宽度。
-            侧边栏只有 160px，放不下右侧艺术字，所以这里只用图标；完整 lockup 在关于页与欢迎页。 */}
-        <div className="flex items-center gap-2 px-1">
+            侧边栏只有 152px，放不下横版 art lockup；完整 lockup 放在居中弹窗和关于页。
+            整块可点，打开项目信息弹窗，不额外占导航位置。 */}
+        <button
+          type="button"
+          onClick={() => setShowProjectCard(true)}
+          aria-haspopup="dialog"
+          aria-expanded={showProjectCard}
+          title="查看项目信息"
+          className="flex w-full items-center gap-2 rounded-lg px-1.5 py-1.5 text-left transition-colors hover:bg-gray-200/70 dark:hover:bg-neutral-800/80"
+        >
           <img
             src="/icon/96.png"
-            alt="哔哩哔哩记忆"
+            alt=""
             className="h-8 w-8 shrink-0 rounded-lg"
           />
-          <div className="min-w-0">
+          <div className="min-w-0 flex-1">
             <p className="truncate text-xs font-medium leading-tight text-gray-700 dark:text-neutral-200">
               哔哩哔哩记忆
             </p>
@@ -249,8 +258,14 @@ export const Sidebar = () => {
               {version ? `v${version}` : ""}
             </p>
           </div>
-        </div>
+        </button>
       </div>
+
+      <ProjectInfoModal
+        open={showProjectCard}
+        onClose={() => setShowProjectCard(false)}
+        version={version}
+      />
     </div>
   );
 };

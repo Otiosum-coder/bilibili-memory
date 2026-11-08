@@ -80,8 +80,13 @@ export const SubscribedCollections = () => {
   };
 
   const openArchiveDetail = async (archive: CollectionArchive) => {
+    setSelectedCollectionId(null);
     setArchiveDetail(archive);
+    setArchiveResources([]);
     setArchiveDeleteConfirm(false);
+    setCurrentPage(1);
+    setKeyword("");
+    contentRef.current?.scrollTo({ top: 0 });
     setArchiveLoading(true);
     try {
       const list = await getSubscribedCollectionResources(archive.id);
@@ -206,6 +211,14 @@ export const SubscribedCollections = () => {
   };
 
   const refreshResources = async (collection: SubscribedCollection) => {
+    // B 站已删除的合集只存在本地，刷新时不能再向 B 站请求内容。
+    if (collection.localRestore) {
+      await loadResources(collection.id).catch(() =>
+        toast.error("加载本地合集内容失败"),
+      );
+      return;
+    }
+
     setIsSyncingResources(true);
     try {
       const response = await browser.runtime.sendMessage({
@@ -246,7 +259,9 @@ export const SubscribedCollections = () => {
     refreshResources(selectedCollection);
   }, [selectedCollectionId]);
 
-  const filteredResources = resources.filter((item) => {
+  const displayResources = archiveDetail ? archiveResources : resources;
+
+  const filteredResources = displayResources.filter((item) => {
     if (!keyword) return true;
     const lowerKeyword = keyword.toLowerCase();
 
@@ -300,14 +315,25 @@ export const SubscribedCollections = () => {
             <button
               key={collection.id}
               type="button"
-              onClick={() => setSelectedCollectionId(collection.id)}
+              onClick={() => {
+                setArchiveDetail(null);
+                setArchiveResources([]);
+                setSelectedCollectionId(collection.id);
+              }}
               className={`w-full p-3 rounded-lg text-left mb-1 transition-colors ${
                 selectedCollectionId === collection.id
                   ? "bg-blue-50 dark:bg-blue-500/10 text-blue-600 dark:text-blue-400"
                   : "hover:bg-gray-100 dark:hover:bg-neutral-800"
               }`}
             >
-              <div className="font-medium truncate">{collection.title}</div>
+              <div className="flex min-w-0 items-center gap-1.5">
+                <span className="truncate font-medium">{collection.title}</span>
+                {collection.localRestore && (
+                  <span className="shrink-0 rounded-full bg-amber-50 px-1.5 py-0.5 text-[10px] font-medium text-amber-600 dark:bg-amber-500/10 dark:text-amber-400">
+                    本地恢复
+                  </span>
+                )}
+              </div>
               <div className="text-xs text-gray-400 dark:text-neutral-500 mt-1 truncate">
                 {collection.upper?.name || "未知 UP 主"} · {collection.media_count} 个视频
               </div>
@@ -319,7 +345,11 @@ export const SubscribedCollections = () => {
               key={archive.id}
               type="button"
               onClick={() => void openArchiveDetail(archive)}
-              className="mb-1 w-full rounded-lg p-3 text-left transition-colors hover:bg-amber-50 dark:hover:bg-amber-500/10"
+              className={`mb-1 w-full rounded-lg p-3 text-left transition-colors ${
+                archiveDetail?.id === archive.id
+                  ? "bg-amber-50 text-amber-700 dark:bg-amber-500/10 dark:text-amber-300"
+                  : "hover:bg-amber-50 dark:hover:bg-amber-500/10"
+              }`}
             >
               <div className="flex min-w-0 items-center gap-2">
                 <span className="truncate font-medium text-gray-700 dark:text-neutral-300">
@@ -347,193 +377,188 @@ export const SubscribedCollections = () => {
       <main className="flex-1 overflow-y-auto" ref={contentRef}>
         <div className="p-6">
           {selectedCollection ? (
-            <>
-              <section className="mb-6 flex flex-col md:flex-row justify-between md:items-center gap-4 bg-white dark:bg-neutral-900 p-4 rounded-xl shadow-sm border border-gray-100 dark:border-neutral-800">
-                <div className="min-w-0">
-                  <h1 className="text-xl font-bold flex items-center gap-2 min-w-0">
-                    <span className="truncate">{selectedCollection.title}</span>
-                    <span className="shrink-0 text-sm font-normal text-gray-500 dark:text-neutral-400 bg-gray-50 dark:bg-neutral-800 px-2 py-1 rounded-full border border-gray-100 dark:border-neutral-700">
-                      {filteredResources.length} 个视频
+            <section className="mb-6 flex flex-col md:flex-row justify-between md:items-center gap-4 bg-white dark:bg-neutral-900 p-4 rounded-xl shadow-sm border border-gray-100 dark:border-neutral-800">
+              <div className="min-w-0">
+                <h1 className="text-xl font-bold flex items-center gap-2 min-w-0">
+                  <span className="truncate">{selectedCollection.title}</span>
+                  {selectedCollection.localRestore && (
+                    <span className="shrink-0 rounded-full bg-amber-50 px-2 py-0.5 text-xs font-medium text-amber-600 dark:bg-amber-500/10 dark:text-amber-400">
+                      B站已删除 · 本地保留
                     </span>
-                  </h1>
-                  {selectedCollection.intro && (
-                    <p className="mt-2 text-sm text-gray-500 dark:text-neutral-400 line-clamp-1">
-                      {selectedCollection.intro}
-                    </p>
                   )}
-                </div>
+                  <span className="shrink-0 text-sm font-normal text-gray-500 dark:text-neutral-400 bg-gray-50 dark:bg-neutral-800 px-2 py-1 rounded-full border border-gray-100 dark:border-neutral-700">
+                    {filteredResources.length} 个视频
+                  </span>
+                </h1>
+                {selectedCollection.localRestore && (
+                  <p className="mt-2 text-xs text-amber-600 dark:text-amber-400">
+                    这个合集已从 B 站删除，下面显示的是本地保存的内容。
+                  </p>
+                )}
+                {selectedCollection.intro && (
+                  <p className="mt-2 text-sm text-gray-500 dark:text-neutral-400 line-clamp-1">
+                    {selectedCollection.intro}
+                  </p>
+                )}
+              </div>
 
-                <div className="flex items-center gap-3 w-full md:w-auto">
-                  <div className="relative flex-1 md:w-[32rem] group flex items-center bg-gray-50 dark:bg-neutral-800 border border-gray-200 dark:border-neutral-700 rounded-full transition-all duration-300 shadow-sm hover:shadow-md focus-within:bg-white dark:focus-within:bg-neutral-800 focus-within:ring-2 focus-within:ring-blue-100 dark:focus-within:ring-blue-500/20 focus-within:border-blue-400 dark:focus-within:border-blue-500">
-                    <div className="relative">
-                      <button
-                        type="button"
-                        className="pl-4 pr-3 py-2 text-sm text-gray-600 dark:text-neutral-300 font-medium border-r border-gray-200 dark:border-neutral-700 hover:text-blue-600 dark:hover:text-blue-400 flex items-center gap-1 transition-colors whitespace-nowrap"
-                        onClick={() => setIsSearchKindDropdownOpen((open) => !open)}
-                      >
-                        <span>{searchLabel}</span>
-                        <ChevronDownIcon className="w-3 h-3 text-gray-400 dark:text-neutral-500" />
-                      </button>
+              <div className="flex items-center gap-3 w-full md:w-auto">
+                <div className="relative flex-1 md:w-[32rem] group flex items-center bg-gray-50 dark:bg-neutral-800 border border-gray-200 dark:border-neutral-700 rounded-full transition-all duration-300 shadow-sm hover:shadow-md focus-within:bg-white dark:focus-within:bg-neutral-800 focus-within:ring-2 focus-within:ring-blue-100 dark:focus-within:ring-blue-500/20 focus-within:border-blue-400 dark:focus-within:border-blue-500">
+                  <div className="relative">
+                    <button
+                      type="button"
+                      className="pl-4 pr-3 py-2 text-sm text-gray-600 dark:text-neutral-300 font-medium border-r border-gray-200 dark:border-neutral-700 hover:text-blue-600 dark:hover:text-blue-400 flex items-center gap-1 transition-colors whitespace-nowrap"
+                      onClick={() => setIsSearchKindDropdownOpen((open) => !open)}
+                    >
+                      <span>{searchLabel}</span>
+                      <ChevronDownIcon className="w-3 h-3 text-gray-400 dark:text-neutral-500" />
+                    </button>
 
-                      {isSearchKindDropdownOpen && (
-                        <>
-                          <button
-                            type="button"
-                            aria-label="关闭搜索类型菜单"
-                            className="fixed inset-0 z-10 cursor-default"
-                            onClick={() => setIsSearchKindDropdownOpen(false)}
-                          />
-                          <div className="absolute top-full left-0 mt-2 w-32 bg-white dark:bg-neutral-900 rounded-lg shadow-lg border border-gray-100 dark:border-neutral-800 py-1 z-20 overflow-hidden">
-                            {SEARCH_OPTIONS.map((option) => (
-                              <button
-                                key={option.value}
-                                type="button"
-                                className={`w-full text-left px-4 py-2 text-sm transition-colors ${
-                                  searchType === option.value
-                                    ? "bg-blue-50 dark:bg-blue-500/10 text-blue-600 dark:text-blue-400 font-medium"
-                                    : "text-gray-600 dark:text-neutral-300 hover:bg-gray-50 dark:hover:bg-neutral-800"
-                                }`}
-                                onClick={() => {
-                                  setSearchType(option.value);
-                                  setIsSearchKindDropdownOpen(false);
-                                  setCurrentPage(1);
-                                }}
-                              >
-                                {option.label}
-                              </button>
-                            ))}
-                          </div>
-                        </>
-                      )}
-                    </div>
-
-                    <input
-                      type="text"
-                      className="flex-1 min-w-0 bg-transparent border-none focus:ring-0 pl-4 pr-10 py-2 text-sm text-gray-700 dark:text-neutral-100 placeholder-gray-400 dark:placeholder-neutral-500 focus:outline-none"
-                      placeholder="搜索..."
-                      value={keyword}
-                      onChange={(event) => {
-                        setKeyword(event.target.value);
-                        setCurrentPage(1);
-                      }}
-                    />
-                    {keyword ? (
-                      <button
-                        type="button"
-                        aria-label="清空搜索"
-                        onClick={() => {
-                          setKeyword("");
-                          setCurrentPage(1);
-                        }}
-                        className="absolute inset-y-0 right-0 pr-3 flex items-center text-gray-400 dark:text-neutral-500 hover:text-gray-600 dark:hover:text-neutral-300 transition-colors"
-                      >
-                        <X className="h-4 w-4" />
-                      </button>
-                    ) : (
-                      <div className="absolute inset-y-0 right-0 pr-3 flex items-center pointer-events-none">
-                        <Search className="h-4 w-4 text-gray-400 dark:text-neutral-500" />
-                      </div>
+                    {isSearchKindDropdownOpen && (
+                      <>
+                        <button
+                          type="button"
+                          aria-label="关闭搜索类型菜单"
+                          className="fixed inset-0 z-10 cursor-default"
+                          onClick={() => setIsSearchKindDropdownOpen(false)}
+                        />
+                        <div className="absolute top-full left-0 mt-2 w-32 bg-white dark:bg-neutral-900 rounded-lg shadow-lg border border-gray-100 dark:border-neutral-800 py-1 z-20 overflow-hidden">
+                          {SEARCH_OPTIONS.map((option) => (
+                            <button
+                              key={option.value}
+                              type="button"
+                              className={`w-full text-left px-4 py-2 text-sm transition-colors ${
+                                searchType === option.value
+                                  ? "bg-blue-50 dark:bg-blue-500/10 text-blue-600 dark:text-blue-400 font-medium"
+                                  : "text-gray-600 dark:text-neutral-300 hover:bg-gray-50 dark:hover:bg-neutral-800"
+                              }`}
+                              onClick={() => {
+                                setSearchType(option.value);
+                                setIsSearchKindDropdownOpen(false);
+                                setCurrentPage(1);
+                              }}
+                            >
+                              {option.label}
+                            </button>
+                          ))}
+                        </div>
+                      </>
                     )}
                   </div>
 
-                  {isSyncingResources && (
-                    <span className="flex items-center gap-1.5 whitespace-nowrap text-xs text-gray-400 dark:text-neutral-500">
-                      <RefreshCw className="w-3.5 h-3.5 animate-spin" />
-                      同步中
-                    </span>
-                  )}
-                </div>
-              </section>
-
-              {isSyncingResources && resources.length === 0 ? (
-                <div className="text-center py-10 text-gray-500 dark:text-neutral-400">
-                  正在同步合集内容...
-                </div>
-              ) : (
-                <>
-                  <div className="grid grid-cols-[repeat(auto-fill,minmax(240px,1fr))] gap-6">
-                    {currentResources.map((item) => (
-                      <a
-                        key={item.id}
-                        href={`https://www.bilibili.com/video/${item.bvid}`}
-                        target="_blank"
-                        rel="noopener noreferrer"
-                        className="border border-gray-200 dark:border-neutral-800 rounded-lg overflow-hidden flex flex-col bg-white dark:bg-neutral-900 hover:shadow-md transition-shadow no-underline text-inherit"
-                      >
-                        <div className="relative w-full aspect-video bg-gray-100 dark:bg-neutral-800">
-                          {item.cover ? (
-                            <img
-                              src={`${item.cover.replace("http:", "https:")}@760w_428h_1c.avif`}
-                              alt={item.title}
-                              className="w-full h-full object-cover"
-                              loading="lazy"
-                            />
-                          ) : (
-                            <div className="w-full h-full flex items-center justify-center text-gray-400 dark:text-neutral-500">
-                              <LibraryBig className="w-8 h-8" />
-                            </div>
-                          )}
-                          {/* 时长压在封面右下角。它是"基本不变"的元数据，
-                              比标题更能说明这是哪条内容——标题会被占位文案顶掉 */}
-                          {formatInteractionDuration(item.duration) ? (
-                            <span className="absolute bottom-1.5 right-1.5 rounded bg-black/70 px-1.5 py-0.5 text-xs tabular-nums text-white">
-                              {formatInteractionDuration(item.duration)}
-                            </span>
-                          ) : null}
-                        </div>
-                        <div className="p-3 flex-1 flex flex-col">
-                          <h3
-                            className="m-0 text-sm leading-[1.4] h-10 overflow-hidden line-clamp-2"
-                            title={item.title}
-                          >
-                            {item.title}
-                          </h3>
-                          <div className="flex justify-between items-center text-gray-500 dark:text-neutral-400 text-xs mt-2 gap-2">
-                            <button
-                              type="button"
-                              onClick={(event) => {
-                                event.preventDefault();
-                                event.stopPropagation();
-                                window.open(
-                                  `https://space.bilibili.com/${item.author_mid}`,
-                                  "_blank",
-                                );
-                              }}
-                              className="hover:text-[#fb7299] transition-colors cursor-pointer truncate text-left"
-                            >
-                              {item.author_name}
-                            </button>
-                            <span className="shrink-0">
-                              {item.pubdate
-                                ? new Date(item.pubdate * 1000).toLocaleDateString()
-                                : ""}
-                            </span>
-                          </div>
-                        </div>
-                      </a>
-                    ))}
-                  </div>
-
-                  {currentResources.length === 0 && (
-                    <div className="text-center py-16 text-gray-400 dark:text-neutral-500">
-                      这个合集暂时没有可显示的视频
+                  <input
+                    type="text"
+                    className="flex-1 min-w-0 bg-transparent border-none focus:ring-0 pl-4 pr-10 py-2 text-sm text-gray-700 dark:text-neutral-100 placeholder-gray-400 dark:placeholder-neutral-500 focus:outline-none"
+                    placeholder="搜索..."
+                    value={keyword}
+                    onChange={(event) => {
+                      setKeyword(event.target.value);
+                      setCurrentPage(1);
+                    }}
+                  />
+                  {keyword ? (
+                    <button
+                      type="button"
+                      aria-label="清空搜索"
+                      onClick={() => {
+                        setKeyword("");
+                        setCurrentPage(1);
+                      }}
+                      className="absolute inset-y-0 right-0 pr-3 flex items-center text-gray-400 dark:text-neutral-500 hover:text-gray-600 dark:hover:text-neutral-300 transition-colors"
+                    >
+                      <X className="h-4 w-4" />
+                    </button>
+                  ) : (
+                    <div className="absolute inset-y-0 right-0 pr-3 flex items-center pointer-events-none">
+                      <Search className="h-4 w-4 text-gray-400 dark:text-neutral-500" />
                     </div>
                   )}
+                </div>
 
-                  <div className="mt-8">
-                    <Pagination
-                      currentPage={currentPage}
-                      totalItems={filteredResources.length}
-                      pageSize={pageSize}
-                      onPageChange={(page) => {
-                        setCurrentPage(page);
-                        contentRef.current?.scrollTo({ top: 0, behavior: "smooth" });
-                      }}
+                {isSyncingResources && (
+                  <span className="flex items-center gap-1.5 whitespace-nowrap text-xs text-gray-400 dark:text-neutral-500">
+                    <RefreshCw className="w-3.5 h-3.5 animate-spin" />
+                    同步中
+                  </span>
+                )}
+              </div>
+            </section>
+          ) : archiveDetail ? (
+            <section className="mb-6 flex flex-col md:flex-row justify-between md:items-center gap-4 bg-white dark:bg-neutral-900 p-4 rounded-xl shadow-sm border border-amber-100 dark:border-amber-500/20">
+              <div className="flex min-w-0 flex-1 items-center gap-4">
+                <div className="flex h-16 w-28 shrink-0 items-center justify-center overflow-hidden rounded-lg bg-gray-100 dark:bg-neutral-800">
+                  {archiveDetail.cover ? (
+                    <img
+                      src={archiveDetail.cover.replace("http:", "https:")}
+                      alt={archiveDetail.title}
+                      className="h-full w-full object-cover"
                     />
+                  ) : (
+                    <ArchiveIcon className="h-7 w-7 text-gray-400" />
+                  )}
+                </div>
+                <div className="min-w-0">
+                  <div className="flex flex-wrap items-center gap-2">
+                    <h1 className="truncate text-xl font-bold">
+                      {archiveDetail.title || `合集 ${archiveDetail.id}`}
+                    </h1>
+                    <span className="shrink-0 rounded-full bg-amber-50 px-2 py-0.5 text-xs font-medium text-amber-600 dark:bg-amber-500/10 dark:text-amber-400">
+                      本地备份
+                    </span>
+                    <span className="shrink-0 rounded-full bg-gray-100 px-2 py-0.5 text-xs text-gray-500 dark:bg-neutral-800 dark:text-neutral-400">
+                      {archiveDetail.reason === "collection_gone" ? "已离开订阅" : "合集已失效"}
+                    </span>
+                    <span className="shrink-0 rounded-full border border-gray-100 bg-gray-50 px-2 py-1 text-sm font-normal text-gray-500 dark:border-neutral-700 dark:bg-neutral-800 dark:text-neutral-400">
+                      {filteredResources.length} 个视频
+                    </span>
                   </div>
-                </>
-              )}
-            </>
+                  <p className="mt-1 text-sm text-gray-500 dark:text-neutral-400">
+                    {archiveDetail.upper?.name || "未知 UP 主"} · 合集 ID {archiveDetail.id}
+                  </p>
+                  <p className="mt-1 text-xs text-gray-400 dark:text-neutral-500">
+                    归档于 {formatArchiveDate(archiveDetail.archivedAt)} · 本地保存{" "}
+                    {archiveDetail.resourceCount || archiveResources.length} 条
+                  </p>
+                </div>
+              </div>
+
+              <div className="flex w-full items-center gap-3 md:w-auto">
+                <div className="relative flex flex-1 items-center rounded-full border border-gray-200 bg-gray-50 shadow-sm transition-all duration-300 focus-within:border-amber-400 focus-within:bg-white focus-within:ring-2 focus-within:ring-amber-100 dark:border-neutral-700 dark:bg-neutral-800 dark:focus-within:bg-neutral-800 dark:focus-within:ring-amber-500/20 md:w-[24rem]">
+                  <Search className="ml-3 h-4 w-4 shrink-0 text-gray-400 dark:text-neutral-500" />
+                  <input
+                    type="text"
+                    className="min-w-0 flex-1 border-none bg-transparent py-2 pl-2 pr-8 text-sm text-gray-700 placeholder-gray-400 focus:outline-none focus:ring-0 dark:text-neutral-100 dark:placeholder-neutral-500"
+                    placeholder="搜索本地备份..."
+                    value={keyword}
+                    onChange={(event) => {
+                      setKeyword(event.target.value);
+                      setCurrentPage(1);
+                    }}
+                  />
+                  {keyword ? (
+                    <button
+                      type="button"
+                      aria-label="清空搜索"
+                      onClick={() => {
+                        setKeyword("");
+                        setCurrentPage(1);
+                      }}
+                      className="absolute inset-y-0 right-0 flex items-center pr-3 text-gray-400 transition-colors hover:text-gray-600 dark:hover:text-neutral-300"
+                    >
+                      <X className="h-4 w-4" />
+                    </button>
+                  ) : null}
+                </div>
+                <button
+                  type="button"
+                  onClick={() => setArchiveDeleteConfirm(true)}
+                  className="flex shrink-0 items-center gap-1.5 rounded-lg border border-red-200 px-3 py-1.5 text-sm text-red-500 transition-colors hover:bg-red-50 dark:border-red-500/30 dark:hover:bg-red-500/10"
+                >
+                  <Trash2 className="h-4 w-4" />
+                  删除备份
+                </button>
+              </div>
+            </section>
           ) : (
             <div className="h-full min-h-[24rem] flex flex-col items-center justify-center text-gray-400 dark:text-neutral-500">
               <LibraryBig className="w-12 h-12 mb-4" />
@@ -546,111 +571,104 @@ export const SubscribedCollections = () => {
               </p>
             </div>
           )}
+
+          {archiveDetail && archiveLoading ? (
+            <div className="py-10 text-center text-gray-500 dark:text-neutral-400">
+              正在加载备份内容...
+            </div>
+          ) : selectedCollection && isSyncingResources && resources.length === 0 ? (
+            <div className="py-10 text-center text-gray-500 dark:text-neutral-400">
+              正在同步合集内容...
+            </div>
+          ) : selectedCollection || archiveDetail ? (
+            <>
+              <div className="grid grid-cols-[repeat(auto-fill,minmax(240px,1fr))] gap-6">
+                {currentResources.map((item) => (
+                  <a
+                    key={item.id}
+                    href={`https://www.bilibili.com/video/${item.bvid}`}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className="border border-gray-200 dark:border-neutral-800 rounded-lg overflow-hidden flex flex-col bg-white dark:bg-neutral-900 hover:shadow-md transition-shadow no-underline text-inherit"
+                  >
+                    <div className="relative w-full aspect-video bg-gray-100 dark:bg-neutral-800">
+                      {item.cover ? (
+                        <img
+                          src={`${item.cover.replace("http:", "https:")}@760w_428h_1c.avif`}
+                          alt={item.title}
+                          className="w-full h-full object-cover"
+                          loading="lazy"
+                        />
+                      ) : (
+                        <div className="w-full h-full flex items-center justify-center text-gray-400 dark:text-neutral-500">
+                          <LibraryBig className="w-8 h-8" />
+                        </div>
+                      )}
+                      {/* 时长压在封面右下角。它是"基本不变"的元数据，
+                          比标题更能说明这是哪条内容——标题会被占位文案顶掉 */}
+                      {formatInteractionDuration(item.duration) ? (
+                        <span className="absolute bottom-1.5 right-1.5 rounded bg-black/70 px-1.5 py-0.5 text-xs tabular-nums text-white">
+                          {formatInteractionDuration(item.duration)}
+                        </span>
+                      ) : null}
+                    </div>
+                    <div className="p-3 flex-1 flex flex-col">
+                      <h3
+                        className="m-0 text-sm leading-[1.4] h-10 overflow-hidden line-clamp-2"
+                        title={item.title}
+                      >
+                        {item.title}
+                      </h3>
+                      <div className="flex justify-between items-center text-gray-500 dark:text-neutral-400 text-xs mt-2 gap-2">
+                        <button
+                          type="button"
+                          onClick={(event) => {
+                            event.preventDefault();
+                            event.stopPropagation();
+                            window.open(
+                              `https://space.bilibili.com/${item.author_mid}`,
+                              "_blank",
+                            );
+                          }}
+                          className="hover:text-[#fb7299] transition-colors cursor-pointer truncate text-left"
+                        >
+                          {item.author_name}
+                        </button>
+                        <span className="shrink-0">
+                          {item.pubdate ? new Date(item.pubdate * 1000).toLocaleDateString() : ""}
+                        </span>
+                      </div>
+                    </div>
+                  </a>
+                ))}
+              </div>
+
+              {currentResources.length === 0 && (
+                <div className="text-center py-16 text-gray-400 dark:text-neutral-500">
+                  {archiveDetail
+                    ? archiveResources.length === 0
+                      ? "本地没有保存到这个合集的内容"
+                      : "没有匹配的备份内容"
+                    : "这个合集暂时没有可显示的视频"}
+                </div>
+              )}
+
+              <div className="mt-8">
+                <Pagination
+                  currentPage={currentPage}
+                  totalItems={filteredResources.length}
+                  pageSize={pageSize}
+                  onPageChange={(page) => {
+                    setCurrentPage(page);
+                    contentRef.current?.scrollTo({ top: 0, behavior: "smooth" });
+                  }}
+                />
+              </div>
+            </>
+          ) : null}
         </div>
       </main>
 
-      {archiveDetail ? (
-        <div
-          className="fixed inset-0 z-[70] flex items-center justify-center bg-black/50 p-4"
-          onMouseDown={(event) => {
-            if (event.target === event.currentTarget) setArchiveDetail(null);
-          }}
-        >
-          <div className="flex max-h-[85vh] w-full max-w-3xl flex-col overflow-hidden rounded-2xl bg-white shadow-2xl dark:bg-neutral-900">
-            <div className="flex items-start gap-4 border-b border-gray-100 p-5 dark:border-neutral-800">
-              <div className="flex h-16 w-28 shrink-0 items-center justify-center overflow-hidden rounded-lg bg-gray-100 dark:bg-neutral-800">
-                {archiveDetail.cover ? (
-                  <img
-                    src={archiveDetail.cover.replace("http:", "https:")}
-                    alt={archiveDetail.title}
-                    className="h-full w-full object-cover"
-                  />
-                ) : (
-                  <ArchiveIcon className="h-7 w-7 text-gray-400" />
-                )}
-              </div>
-              <div className="min-w-0 flex-1">
-                <div className="flex flex-wrap items-center gap-2">
-                  <h2 className="truncate text-lg font-bold">
-                    {archiveDetail.title || `合集 ${archiveDetail.id}`}
-                  </h2>
-                  <span className="rounded-full bg-amber-50 px-2 py-0.5 text-xs font-medium text-amber-600 dark:bg-amber-500/10 dark:text-amber-400">
-                    本地备份
-                  </span>
-                  <span className="rounded-full bg-gray-100 px-2 py-0.5 text-xs text-gray-500 dark:bg-neutral-800 dark:text-neutral-400">
-                    {archiveDetail.reason === "collection_gone" ? "已离开订阅" : "合集已失效"}
-                  </span>
-                </div>
-                <div className="mt-1 text-sm text-gray-500 dark:text-neutral-400">
-                  {archiveDetail.upper?.name || "未知 UP 主"} · 合集 ID {archiveDetail.id}
-                </div>
-                <div className="mt-1 text-xs text-gray-400 dark:text-neutral-500">
-                  归档于 {formatArchiveDate(archiveDetail.archivedAt)} · 本地保存{" "}
-                  {archiveDetail.resourceCount || archiveResources.length} 条
-                </div>
-              </div>
-              <button
-                type="button"
-                aria-label="关闭合集备份详情"
-                onClick={() => setArchiveDetail(null)}
-                className="rounded-md p-1.5 text-gray-400 hover:bg-gray-100 hover:text-gray-600 dark:hover:bg-neutral-800 dark:hover:text-neutral-300"
-              >
-                <X className="h-5 w-5" />
-              </button>
-            </div>
-
-            <div className="flex items-center justify-between gap-3 border-b border-gray-100 px-5 py-3 dark:border-neutral-800">
-              <p className="text-xs text-gray-400 dark:text-neutral-500">
-                删除只清理本地备份，不会取消 B 站订阅；5 秒内可撤销。
-              </p>
-              <button
-                type="button"
-                onClick={() => setArchiveDeleteConfirm(true)}
-                className="flex shrink-0 items-center gap-1.5 rounded-lg border border-red-200 px-3 py-1.5 text-sm text-red-500 transition-colors hover:bg-red-50 dark:border-red-500/30 dark:hover:bg-red-500/10"
-              >
-                <Trash2 className="h-4 w-4" />
-                删除备份
-              </button>
-            </div>
-
-            <div className="min-h-0 flex-1 overflow-y-auto p-5">
-              {archiveLoading ? (
-                <div className="py-10 text-center text-sm text-gray-400 dark:text-neutral-500">
-                  正在加载备份内容...
-                </div>
-              ) : archiveResources.length === 0 ? (
-                <div className="py-10 text-center text-sm text-gray-400 dark:text-neutral-500">
-                  本地没有保存到这个合集的内容
-                </div>
-              ) : (
-                <div className="space-y-2">
-                  {archiveResources.map((resource) => (
-                    <a
-                      key={resource.id}
-                      href={`https://www.bilibili.com/video/${resource.bvid}`}
-                      target="_blank"
-                      rel="noopener noreferrer"
-                      className="flex items-center gap-3 rounded-lg border border-gray-100 p-3 text-inherit no-underline transition-colors hover:bg-gray-50 dark:border-neutral-800 dark:hover:bg-neutral-800/60"
-                    >
-                      <span className="min-w-0 flex-1 truncate text-sm">
-                        {resource.title || "已失效视频"}
-                      </span>
-                      <span className="shrink-0 font-mono text-xs text-gray-400 dark:text-neutral-500">
-                        {resource.bvid}
-                      </span>
-                      <span className="shrink-0 text-xs text-gray-400 dark:text-neutral-500">
-                        {resource.pubdate
-                          ? new Date(resource.pubdate * 1000).toLocaleDateString()
-                          : ""}
-                      </span>
-                    </a>
-                  ))}
-                </div>
-              )}
-            </div>
-          </div>
-        </div>
-      ) : null}
 
       {archiveDeleteConfirm && archiveDetail ? (
         <div className="fixed inset-0 z-[80] flex items-center justify-center bg-black/50 p-4">

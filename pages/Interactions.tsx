@@ -733,13 +733,17 @@ const Interactions = () => {
             </div>
           ) : items.length === 0 ? (
             <div className="py-20 text-center text-sm text-gray-400 dark:text-neutral-500">
-              <p>还没有互动记录。</p>
+              <p>{syncHealth || "还没有互动记录。"}</p>
               <p className="mt-2">
                 数据来源就是你个人主页上的「最近点赞的视频」与「最近投币的视频」两个模块，
                 点上面的「立即同步」即可抓取；之后每次访问 B 站个人主页（半小时最多一次）
                 也会自动补抓一把。
               </p>
-              <p className="mt-2">B 站只保留最近 20 条，越早开始记录，能留住的越多。</p>
+              <p className="mt-2">
+                {syncHealth
+                  ? "按上面的提示重新同步；已有本地数据不会因为这次失败被删除。"
+                  : "B 站只保留最近 20 条，越早开始记录，能留住的越多。"}
+              </p>
             </div>
           ) : filtered.length === 0 ? (
             <div className="py-20 text-center text-sm text-gray-400 dark:text-neutral-500">

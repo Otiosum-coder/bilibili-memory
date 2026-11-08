@@ -825,7 +825,7 @@ export const History: React.FC = () => {
           <p className="mt-2 text-sm leading-6 text-gray-500 dark:text-neutral-400">
             {hasActiveFilters
               ? "试试更换关键词、分类或日期范围。"
-              : "同步 B 站历史后，你的观看记录会显示在这里。"}
+              : "可能是还没同步过，也可能 B 站端确实没有记录。点右上角同步一次；如果同步失败，页面会给出提示。"}
           </p>
           {hasActiveFilters && (
             <button

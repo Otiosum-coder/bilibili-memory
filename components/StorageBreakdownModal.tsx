@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { AlertTriangle, X } from "lucide-react";
 import { formatStorageSize } from "../utils/storageHealth";
+import { getDataSafetyLog, type DataSafetyEvent } from "../utils/dataSafetyLog";
 import {
   sumSelectedAssetBytes,
   type AssetKindSummary,
@@ -18,7 +19,7 @@ interface StorageBreakdownModalProps {
   /** 执行清理，返回每个类别的实际结果 */
   onCleanup: (
     kinds: AssetKind[],
-  ) => Promise<Array<{ kind: AssetKind; deleted: number; freedBytes: number }>>;
+  ) => Promise<Array<{ kind: AssetKind; deleted: number; freedBytes: number; skipped?: number }>>;
   onClose: () => void;
   /** 清理完成后通知外部刷新统计 */
   onCleaned: () => void;
@@ -50,6 +51,7 @@ export const StorageBreakdownModal = ({
   const [selected, setSelected] = useState<AssetKind[]>([]);
   const [step, setStep] = useState<CleanupStep>("overview");
   const [result, setResult] = useState<string>("");
+  const [safetyLog, setSafetyLog] = useState<DataSafetyEvent[]>([]);
   const dialogRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
@@ -57,6 +59,9 @@ export const StorageBreakdownModal = ({
     setSelected([]);
     setStep("overview");
     setResult("");
+    void getDataSafetyLog()
+      .then(setSafetyLog)
+      .catch(() => setSafetyLog([]));
   }, [open]);
 
   useEffect(() => {
@@ -109,7 +114,10 @@ export const StorageBreakdownModal = ({
       const outcome = await Promise.race([onCleanup(selected), timeout]);
       const freed = outcome.reduce((total, entry) => total + entry.freedBytes, 0);
       const deleted = outcome.reduce((total, entry) => total + entry.deleted, 0);
-      setResult(`已清理 ${formatCount(deleted)} 张图片，释放约 ${formatStorageSize(freed)}。`);
+      const skipped = outcome.reduce((total, entry) => total + (entry.skipped ?? 0), 0);
+      const skippedText =
+        skipped > 0 ? `；保留 ${formatCount(skipped)} 张仍被收藏/档案引用的封面。` : "。";
+      setResult(`已清理 ${formatCount(deleted)} 张图片，释放约 ${formatStorageSize(freed)}${skippedText}`);
       setSelected([]);
       setStep("done");
       onCleaned();
@@ -290,6 +298,34 @@ export const StorageBreakdownModal = ({
                   ))}
                 </ul>
               </section>
+
+              {safetyLog.length > 0 ? (
+                <section className="mt-6">
+                  <h3 className="text-sm font-semibold text-gray-800 dark:text-neutral-200">
+                    数据安全日志
+                  </h3>
+                  <p className="mt-1 text-xs leading-relaxed text-gray-400 dark:text-neutral-500">
+                    记录清理图片等可能造成不可逆损失的操作，只保留最近 100 条。
+                  </p>
+                  <ul className="mt-2 max-h-32 overflow-y-auto divide-y divide-gray-100 dark:divide-neutral-800">
+                    {safetyLog.slice(0, 8).map((event) => (
+                      <li key={`${event.at}-${event.kind}-${event.message}`} className="py-1.5 text-xs">
+                        <span className="tabular-nums text-gray-400 dark:text-neutral-500">
+                          {new Date(event.at).toLocaleString("zh-CN")}
+                        </span>
+                        <span className="ml-2 text-gray-700 dark:text-neutral-300">{event.message}</span>
+                        {event.detail ? (
+                          <span className="ml-2 text-gray-400 dark:text-neutral-500">
+                            {Object.entries(event.detail)
+                              .map(([key, value]) => `${key}=${value}`)
+                              .join(" · ")}
+                          </span>
+                        ) : null}
+                      </li>
+                    ))}
+                  </ul>
+                </section>
+              ) : null}
 
               <section className="mt-6 rounded-lg bg-gray-50 p-3 text-xs leading-relaxed text-gray-500 dark:bg-neutral-800/60 dark:text-neutral-400">
                 <p>

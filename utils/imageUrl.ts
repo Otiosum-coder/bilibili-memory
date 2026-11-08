@@ -87,6 +87,25 @@ export const buildAssetId = (kind: AssetKind, raw: string | undefined | null): s
 };
 
 /**
+ * 从 asset id 反推原始图片地址。
+ *
+ * asset id 只保留 URL 的 pathname，且 pathname 本身带内容哈希：
+ * `cover:/bfs/archive/abc.jpg` → `https://i0.hdslb.com/bfs/archive/abc.jpg`。
+ * 即使记录里的 `cover` 字段后来被 B站占位图覆盖，只要 `coverAssetId` 还在，
+ * 就仍然知道原图在哪里，可以重新抓取归档。
+ *
+ * 占位图（失效封面 / 注销头像）没有恢复价值，直接返回 null。
+ */
+export const sourceUrlFromAssetId = (assetId: string | undefined | null): string | null => {
+  if (!assetId) return null;
+  const match = /^(cover|avatar):(\/.*)$/.exec(assetId);
+  if (!match) return null;
+  const pathname = match[2];
+  if (pathname === PLACEHOLDER_COVER_PATH || pathname === NOFACE_PATH) return null;
+  return `https://i0.hdslb.com${pathname}`;
+};
+
+/**
  * 由 asset id 派生本地备份文件名。
  *
  * `cover:/bfs/archive/abc.jpg` → `cover__bfs_archive_abc.jpg`

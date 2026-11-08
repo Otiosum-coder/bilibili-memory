@@ -2,6 +2,7 @@ import { useState, useEffect, useLayoutEffect, useRef } from "react";
 import {
   Check,
   ChevronDown,
+  Compass,
   GripVertical,
   HardDrive,
   LoaderCircle,
@@ -42,6 +43,7 @@ import {
   THIRD_PARTY_NAME_LOOKUP_ENABLED,
   DEFAULT_THIRD_PARTY_NAME_LOOKUP_ENABLED,
   THIRD_PARTY_NAME_LOOKUP_CONSENT,
+  FIRST_RUN_GUIDE_COMPLETED,
 } from "../utils/constants";
 import toast from "react-hot-toast";
 import { HIDEABLE_MENU_TITLES, SIDEBAR_MENU_TITLES } from "../components/Sidebar";
@@ -316,7 +318,12 @@ const Settings = () => {
    * 清理完必须**重新采集明细**，否则弹窗还显示着旧数字。
    */
   const handleCleanupAssets = async (kinds: AssetKind[]) => {
-    const outcome: Array<{ kind: AssetKind; deleted: number; freedBytes: number }> = [];
+    const outcome: Array<{
+      kind: AssetKind;
+      deleted: number;
+      freedBytes: number;
+      skipped: number;
+    }> = [];
     for (const kind of kinds) {
       const result = await clearAssetsByKind(kind);
       outcome.push({ kind, ...result });
@@ -915,6 +922,94 @@ const Settings = () => {
               </div>
             </div>
           </div>
+          <div>
+            <div className="border-b border-gray-200 pb-2 dark:border-neutral-800">
+              <h2 className="flex items-center gap-2 text-base font-bold text-gray-800 dark:text-neutral-200">
+                <RotateCcw className="h-5 w-5 text-emerald-500" />
+                界面
+              </h2>
+            </div>
+
+            <div className="mt-4 w-full rounded-xl border border-gray-100 bg-gray-50 shadow-sm dark:border-neutral-800 dark:bg-neutral-900">
+              <div className="p-5">
+                <h3 className="mb-1 text-base font-bold text-gray-800 dark:text-neutral-100">
+                  侧边栏与用户信息
+                </h3>
+                <p className="mb-4 text-xs text-gray-500 dark:text-neutral-400">
+                  勾选要显示的菜单项，拖拽右侧手柄调整顺序；「设置」不可隐藏。
+                </p>
+
+                <ul className="space-y-1">
+                  {menuOrder.map((title) => {
+                    const hideable = HIDEABLE_MENU_TITLES.includes(title);
+                    const shown = !hiddenMenus.includes(title);
+                    const isDragging = draggedMenu === title;
+                    return (
+                      <li
+                        key={title}
+                        ref={(element) => {
+                          if (element) {
+                            menuItemRefs.current.set(title, element);
+                          } else {
+                            menuItemRefs.current.delete(title);
+                          }
+                        }}
+                        onDragOver={(event) => handleMenuDragOver(event, title)}
+                        onDrop={handleMenuDrop}
+                        className={`flex items-center gap-2 rounded-lg border bg-white px-3 py-2 transition-colors dark:bg-neutral-900 ${
+                          isDragging
+                            ? "border-dashed border-pink-200 opacity-0 dark:border-pink-500/40"
+                            : "border-gray-200 dark:border-neutral-700"
+                        }`}
+                      >
+                        <input
+                          type="checkbox"
+                          checked={shown}
+                          disabled={!hideable}
+                          onChange={(event) => void toggleHiddenMenu(title, !event.target.checked)}
+                          aria-label={`显示「${title}」`}
+                          className="h-4 w-4 shrink-0 accent-pink-600 disabled:opacity-40 dark:accent-pink-500"
+                        />
+                        <span
+                          className={`min-w-0 flex-1 truncate text-sm ${
+                            shown
+                              ? "text-gray-700 dark:text-neutral-200"
+                              : "text-gray-400 line-through dark:text-neutral-500"
+                          }`}
+                        >
+                          {title}
+                        </span>
+                        {!hideable ? (
+                          <span className="shrink-0 text-[10px] text-gray-400 dark:text-neutral-500">
+                            不可隐藏
+                          </span>
+                        ) : null}
+                        <span
+                          draggable
+                          onDragStart={(event) => handleMenuDragStart(event, title)}
+                          onDragEnd={handleMenuDragEnd}
+                          title={`拖拽调整「${title}」的顺序`}
+                          aria-label={`拖拽调整「${title}」的顺序`}
+                          className="inline-flex h-7 w-7 shrink-0 cursor-grab items-center justify-center rounded text-gray-400 transition-colors hover:bg-gray-100 hover:text-gray-600 active:cursor-grabbing dark:text-neutral-500 dark:hover:bg-neutral-800 dark:hover:text-neutral-300"
+                        >
+                          <GripVertical className="h-4 w-4" />
+                        </span>
+                      </li>
+                    );
+                  })}
+                </ul>
+
+                <div className="mt-4 border-t border-gray-200 pt-4 dark:border-neutral-800">
+                  <Checkbox
+                    label="隐藏用户信息"
+                    checked={isHideUserInfo}
+                    onChange={handleHideUserInfoChange}
+                  />
+                </div>
+
+              </div>
+            </div>
+          </div>
         </div>
 
         <div className="space-y-6">
@@ -1257,94 +1352,36 @@ const Settings = () => {
               </div>
             ) : null}
         </div>
+          <div className="border-b border-gray-200 pb-2 dark:border-neutral-800">
+            <h2 className="flex items-center gap-2 text-base font-bold text-gray-800 dark:text-neutral-200">
+              <Compass className="h-5 w-5 text-sky-500" />
+              新手引导
+            </h2>
+          </div>
 
-      <div>
-        <div className="border-b border-gray-200 pb-2 dark:border-neutral-800">
-          <h2 className="flex items-center gap-2 text-base font-bold text-gray-800 dark:text-neutral-200">
-            <RotateCcw className="h-5 w-5 text-emerald-500" />
-            界面
-          </h2>
-        </div>
-
-        <div className="mt-4 w-full rounded-xl border border-gray-100 bg-gray-50 shadow-sm dark:border-neutral-800 dark:bg-neutral-900">
-          <div className="p-5">
-            <h3 className="mb-1 text-base font-bold text-gray-800 dark:text-neutral-100">
-              侧边栏与用户信息
-            </h3>
-            <p className="mb-4 text-xs text-gray-500 dark:text-neutral-400">
-              勾选要显示的菜单项，拖拽右侧手柄调整顺序；「设置」不可隐藏。
-            </p>
-
-            <ul className="space-y-1">
-              {menuOrder.map((title) => {
-                const hideable = HIDEABLE_MENU_TITLES.includes(title);
-                const shown = !hiddenMenus.includes(title);
-                const isDragging = draggedMenu === title;
-                return (
-                  <li
-                    key={title}
-                    ref={(element) => {
-                      if (element) {
-                        menuItemRefs.current.set(title, element);
-                      } else {
-                        menuItemRefs.current.delete(title);
-                      }
-                    }}
-                    onDragOver={(event) => handleMenuDragOver(event, title)}
-                    onDrop={handleMenuDrop}
-                    className={`flex items-center gap-2 rounded-lg border bg-white px-3 py-2 transition-colors dark:bg-neutral-900 ${
-                      isDragging
-                        ? "border-dashed border-pink-200 opacity-0 dark:border-pink-500/40"
-                        : "border-gray-200 dark:border-neutral-700"
-                    }`}
-                  >
-                    <input
-                      type="checkbox"
-                      checked={shown}
-                      disabled={!hideable}
-                      onChange={(event) => void toggleHiddenMenu(title, !event.target.checked)}
-                      aria-label={`显示「${title}」`}
-                      className="h-4 w-4 shrink-0 accent-pink-600 disabled:opacity-40 dark:accent-pink-500"
-                    />
-                    <span
-                      className={`min-w-0 flex-1 truncate text-sm ${
-                        shown
-                          ? "text-gray-700 dark:text-neutral-200"
-                          : "text-gray-400 line-through dark:text-neutral-500"
-                      }`}
-                    >
-                      {title}
-                    </span>
-                    {!hideable ? (
-                      <span className="shrink-0 text-[10px] text-gray-400 dark:text-neutral-500">
-                        不可隐藏
-                      </span>
-                    ) : null}
-                    <span
-                      draggable
-                      onDragStart={(event) => handleMenuDragStart(event, title)}
-                      onDragEnd={handleMenuDragEnd}
-                      title={`拖拽调整「${title}」的顺序`}
-                      aria-label={`拖拽调整「${title}」的顺序`}
-                      className="inline-flex h-7 w-7 shrink-0 cursor-grab items-center justify-center rounded text-gray-400 transition-colors hover:bg-gray-100 hover:text-gray-600 active:cursor-grabbing dark:text-neutral-500 dark:hover:bg-neutral-800 dark:hover:text-neutral-300"
-                    >
-                      <GripVertical className="h-4 w-4" />
-                    </span>
-                  </li>
-                );
-              })}
-            </ul>
-
-            <div className="mt-4 border-t border-gray-200 pt-4 dark:border-neutral-800">
-              <Checkbox
-                label="隐藏用户信息"
-                checked={isHideUserInfo}
-                onChange={handleHideUserInfoChange}
-              />
+          <div className="w-full rounded-xl border border-gray-100 bg-gray-50 p-5 shadow-sm dark:border-neutral-800 dark:bg-neutral-900">
+            <div className="flex flex-wrap items-center justify-between gap-3">
+              <div className="min-w-0">
+                <h3 className="text-base font-medium text-gray-800 dark:text-neutral-100">
+                  功能导览
+                </h3>
+                <p className="mt-1 text-xs leading-relaxed text-gray-500 dark:text-neutral-400">
+                  重新看一遍 6 步功能介绍，不会清除任何数据。
+                </p>
+              </div>
+              <button
+                type="button"
+                onClick={async () => {
+                  await setStorageValue(FIRST_RUN_GUIDE_COMPLETED, false);
+                  window.location.hash = "/";
+                }}
+                className="shrink-0 rounded-md border border-gray-200 bg-white px-3 py-1.5 text-xs font-medium text-gray-700 transition-colors hover:border-pink-200 hover:text-pink-600 dark:border-neutral-700 dark:bg-neutral-900 dark:text-neutral-200 dark:hover:border-pink-500/40 dark:hover:text-pink-400"
+              >
+                重新查看新手引导
+              </button>
             </div>
           </div>
-        </div>
-      </div>
+
         </div>
       </div>
 
