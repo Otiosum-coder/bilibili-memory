@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import toast from "react-hot-toast";
-import { FileText, LayoutDashboard, RefreshCw, X } from "lucide-react";
+import { FileText, LayoutDashboard, LogIn, RefreshCw, X } from "lucide-react";
 import {
   FOLLOWING_LAST_SYNC,
   FOLLOWING_SYNC_INTERVAL,
@@ -1298,6 +1298,25 @@ export const Dashboard = () => {
   const [collectionCoverArchiveProgress, setCollectionCoverArchiveProgress] =
     useState<CoverArchiveProgress | null>(null);
   const [archiving, setArchiving] = useState(false);
+  const [biliLoggedIn, setBiliLoggedIn] = useState<boolean | null>(null);
+  const [syncError, setSyncError] = useState<string | null>(null);
+
+  useEffect(() => {
+    let active = true;
+    void fetch("https://api.bilibili.com/x/web-interface/nav", { credentials: "include" })
+      .then((response) => (response.ok ? response.json() : null))
+      .then((payload: { data?: { isLogin?: boolean } } | null) => {
+        if (!active) return;
+        setBiliLoggedIn(Boolean(payload?.data?.isLogin));
+      })
+      .catch(() => {
+        if (!active) return;
+        setBiliLoggedIn(null);
+      });
+    return () => {
+      active = false;
+    };
+  }, []);
 
   const load = useCallback(async () => {
     setLoading(true);
@@ -1498,13 +1517,16 @@ export const Dashboard = () => {
 
   const handleSync = useCallback(async () => {
     setSyncing(true);
+    setSyncError(null);
     try {
       const response = await browser.runtime.sendMessage({ action: "syncFollowing" });
       if (!response?.success) throw new Error(response?.error || "关注同步失败");
       toast.success(response.message ?? "关注同步完成");
       await load();
     } catch (error) {
-      toast.error(error instanceof Error ? error.message : "关注同步失败");
+      const message = error instanceof Error ? error.message : "关注同步失败";
+      setSyncError(`关注同步失败：${message}`);
+      toast.error(message);
     } finally {
       setSyncing(false);
     }
@@ -1512,13 +1534,16 @@ export const Dashboard = () => {
 
   const handleSyncInteractions = useCallback(async () => {
     setInteractionSyncing(true);
+    setSyncError(null);
     try {
       const response = await browser.runtime.sendMessage({ action: "syncInteractions" });
       if (!response?.success) throw new Error(response?.error || "互动记录同步失败");
       toast.success(response.message ?? "互动记录同步完成");
       await load();
     } catch (error) {
-      toast.error(error instanceof Error ? error.message : "互动记录同步失败");
+      const message = error instanceof Error ? error.message : "互动记录同步失败";
+      setSyncError(`互动记录同步失败：${message}`);
+      toast.error(message);
     } finally {
       setInteractionSyncing(false);
     }
@@ -1775,7 +1800,43 @@ export const Dashboard = () => {
   return (
     <div className="h-screen overflow-y-auto">
       <div className="mx-auto max-w-[1500px] px-6 py-5 lg:px-10">
-        <div className="mb-6 flex flex-col justify-between gap-4 rounded-xl border border-gray-100 bg-white p-4 shadow-sm md:flex-row md:items-center dark:border-neutral-800 dark:bg-neutral-900">
+        {biliLoggedIn === false && (
+          <div className="mb-4 flex flex-wrap items-center justify-between gap-3 rounded-xl border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-800 dark:border-amber-500/30 dark:bg-amber-500/10 dark:text-amber-200">
+            <span className="flex items-center gap-2">
+              <LogIn className="h-4 w-4" />
+              未登录 B 站，当前无法同步新数据。已有本地记录仍可查看。
+            </span>
+            <button
+              type="button"
+              onClick={() => void browser.tabs.create({ url: "https://www.bilibili.com" })}
+              className="rounded-md border border-amber-300 bg-white px-3 py-1.5 text-xs font-medium text-amber-800 hover:bg-amber-100 dark:border-amber-500/40 dark:bg-transparent dark:text-amber-200 dark:hover:bg-amber-500/10"
+            >
+              去登录 B 站
+            </button>
+          </div>
+        )}
+        {syncError && (
+          <div
+            role="alert"
+            className="mb-4 flex flex-wrap items-center justify-between gap-3 rounded-xl border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700 dark:border-red-500/30 dark:bg-red-500/10 dark:text-red-300"
+          >
+            <span className="flex items-center gap-2">
+              <X className="h-4 w-4" />
+              {syncError}。已有本地数据不会被删除。
+            </span>
+            <button
+              type="button"
+              onClick={() => setSyncError(null)}
+              className="rounded-md border border-red-300 px-3 py-1 text-xs font-medium hover:bg-red-100 dark:border-red-500/40 dark:hover:bg-red-500/10"
+            >
+              知道了
+            </button>
+          </div>
+        )}
+        <div
+          data-tour="dashboard-overview"
+          className="mb-6 flex flex-col justify-between gap-4 rounded-xl border border-gray-100 bg-white p-4 shadow-sm md:flex-row md:items-center dark:border-neutral-800 dark:bg-neutral-900"
+        >
           <h1 className="flex items-center gap-2 text-xl font-bold text-gray-900 dark:text-neutral-100">
             <LayoutDashboard className="h-5 w-5 text-pink-500" />
             总览

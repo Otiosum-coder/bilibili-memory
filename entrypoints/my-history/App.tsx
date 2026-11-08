@@ -6,7 +6,6 @@ import { Sidebar } from "../../components/Sidebar";
 import Settings from "../../pages/Settings";
 import ScrollToTopButton from "../../components/ScrollToTopButton";
 import toast, { Toaster } from "react-hot-toast";
-import Feedback from "../../pages/Feedback";
 import WebDavSync from "../../pages/WebDavSync";
 import { Favorites } from "../../pages/Favorites";
 import Welcome from "../../pages/Welcome";
@@ -244,7 +243,6 @@ const App = () => {
             <Route path="/history" element={<History />} />
             <Route path="/about" element={<About />} />
             <Route path="/settings" element={<Settings />} />
-            <Route path="/feedback" element={<Feedback />} />
             <Route path="/webdav-sync" element={<WebDavSync />} />
             <Route path="/favorites" element={<Favorites />} />
             <Route path="/following" element={<Following />} />

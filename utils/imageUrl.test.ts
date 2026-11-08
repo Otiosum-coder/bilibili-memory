@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { assetFileName } from "./imageUrl";
+import { assetFileName, sourceUrlFromAssetId } from "./imageUrl";
 
 /**
  * 备份文件名必须**由 asset id 确定派生**：
@@ -33,5 +33,32 @@ describe("assetFileName", () => {
     const name = assetFileName("cover:/bfs/archive/sub/abc.jpg");
     expect(name).not.toContain("/");
     expect(name).not.toContain("\\");
+  });
+});
+
+describe("sourceUrlFromAssetId", () => {
+  it("从封面 asset id 还原原始地址", () => {
+    expect(sourceUrlFromAssetId("cover:/bfs/archive/abc.jpg")).toBe(
+      "https://i0.hdslb.com/bfs/archive/abc.jpg",
+    );
+  });
+
+  it("头像同理", () => {
+    expect(sourceUrlFromAssetId("avatar:/bfs/face/abc.jpg")).toBe(
+      "https://i0.hdslb.com/bfs/face/abc.jpg",
+    );
+  });
+
+  it("占位图不生成可抓取地址", () => {
+    expect(sourceUrlFromAssetId("cover:/bfs/archive/be27fd62c99036dce67efface486fb0a88ffed06.jpg")).toBe(
+      null,
+    );
+    expect(sourceUrlFromAssetId("avatar:/bfs/face/member/noface.jpg")).toBe(null);
+  });
+
+  it("非法 id 返回 null", () => {
+    expect(sourceUrlFromAssetId(undefined)).toBe(null);
+    expect(sourceUrlFromAssetId("cover:")).toBe(null);
+    expect(sourceUrlFromAssetId("random")).toBe(null);
   });
 });

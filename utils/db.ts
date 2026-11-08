@@ -39,6 +39,7 @@ import {
 import { isPlaceholderTitle, shouldPreserveLocalMetadata } from "./favRecovery";
 import { isPlaceholderImage } from "./imageUrl";
 import { mergeRestoredFavorite, mergeVanishArchive } from "./vanishArchive";
+import { appendDataSafetyEvent } from "./dataSafetyLog";
 
 const DB_CONFIG: DBConfig = {
   name: "bilibiliHistory",
@@ -2140,8 +2141,14 @@ const mergeCollectionShell = (
   };
 };
 
+export interface ReplaceSubscribedCollectionsOptions {
+  /** 查询确认合集已被 UP 删除/失效，可以恢复为本地合集。 */
+  deletedCollectionIds?: Set<number>;
+}
+
 export const replaceSubscribedCollections = async (
   collections: SubscribedCollection[],
+  options: ReplaceSubscribedCollectionsOptions = {},
 ): Promise<void> => {
   const db = await openDB();
   const previousCollections = await getAllSubscribedCollections();
@@ -2181,13 +2188,14 @@ export const replaceSubscribedCollections = async (
     const invalid = isInvalidCollectionShell(incoming);
 
     if (invalid) {
-      // 线上只剩占位壳：不再放进活跃列表；只有本地确实存过内容才值得归档。
+      // 线上只剩占位壳：这通常是 UP 删除了合集，而不是用户取消订阅。
+      // 本地有内容时直接恢复成“仅本地”合集，放回原来的 index；
+      // 这样用户还能按旧位置找到它，不必去档案里翻。
       if (previous) {
         const localResourceCount = await getSubscribedCollectionResourceCount(previous.id);
         if (localResourceCount > 0 && !existingArchive?.deletedAt) {
-          archivesToPut.push(
-            archiveFor(previous, "collection_invalid", existingArchive, localResourceCount),
-          );
+          nextCollections.push({ ...previous, localRestore: true });
+          archiveIdsToDelete.push(previous.id);
         } else if (localResourceCount <= 0) {
           archiveIdsToDelete.push(previous.id);
         }
@@ -2214,10 +2222,31 @@ export const replaceSubscribedCollections = async (
       archiveIdsToDelete.push(previous.id);
       continue;
     }
+
+    // 已经是“仅本地”恢复的合集：B 站目录里当然没有它，继续留在原位。
+    if (previous.localRestore) {
+      nextCollections.push(previous);
+      archiveIdsToDelete.push(previous.id);
+      continue;
+    }
+
+    // B 站目录里没有它，需要区分：用户主动取消订阅 vs UP 删除。
+    // 只有后台查询确认“合集本身已不存在”时才自动恢复；
+    // 查不到/查询失败/确认仍存在，都继续走原来的归档逻辑。
+    if (options.deletedCollectionIds?.has(previous.id)) {
+      nextCollections.push({ ...previous, localRestore: true });
+      archiveIdsToDelete.push(previous.id);
+      continue;
+    }
+
     archivesToPut.push(
       archiveFor(previous, "collection_gone", existingArchive, localResourceCount),
     );
   }
+
+  // 按 B 站原来的 index 排序。自动恢复的合集不能因为是在循环末尾
+  // push 进去就跑到列表底部，否则用户又要满列表找它。
+  nextCollections.sort((a, b) => (a.index ?? 0) - (b.index ?? 0));
 
   // 兼容旧版本留下的空档案：只保留本地确实有内容的合集。
   for (const archive of previousArchives) {
@@ -3444,10 +3473,48 @@ export const clearAssets = async (): Promise<void> => {
   const tx = db.transaction("assets", "readwrite");
   tx.objectStore("assets").clear();
   await transactionDone(tx);
+  void appendDataSafetyEvent({
+    at: Date.now(),
+    kind: "asset-delete",
+    message: "清空全部图片归档",
+  });
 };
 
 /**
- * 按类型清空图片归档，返回删掉的条数与释放的字节数。
+ * 收集仍被记录引用的封面字节 ID。
+ *
+ * 记录里的 `coverAssetId` 只是指针，真正的字在 `assets` 表里。清图片时如果
+ * 不检查引用，就会把“唯一一份封面”删掉，留下一个永远解析失败的 ID。这里把
+ * 可能引用封面的 store 全部扫一遍，清理时跳过这些 ID。
+ */
+const collectReferencedCoverAssetIds = async (): Promise<Set<string>> => {
+  const db = await openDB();
+  const storeNames = [
+    "favResources",
+    "vanishArchive",
+    "subscribedCollectionResources",
+    "collectionArchives",
+    "interactions",
+  ] as const;
+  const tx = db.transaction(storeNames, "readonly");
+  const referenced = new Set<string>();
+
+  for (const storeName of storeNames) {
+    const rows = (await requestResult(tx.objectStore(storeName).getAll())) as Array<{
+      coverAssetId?: string;
+    }>;
+    for (const row of rows) {
+      if (row?.coverAssetId) referenced.add(row.coverAssetId);
+    }
+  }
+
+  await transactionDone(tx);
+  return referenced;
+};
+
+/**
+ * 按类型清空图片归档，返回删掉的条数、释放的字节数，以及因仍被记录引用而
+ * 跳过的条数。
  *
  * 用 `kind` 索引走游标逐个删，而不是 `getAll()` 后再删：
  * `assets` 里是真实图片字节，一次全读进内存在大库上会明显卡顿甚至爆内存。
@@ -3461,12 +3528,14 @@ export const clearAssets = async (): Promise<void> => {
  */
 export const clearAssetsByKind = async (
   kind: AssetKind,
-): Promise<{ deleted: number; freedBytes: number }> => {
+): Promise<{ deleted: number; freedBytes: number; skipped: number }> => {
+  const protectedIds = kind === "cover" ? await collectReferencedCoverAssetIds() : new Set<string>();
   const db = await openDB();
   const tx = db.transaction("assets", "readwrite");
   const index = tx.objectStore("assets").index("kind");
   let deleted = 0;
   let freedBytes = 0;
+  let skipped = 0;
 
   await new Promise<void>((resolve, reject) => {
     const request = index.openCursor(IDBKeyRange.only(kind));
@@ -3477,6 +3546,11 @@ export const clearAssetsByKind = async (
         return;
       }
       const record = cursor.value as AssetRecord;
+      if (protectedIds.has(record.id)) {
+        skipped += 1;
+        cursor.continue();
+        return;
+      }
       freedBytes += record?.blob?.size ?? 0;
       deleted += 1;
       try {
@@ -3494,7 +3568,15 @@ export const clearAssetsByKind = async (
   });
 
   await transactionDone(tx);
-  return { deleted, freedBytes };
+  if (deleted > 0 || skipped > 0) {
+    void appendDataSafetyEvent({
+      at: Date.now(),
+      kind: "asset-delete",
+      message: kind === "cover" ? "清理封面图片归档" : "清理头像图片归档",
+      detail: { deleted, skipped, freedBytes },
+    });
+  }
+  return { deleted, freedBytes, skipped };
 };
 
 /**

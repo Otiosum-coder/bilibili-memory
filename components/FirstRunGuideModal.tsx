@@ -1,5 +1,13 @@
 import { useEffect, useLayoutEffect, useRef, useState } from "react";
-import { DatabaseBackup, Heart, History, RotateCcw, Users, Wand2, X } from "lucide-react";
+import {
+  DatabaseBackup,
+  Heart,
+  History,
+  LayoutDashboard,
+  RotateCcw,
+  Users,
+  X,
+} from "lucide-react";
 
 interface FirstRunGuideModalProps {
   open: boolean;
@@ -18,23 +26,25 @@ interface GuideStep {
 
 const steps: GuideStep[] = [
   {
-    title: "欢迎使用哔哩哔哩记忆",
-    description: "接下来用几步认识收藏夹、关注列表和备份。每一步都会指向真实功能，也可以随时跳过。",
-    icon: History,
+    title: "总览",
+    description:
+      "首页是总览。这里集中显示历史、收藏、关注和失效内容的数量，也能看到最近一次同步时间。第一次同步完成后，数据会逐步出现在各个页面。",
+    icon: LayoutDashboard,
     accent: "bg-pink-50 text-pink-600 dark:bg-pink-500/10 dark:text-pink-400",
-    target: null,
-    path: null,
+    target: "[data-tour='dashboard-overview']",
+    path: "/",
   },
   {
-    title: "历史记录入口",
-    description: "从这里进入历史记录。扩展会在本地保存你看过的视频，支持搜索、筛选和分页浏览。",
+    title: "历史记录",
+    description:
+      "从左侧进入历史记录。扩展会在本地保存你看过的视频，支持搜索、筛选和分页；B 站历史记录过了上限后，本地仍然能查到。",
     icon: History,
     accent: "bg-pink-50 text-pink-600 dark:bg-pink-500/10 dark:text-pink-400",
     target: "[data-tour='history-menu']",
     path: "/history",
   },
   {
-    title: "收藏夹页面",
+    title: "收藏夹",
     description:
       "左侧是收藏夹目录，右侧是本地保存的收藏内容。可以按收藏夹查看、搜索，也能看到在线收藏夹比本地多出的条数。",
     icon: Heart,
@@ -54,25 +64,16 @@ const steps: GuideStep[] = [
   {
     title: "关注列表",
     description:
-      "这里保存你关注的 UP 主，以及取关、改名、账号注销等变化。第一次同步会建立基线；B 站不提供历史变化，因此变化记录只能从建立基线之后开始累积。",
+      "这里保存你关注的 UP 主，以及取关、改名、账号注销等变化。第一次同步会建立基线；B 站不提供历史变化，所以变化记录只能从建立基线之后开始累积。设置里还可以选择开启第三方曾用名查询，默认关闭。",
     icon: Users,
     accent: "bg-blue-50 text-blue-600 dark:bg-blue-500/10 dark:text-blue-400",
     target: "[data-tour='following-toolbar']",
     path: "/following",
   },
   {
-    title: "查询曾用名",
+    title: "互动、消失档案与备份",
     description:
-      "在设置中开启第三方曾用名查询后，关注列表右上角会出现「补全曾用名」。数据来自 aicu.cc，默认关闭，需要先同意；只查询关注列表，不提供任意 UID 查询。",
-    icon: Wand2,
-    accent: "bg-purple-50 text-purple-600 dark:bg-purple-500/10 dark:text-purple-400",
-    target: "[data-tour='following-toolbar']",
-    path: "/following",
-  },
-  {
-    title: "数据备份",
-    description:
-      "数据默认只保存在浏览器本地。想换设备或防止浏览器数据丢失，可以在这里导出 JSON，或配置 WebDAV / 本地目录备份。",
+      "左侧还有「互动记录」和「消失档案」：点赞投币在 B 站只留最近 20 条，本地会持续保存；消失档案汇总四处已经查不到的内容。最后，数据默认只在本地，建议到「数据备份」配置一次备份。",
     icon: DatabaseBackup,
     accent: "bg-emerald-50 text-emerald-600 dark:bg-emerald-500/10 dark:text-emerald-400",
     target: "[data-tour='backup-menu']",

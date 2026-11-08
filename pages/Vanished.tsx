@@ -18,7 +18,7 @@ import {
   X,
 } from "lucide-react";
 import toast from "react-hot-toast";
-import { createAssetObjectUrl } from "../utils/assetArchive";
+import { archiveAvatar, archiveCover, createAssetObjectUrl } from "../utils/assetArchive";
 import {
   deleteCollectionArchiveResources,
   deleteCollectionArchives,
@@ -39,7 +39,7 @@ import {
 import { isInvalidatedResource } from "../utils/favVanishedDiff";
 import { formatInteractionDuration } from "../utils/interactionQuery";
 import { NameHistoryPopover } from "../components/NameHistoryPopover";
-import { PLACEHOLDER_COVER_PATH } from "../utils/imageUrl";
+import { PLACEHOLDER_COVER_PATH, sourceUrlFromAssetId } from "../utils/imageUrl";
 import {
   FOLLOWING_STATUS_LABEL,
   buildLocalNameTimeline,
@@ -302,21 +302,42 @@ const copyBvid = async (item: VanishArchiveItem): Promise<void> => {
  */
 const ArchiveCover = ({ item, avatar = false }: { item: VanishArchiveItem; avatar?: boolean }) => {
   const [assetUrl, setAssetUrl] = useState<string | null>(null);
+  const assetId = item.coverAssetId;
+  // `cover` 可能已被 B站占位图覆盖，但 asset id 里还保留原始 pathname。
+  const sourceUrl = sourceUrlFromAssetId(assetId);
 
   useEffect(() => {
     let active = true;
     let created: string | null = null;
 
-    if (item.coverAssetId) {
-      createAssetObjectUrl(item.coverAssetId)
-        .then((url) => {
-          if (!url) return;
-          if (!active) {
-            URL.revokeObjectURL(url);
+    if (assetId) {
+      createAssetObjectUrl(assetId)
+        .then(async (url) => {
+          if (url) {
+            if (!active) {
+              URL.revokeObjectURL(url);
+              return;
+            }
+            created = url;
+            setAssetUrl(url);
             return;
           }
-          created = url;
-          setAssetUrl(url);
+          // 本地字节被清过：先从 asset id 反推的原始地址补归档，再重新读取。
+          if (!sourceUrl) return;
+          try {
+            const archive = assetId.startsWith("avatar:") ? archiveAvatar : archiveCover;
+            await archive(sourceUrl);
+            const repaired = await createAssetObjectUrl(assetId);
+            if (!repaired) return;
+            if (!active) {
+              URL.revokeObjectURL(repaired);
+              return;
+            }
+            created = repaired;
+            setAssetUrl(repaired);
+          } catch {
+            // 原图也已失效时保持远程/占位图
+          }
         })
         .catch(() => undefined);
     } else {
@@ -327,9 +348,9 @@ const ArchiveCover = ({ item, avatar = false }: { item: VanishArchiveItem; avata
       active = false;
       if (created) URL.revokeObjectURL(created);
     };
-  }, [item.coverAssetId]);
+  }, [assetId, sourceUrl]);
 
-  const remote = item.cover ? item.cover.replace(/^http:/, "https:") : "";
+  const remote = sourceUrl ?? (item.cover ? item.cover.replace(/^http:/, "https:") : "");
   const source = assetUrl ?? (remote || `https://i0.hdslb.com${PLACEHOLDER_COVER_PATH}`);
   const onError = (event: React.SyntheticEvent<HTMLImageElement>) => {
     const image = event.currentTarget;
@@ -730,20 +751,38 @@ const VanishedFollowingRow = ({
   onOpen: () => void;
 }) => {
   const [assetUrl, setAssetUrl] = useState<string | null>(null);
+  const assetId = item.coverAssetId;
+  const sourceUrl = sourceUrlFromAssetId(assetId);
 
   useEffect(() => {
     let active = true;
     let created: string | null = null;
-    if (item.coverAssetId) {
-      createAssetObjectUrl(item.coverAssetId)
-        .then((url) => {
-          if (!url) return;
-          if (!active) {
-            URL.revokeObjectURL(url);
+    if (assetId) {
+      createAssetObjectUrl(assetId)
+        .then(async (url) => {
+          if (url) {
+            if (!active) {
+              URL.revokeObjectURL(url);
+              return;
+            }
+            created = url;
+            setAssetUrl(url);
             return;
           }
-          created = url;
-          setAssetUrl(url);
+          if (!sourceUrl) return;
+          try {
+            await archiveAvatar(sourceUrl);
+            const repaired = await createAssetObjectUrl(assetId);
+            if (!repaired) return;
+            if (!active) {
+              URL.revokeObjectURL(repaired);
+              return;
+            }
+            created = repaired;
+            setAssetUrl(repaired);
+          } catch {
+            // 原头像也失效时保持远程/占位图
+          }
         })
         .catch(() => undefined);
     } else {
@@ -753,7 +792,7 @@ const VanishedFollowingRow = ({
       active = false;
       if (created) URL.revokeObjectURL(created);
     };
-  }, [item.coverAssetId]);
+  }, [assetId, sourceUrl]);
 
   const source = following ?? snapshotAsFollowing(item) ?? undefined;
   const formerNames = Math.max(0, (source?.nameHistory?.length ?? 0) - 1);
@@ -763,7 +802,7 @@ const VanishedFollowingRow = ({
   const displayInfo = source ? resolveDisplayNameInfo(source) : null;
   const name = displayInfo?.name || item.title?.trim() || `UID ${item.sourceId}（名字未知）`;
   const sign = (source?.sign ?? "").trim();
-  const avatar = assetUrl ?? (item.cover ? item.cover.replace(/^http:/, "https:") : "");
+  const avatar = assetUrl ?? sourceUrl ?? (item.cover ? item.cover.replace(/^http:/, "https:") : "");
   // 曾用名**直接铺在卡片上**，不做浮层也不要点详情——
   // 用户点开一条关注记录就是想知道"它以前叫什么"，多一步点击就失去意义
   const formerNameList = Array.from(

@@ -378,6 +378,13 @@ export interface SubscribedCollection {
     face: string;
   };
   index: number;
+  /**
+   * 合集已被 B 站删除（UP 删除/失效），但本地还保留着内容。
+   *
+   * 这类合集不是真正的“已订阅”状态：它只存在于本地，用来让用户还能
+   * 按原来的位置找到并查看备份。同步时必须跳过它，不能再次归档或删除。
+   */
+  localRestore?: boolean;
 }
 
 export interface SubscribedCollectionResource {

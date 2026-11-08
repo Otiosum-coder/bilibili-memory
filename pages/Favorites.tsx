@@ -40,7 +40,12 @@ import {
   resolveFavResourceState,
 } from "../utils/favResourceInfo";
 import { FavResourceHoverPanel } from "../components/FavResourceHoverPanel";
-import { PLACEHOLDER_COVER_PATH } from "../utils/imageUrl";
+import { archiveCover, createAssetObjectUrl } from "../utils/assetArchive";
+import {
+  isPlaceholderImage,
+  PLACEHOLDER_COVER_PATH,
+  sourceUrlFromAssetId,
+} from "../utils/imageUrl";
 import { getStorageValue } from "../utils/storage";
 import { FAV_RECOVERY_PROGRESS } from "../utils/constants";
 import { formatInteractionDuration } from "../utils/interactionQuery";
@@ -54,6 +59,99 @@ import { DeleteFavoriteFolderModal } from "../components/DeleteFavoriteFolderMod
  * 重启而消失（旧版本结束时只写 running、不写完成，会留下"僵尸进度"）。
  */
 const FAV_RECOVERY_STALE_MS = 120_000;
+
+/**
+ * 收藏封面优先用本地归档字节。
+ *
+ * 之前的实现只拼 `item.cover` 远程地址，所以一旦远程封面被 B站 换成占位图、
+ * 或者归档字节被清掉，就只能看到灰图；即使 `coverAssetId` 还指向完好的本地图片
+ * 也不会用。这里改为 asset → 远程封面 → 占位图三级回退，并在发现 asset 缺失时
+ * 顺手重新归档一次，避免“数据在、图不在”。
+ */
+function FavoriteCoverImage({
+  cover,
+  coverAssetId,
+  alt,
+  className,
+}: {
+  cover?: string;
+  coverAssetId?: string;
+  alt: string;
+  className?: string;
+}) {
+  // 即使 `cover` 已被 B站占位图覆盖，`coverAssetId` 仍保留原始 pathname；
+  // 从它反推的地址才是真正可恢复的封面。
+  const sourceUrl = sourceUrlFromAssetId(coverAssetId);
+  const remoteSrc = sourceUrl
+    ? `${sourceUrl}@760w_428h_1c.avif`
+    : cover && !isPlaceholderImage(cover)
+      ? `${cover.replace("http:", "https:")}@760w_428h_1c.avif`
+      : "";
+  const placeholderSrc = `https://i0.hdslb.com${PLACEHOLDER_COVER_PATH}@760w_428h_1c.avif`;
+  const [src, setSrc] = useState(remoteSrc);
+  const repairTriedRef = useRef(false);
+
+  useEffect(() => {
+    let cancelled = false;
+    let objectUrl: string | null = null;
+    repairTriedRef.current = false;
+    setSrc(remoteSrc);
+
+    if (!coverAssetId) return;
+
+    void createAssetObjectUrl(coverAssetId).then(async (url) => {
+      if (cancelled) {
+        if (url) URL.revokeObjectURL(url);
+        return;
+      }
+      if (url) {
+        objectUrl = url;
+        setSrc(url);
+        return;
+      }
+      // asset 记录在、字节丢了：先用反推出的原地址显示，再补一份字节。
+      if (!repairTriedRef.current && remoteSrc) {
+        repairTriedRef.current = true;
+        try {
+          await archiveCover(sourceUrl ?? cover);
+          const repaired = await createAssetObjectUrl(coverAssetId);
+          if (cancelled) {
+            if (repaired) URL.revokeObjectURL(repaired);
+            return;
+          }
+          if (repaired) {
+            objectUrl = repaired;
+            setSrc(repaired);
+          }
+        } catch {
+          // 补不回来就保持远程/占位图，不阻塞页面
+        }
+      }
+    });
+
+    return () => {
+      cancelled = true;
+      if (objectUrl) URL.revokeObjectURL(objectUrl);
+    };
+  }, [cover, coverAssetId, remoteSrc]);
+
+  return (
+    <img
+      src={src || remoteSrc || placeholderSrc}
+      alt={alt}
+      className={className}
+      loading="lazy"
+      onError={(event) => {
+        const image = event.currentTarget;
+        if (src !== remoteSrc && remoteSrc) {
+          setSrc(remoteSrc);
+          return;
+        }
+        if (!image.src.startsWith(placeholderSrc)) image.src = placeholderSrc;
+      }}
+    />
+  );
+}
 
 /** 恢复流水线的阶段名。页面据此显示「正在 biliplus 查询 20/83」而不是一个不动的数字 */
 const RECOVERY_PHASE_LABEL: Record<string, string> = {
@@ -686,6 +784,19 @@ export const Favorites = () => {
   const selectedFolder = folders.find((folder) => folder.id === selectedFolderId) ?? null;
   const isFavoriteSyncing =
     syncProgress?.status === "syncing" || allSyncProgress?.status === "syncing";
+  const allSyncError =
+    allSyncProgress?.status === "error"
+      ? allSyncProgress.message || "全部收藏夹同步失败"
+      : allSyncProgress && (allSyncProgress.failedFolders?.length ?? 0) > 0
+        ? `${allSyncProgress.failedFolders?.length ?? 0} 个收藏夹同步失败：${(allSyncProgress.failedFolders ?? [])
+            .slice(0, 2)
+            .map((folder) => `「${folder.title}」${folder.error}`)
+            .join("；")}`
+        : "";
+  const singleSyncError =
+    syncProgress?.status === "error"
+      ? syncProgress.message || `「${syncProgress.folderTitle}」同步失败`
+      : "";
 
   return (
     <div className="flex h-screen bg-gray-50 dark:bg-[#0a0a0a]">
@@ -762,6 +873,17 @@ export const Favorites = () => {
               </p>
             </button>
           )}
+
+        {(allSyncError || singleSyncError) && (
+          <div
+            role="alert"
+            className="m-2 rounded-lg border border-red-200 bg-red-50 p-3 text-xs leading-relaxed text-red-700 dark:border-red-500/20 dark:bg-red-500/10 dark:text-red-300"
+          >
+            <p className="font-semibold">收藏夹同步没有完成</p>
+            <p className="mt-1">{allSyncError || singleSyncError}</p>
+            <p className="mt-1 opacity-80">已有本地数据不会被删除，可以稍后重新同步。</p>
+          </div>
+        )}
 
         {allSyncProgress?.status !== "syncing" &&
           syncProgress &&
@@ -1105,18 +1227,13 @@ export const Favorites = () => {
                               }}
                               onMouseLeave={() => setHoverResource(null)}
                             >
-                              <img
-                                src={`${item.cover.replace("http:", "https:")}@760w_428h_1c.avif`}
+                              <FavoriteCoverImage
+                                cover={item.cover}
+                                coverAssetId={item.coverAssetId}
                                 alt={item.title}
                                 className={`w-full h-full object-cover ${
                                   state === "broken" ? "opacity-70" : ""
                                 }`}
-                                loading="lazy"
-                                onError={(event) => {
-                                  const image = event.currentTarget;
-                                  const fallback = `https://i0.hdslb.com${PLACEHOLDER_COVER_PATH}@760w_428h_1c.avif`;
-                                  if (!image.src.startsWith(fallback)) image.src = fallback;
-                                }}
                               />
                               {invalidated ? (
                                 <span
@@ -1195,8 +1312,13 @@ export const Favorites = () => {
                     );
                   })}
                   {currentResources.length === 0 && (
-                    <div className="col-span-full text-center py-10 text-gray-400 dark:text-neutral-500">
-                      这个收藏夹是空的
+                    <div className="col-span-full py-10 text-center text-gray-400 dark:text-neutral-500">
+                      <p>{keyword ? "没有匹配的收藏内容" : "这个收藏夹是空的"}</p>
+                      {!keyword ? (
+                        <p className="mt-2 text-xs">
+                          可能是还没同步过，也可能 B 站端确实没有内容。点左侧「同步所有」或单个收藏夹的同步按钮。
+                        </p>
+                      ) : null}
                     </div>
                   )}
                 </div>

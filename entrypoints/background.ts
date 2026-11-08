@@ -3656,6 +3656,43 @@ export default defineBackground(() => {
     return navData.data.mid;
   }
 
+  /**
+   * 查询一个合集是否还存在于 B 站。
+   *
+   * 只看目录接口无法区分“用户取消订阅”和“UP 删除合集”：
+   * 两种情况都会从 `collected/list` 里消失。这里用合集详情接口补一次判断，
+   * 返回：
+   * - true  ：合集仍有有效数据（用户只是取消订阅）
+   * - false ：合集已删除/失效
+   * - null  ：请求失败、风控或响应格式不确定，不能据此恢复
+   */
+  async function queryCollectionExists(collectionId: number): Promise<boolean | null> {
+    try {
+      const sessdata = await getBilibiliSession();
+      if (!sessdata) return null;
+      const response = await fetch(
+        `https://api.bilibili.com/x/space/fav/season/list?season_id=${collectionId}&pn=1&ps=1`,
+        { headers: { Cookie: `SESSDATA=${sessdata}` } },
+      );
+      if (!response.ok) return null;
+
+      const data = await response.json().catch(() => null);
+      if (!data || typeof data.code !== "number") return null;
+
+      // 稿件/合集不存在时 B 站可能返回 -404 或 62002。
+      if (data.code === -404 || data.code === 62002) return false;
+      if (data.code !== 0) return null;
+
+      const payload = data.data;
+      if (!payload || typeof payload !== "object") return null;
+      // 空合集也可能没有 medias，但有 info；两者存在一个就说明合集壳还在。
+      if (Array.isArray(payload.medias) || payload.info) return true;
+      return null;
+    } catch {
+      return null;
+    }
+  }
+
   async function syncSubscribedCollections(): Promise<void> {
     const sessdata = await getBilibiliSession();
     const currentMid = await getCurrentBilibiliMid(sessdata);
@@ -3712,7 +3749,23 @@ export default defineBackground(() => {
       page += 1;
     }
 
-    await replaceSubscribedCollections(collections);
+    // 目录里消失的合集，先补一次“是否还存在于 B 站”的判断。
+    // 只有确认合集本身被删除时，才让它自动回到订阅列表原位；
+    // 用户自己取消订阅的合集继续留在本地备份。
+    const previousCollections = await getAllSubscribedCollections();
+    const onlineIds = new Set(collections.map((item) => item.id));
+    const deletedCollectionIds = new Set<number>();
+    for (const previous of previousCollections) {
+      if (onlineIds.has(previous.id) || previous.localRestore) continue;
+      const localResourceCount = await getSubscribedCollectionResourceCount(previous.id);
+      if (localResourceCount <= 0) continue;
+      const exists = await queryCollectionExists(previous.id);
+      if (exists === false) deletedCollectionIds.add(previous.id);
+      // 查询有结果或失败都不自动恢复：前者是用户自己取消，后者不能确定。
+      await new Promise((resolve) => setTimeout(resolve, 250));
+    }
+
+    await replaceSubscribedCollections(collections, { deletedCollectionIds });
     // 目录同步完成后自动排队首次全量。不能 await：合集内容可能很多，
     // 目录同步的响应要立刻返回；进度写进 storage，页面可以轮询。
     void startCollectionArchiveSync();
@@ -3877,6 +3930,11 @@ export default defineBackground(() => {
       let skipped = 0;
 
       for (const collection of collections) {
+        // 仅本地恢复的合集在 B 站已经不存在，不能再去抓内容。
+        if (collection.localRestore) {
+          skipped++;
+          continue;
+        }
         if (collection.media_count <= 0) {
           skipped++;
           continue;
