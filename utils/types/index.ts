@@ -103,6 +103,11 @@ export interface DBConfig {
       keyPath: string;
       indexes: string[];
     };
+    /** 收藏元数据安全快照（v14）：同步前保存，防止占位内容覆盖已恢复数据 */
+    favMetadataSnapshots: {
+      keyPath: string | string[];
+      indexes: string[];
+    };
     following: {
       keyPath: string;
       indexes: string[];
