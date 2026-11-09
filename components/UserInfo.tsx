@@ -1,4 +1,5 @@
 import { useEffect, useState } from "react";
+import { Zap } from "lucide-react";
 
 interface BilibiliAccount {
   mid: number;
@@ -18,9 +19,10 @@ interface BilibiliAccount {
  * 上游实现读取的是云服务的登录态（会请求 bilibilihistory.com）。云同步已随本 fork
  * 移除，这里改为直接读本地 B 站的登录态，不再联系任何第三方服务。
  *
- * 展示上不显示昵称和 UID：头像靠左、放大到 48px 作为视觉锚点，
+ * 展示上不显示昵称和 UID：头像靠左、放大到 42px 作为视觉锚点，
  * 身份标签整体靠右，等级牌在会员牌正下方居中。
- * 硬核会员会替换等级牌（B 站规则：硬核会员本身就是 LV6 身份）；
+ * 第一行是身份：大会员 / 正式会员；第二行是等级：普通等级或硬核会员。
+ * 硬核会员按 B 站样式显示为红色「⚡ 硬核会员」标签，不再单独替换成一块文字；
  * 大会员/年度大会员的文字和配色交给接口的 vip_label 决定。
  * 完整昵称放在 title 里，悬停可看。
  */
@@ -121,12 +123,24 @@ export const UserInfo = () => {
             >
               {account.vipLabel}
             </span>
-          ) : null}
+          ) : (
+            <span
+              title={
+                account.level > 0
+                  ? "正式会员（已通过会员转正答题）"
+                  : "注册会员（完成转正答题后成为正式会员）"
+              }
+              className="inline-flex h-[18px] shrink-0 items-center justify-center whitespace-nowrap rounded-[3px] bg-gray-100 px-1.5 text-[10px] font-medium leading-none text-gray-500 ring-1 ring-inset ring-gray-200 dark:bg-neutral-800 dark:text-neutral-300 dark:ring-neutral-700"
+            >
+              {account.level > 0 ? "正式会员" : "注册会员"}
+            </span>
+          )}
           {account.isSeniorMember ? (
             <span
               title="硬核会员（已通过 LV6 硬核试炼）"
-              className="inline-flex h-[18px] shrink-0 items-center justify-center whitespace-nowrap rounded-[3px] bg-[#f04b4b] px-1.5 text-[10px] font-semibold leading-none text-white"
+              className="inline-flex h-[18px] shrink-0 items-center justify-center gap-0.5 whitespace-nowrap rounded-[3px] bg-[#f04b4b] px-1 text-[10px] font-semibold leading-none text-white"
             >
+              <Zap className="h-2.5 w-2.5 fill-current" strokeWidth={0} />
               硬核会员
             </span>
           ) : account.level > 0 ? (
