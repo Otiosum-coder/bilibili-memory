@@ -43,7 +43,7 @@ import { appendDataSafetyEvent } from "./dataSafetyLog";
 
 const DB_CONFIG: DBConfig = {
   name: "bilibiliHistory",
-  version: 13,
+  version: 14,
   stores: {
     history: {
       keyPath: "id",
@@ -68,6 +68,10 @@ const DB_CONFIG: DBConfig = {
     favResources: {
       keyPath: ["folder_id", "id"],
       indexes: ["id", "folder_id", "fav_time"],
+    },
+    favMetadataSnapshots: {
+      keyPath: ["folder_id", "id"],
+      indexes: ["folder_id"],
     },
     subscribedCollections: {
       keyPath: "id",
@@ -584,6 +588,14 @@ export const openDB = (): Promise<IDBDatabase> => {
         favResourcesStore.createIndex("id", "id", { unique: false });
         favResourcesStore.createIndex("folder_id", "folder_id", { unique: false });
         favResourcesStore.createIndex("fav_time", "fav_time", { unique: false });
+      }
+
+      if (!db.objectStoreNames.contains("favMetadataSnapshots")) {
+        console.log("补创建favMetadataSnapshots表");
+        const snapshotStore = db.createObjectStore("favMetadataSnapshots", {
+          keyPath: ["folder_id", "id"],
+        });
+        snapshotStore.createIndex("folder_id", "folder_id", { unique: false });
       }
 
       if (!db.objectStoreNames.contains("subscribedCollections")) {
@@ -2104,6 +2116,80 @@ export const getFavResources = async (folderId?: number): Promise<FavoriteResour
   });
 };
 
+/**
+ * 全量同步前把本地真实收藏元数据写入安全快照。
+ *
+ * 同步接口对已删除稿件只返回占位标题/封面；即使下游保护逻辑出问题，
+ * 下一次同步结束后也可以从这份快照把标题/封面补回来。
+ */
+export const saveFavoriteMetadataSnapshots = async (
+  resources: FavoriteResource[],
+): Promise<void> => {
+  const candidates = resources.filter(
+    (resource) => !isPlaceholderTitle(resource.title) || !isPlaceholderImage(resource.cover),
+  );
+  if (candidates.length === 0) return;
+
+  const db = await openDB();
+  const tx = db.transaction("favMetadataSnapshots", "readwrite");
+  const store = tx.objectStore("favMetadataSnapshots");
+  candidates.forEach((resource) => store.put(resource));
+  await new Promise<void>((resolve, reject) => {
+    tx.oncomplete = () => resolve();
+    tx.onerror = () => reject(tx.error);
+    tx.onabort = () => reject(tx.error);
+  });
+};
+
+/**
+ * 同步结束后，把当前又被占位内容覆盖的收藏从安全快照恢复。
+ * 当前字段仍为真实值时优先保留当前值（mergeRestoredFavorite 的规则）。
+ */
+export const restoreFavoriteMetadataSnapshots = async (folderId: number): Promise<number> => {
+  const db = await openDB();
+  const readTx = db.transaction(["favResources", "favMetadataSnapshots"], "readonly");
+  const currentStore = readTx.objectStore("favResources");
+  const snapshotStore = readTx.objectStore("favMetadataSnapshots");
+  const [currentResources, snapshots] = await Promise.all([
+    new Promise<FavoriteResource[]>((resolve, reject) => {
+      const request = currentStore.index("folder_id").getAll(folderId);
+      request.onsuccess = () => resolve(request.result as FavoriteResource[]);
+      request.onerror = () => reject(request.error);
+    }),
+    new Promise<FavoriteResource[]>((resolve, reject) => {
+      const request = snapshotStore.index("folder_id").getAll(folderId);
+      request.onsuccess = () => resolve(request.result as FavoriteResource[]);
+      request.onerror = () => reject(request.error);
+    }),
+  ]);
+
+  const snapshotById = new Map(snapshots.map((snapshot) => [snapshot.id, snapshot]));
+  const updates: FavoriteResource[] = [];
+  for (const current of currentResources) {
+    const snapshot = snapshotById.get(current.id);
+    if (!snapshot) continue;
+    const merged = mergeRestoredFavorite(snapshot, current);
+    if (
+      merged.title !== current.title ||
+      merged.cover !== current.cover ||
+      merged.coverAssetId !== current.coverAssetId
+    ) {
+      updates.push(merged);
+    }
+  }
+  if (updates.length === 0) return 0;
+
+  const writeTx = db.transaction("favResources", "readwrite");
+  const store = writeTx.objectStore("favResources");
+  updates.forEach((resource) => store.put(resource));
+  await new Promise<void>((resolve, reject) => {
+    writeTx.oncomplete = () => resolve();
+    writeTx.onerror = () => reject(writeTx.error);
+    writeTx.onabort = () => reject(writeTx.error);
+  });
+  return updates.length;
+};
+
 const isInvalidCollectionShell = (collection: SubscribedCollection): boolean => {
   const title = (collection.title || "").trim();
   return !title || title === "未命名合集" || /合集.*失效|已失效/.test(title);
@@ -2753,25 +2839,39 @@ export const importFavFolders = async (folders: FavoriteFolder[]): Promise<void>
 };
 
 /**
- * 批量导入收藏夹资源（直接 upsert）
+ * 批量导入收藏夹资源。
+ *
+ * 不能无条件 put：旧备份可能只有占位标题/封面，直接覆盖会把当前已经恢复好的
+ * 真实元数据重新打回「已失效视频」。这里与恢复链路一样做字段级合并，
+ * 当前真实字段优先，备份只补缺失/占位字段。
  */
 export const importFavResources = async (resources: FavoriteResource[]): Promise<void> => {
+  if (resources.length === 0) return;
+
   const db = await openDB();
+  const readTx = db.transaction("favResources", "readonly");
+  const readStore = readTx.objectStore("favResources");
+  const current = await Promise.all(
+    resources.map(
+      (res) =>
+        new Promise<FavoriteResource | undefined>((resolve, reject) => {
+          const request = readStore.get([res.folder_id, res.id]);
+          request.onsuccess = () => resolve(request.result as FavoriteResource | undefined);
+          request.onerror = () => reject(request.error);
+        }),
+    ),
+  );
+
   const tx = db.transaction("favResources", "readwrite");
   const store = tx.objectStore("favResources");
+  resources.forEach((res, index) => {
+    store.put(mergeRestoredFavorite(res, current[index]));
+  });
 
-  return new Promise((resolve, reject) => {
-    if (resources.length === 0) {
-      resolve();
-      return;
-    }
-
-    resources.forEach((res) => {
-      store.put(res);
-    });
-
+  await new Promise<void>((resolve, reject) => {
     tx.oncomplete = () => resolve();
     tx.onerror = () => reject(tx.error);
+    tx.onabort = () => reject(tx.error);
   });
 };
 

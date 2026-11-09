@@ -53,6 +53,8 @@ import {
   replaceFavFolders,
   saveFavResources,
   getFavResources,
+  saveFavoriteMetadataSnapshots,
+  restoreFavoriteMetadataSnapshots,
   applyFavResourceRecovery,
   applySubscribedCollectionCoverAssets,
   getAllHistory,
@@ -1942,26 +1944,47 @@ export default defineBackground(() => {
         onlineResourceIds.add(id);
 
         const existing = existingById.get(id);
-        if (existing) {
-          // 历史遗留修复：日期来自不可信的 spaceDetail（曾把所有条目变成同一天），
-          // 重置成"时间未知"；index 用邻居位置重新插值，修掉整夹乱序。
-          existingById.set(id, { ...existing, index, fav_time: 0, ctime: 0 });
-          toSave.push({ ...existing, index, fav_time: 0, ctime: 0 });
-        } else {
-          const resource: FavoriteResource = {
-            ...media,
-            folder_id: folder.id,
-            id,
-            index,
-            bv_id: media.bv_id || media.bvid,
-            // 宁可显示"时间未知"，也不要用 spaceDetail 的不可信日期
-            fav_time: 0,
-            ctime: 0,
-          };
-          existingById.set(id, resource);
-          toSave.push(resource);
-          added += 1;
+        // 实测当前 spaceDetail 会返回每条真实的 fav_time/ctime；
+        // 本地已有非零值优先保留，缺失时再用接口值，绝不能无条件清零。
+        let resource: FavoriteResource = existing
+          ? {
+              ...existing,
+              index,
+              fav_time: existing.fav_time || Number(media?.fav_time) || 0,
+              ctime: existing.ctime || Number(media?.ctime) || 0,
+            }
+          : {
+              ...media,
+              folder_id: folder.id,
+              id,
+              index,
+              bv_id: media.bv_id || media.bvid,
+              fav_time: Number(media?.fav_time) || 0,
+              ctime: Number(media?.ctime) || 0,
+            };
+
+        // 补全接口对已删除稿件也返回 attr=0、真实标题，所以只看 attr 会把
+        // "已删除"误判成正常。补全条目只在这里出现，逐条探测一次详情；
+        // 命中 -404 / 62002 就写入失效标记，保留标题/封面，让卡片显示"已保留"。
+        if ((resource.attr ?? 0) === 0 && resource.invalidatedKind == null) {
+          const probe = await probeFavoriteResource(resource, sessdata);
+          if (probe.ok && (probe.code === -404 || probe.code === 62002)) {
+            const attr = probe.code === 62002 ? 9 : 1;
+            resource = {
+              ...resource,
+              attr,
+              invalidatedKind: resolveInvalidatedKind(attr) ?? "other",
+              invalidatedAt:
+                resource.invalidatedAt ?? Math.floor(Date.now() / 1000),
+            };
+          }
+          // 补全条目通常不多，但仍留出间隔，避免集中探测触发风控。
+          await new Promise((resolve) => setTimeout(resolve, 250));
         }
+
+        existingById.set(id, resource);
+        toSave.push(resource);
+        if (!existing) added += 1;
       }
       if (toSave.length > 0) await saveFavResources(toSave);
 
@@ -2003,13 +2026,17 @@ export default defineBackground(() => {
     console.log(`正在同步收藏夹: ${folder.title} (${isFullSync ? "全量" : "增量"})`);
 
     let localResources = await getFavResources(folder.id);
-    // 清理历史版本遗留的"占位记录"：B站 avid 不可能大于 1e12，
-    // 这些是之前用 ids 兜底插入的假记录（只有 id、没有标题/封面），会把排序和内容搞乱。
+    // 全量同步前先把本地真实元数据存一份安全快照。
+    // 即使后续接口返回占位内容、或清理逻辑误删记录，同步结束后仍能补回来。
+    if (isFullSync) {
+      await saveFavoriteMetadataSnapshots(localResources);
+    }
+    // 清理历史版本遗留的"占位记录"：只剔除非法 id。
+    // 注意不能再用 id > 1e12 判断：新版 B 站 avid 已经是 1e14 量级，
+    // 原来的上限会把正常收藏当成假记录删掉，再按占位内容重建，导致本地恢复的标题/封面丢失。
     if (isFullSync) {
       const bogusIds = localResources
-        .filter(
-          (item) => !Number.isSafeInteger(item.id) || item.id <= 0 || item.id > 1_000_000_000_000,
-        )
+        .filter((item) => !Number.isSafeInteger(item.id) || item.id <= 0)
         .map((item) => item.id);
       if (bogusIds.length > 0) {
         await deleteFavResources(folder.id, bogusIds);
@@ -2110,6 +2137,13 @@ export default defineBackground(() => {
         onlineResourceIds,
         beforeSupplementCount,
       );
+    }
+
+    if (isFullSync) {
+      const restored = await restoreFavoriteMetadataSnapshots(folder.id);
+      if (restored > 0) {
+        console.log(`收藏夹「${folder.title}」：从安全快照恢复 ${restored} 条标题/封面`);
+      }
     }
 
     if (isFullSync) {
