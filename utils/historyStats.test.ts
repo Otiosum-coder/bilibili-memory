@@ -7,15 +7,21 @@ import {
   buildTopAuthors,
   buildHourAxisLabels,
   buildDurationDistribution,
+  buildCompletionStats,
+  buildMonthlyViewSeries,
+  buildWatchTimeStats,
   computeCoverageDays,
   computeLongestStreak,
   countCompletedPlays,
+  estimateWatchedSeconds,
+  filterEventsByYear,
   filterStatsEvents,
   isCompletedObservation,
   findPeakDay,
   findPeakHourWindow,
   formatHourWindow,
   isStatsEligibleBusiness,
+  listHistoryYears,
   resolvePeriodStartMs,
   summarizeViewCounts,
   toDayKey,
@@ -482,6 +488,32 @@ describe("近期维度（最近在看的 UP 主）", () => {
     expect(authors[0].uniqueContents).toBe(2);
   });
 
+  it("按观看时长排序：长时间视频可以超过视频更多的作者", () => {
+    const events = [
+      event({ author_mid: 1, author_name: "长视频", content_key: "a:1", duration: 3600, progress: 3600 }),
+      event({ author_mid: 2, author_name: "多视频", content_key: "b:1", duration: 600, progress: 600 }),
+      event({ author_mid: 2, author_name: "多视频", content_key: "b:2", duration: 600, progress: 600 }),
+    ];
+    expect(buildTopAuthors(events)[0].mid).toBe(2);
+    const byWatchTime = buildTopAuthors(events, 5, { sortBy: "watchSeconds" });
+    expect(byWatchTime[0].mid).toBe(1);
+    expect(byWatchTime[0].watchSeconds).toBe(3600);
+  });
+
+  it("近期窗口内的观看时长单独累计", () => {
+    const authors = buildTopAuthors(
+      [
+        event({ author_mid: 1, content_key: "a:1", duration: 3600, progress: 3600, view_at: at(-40) }),
+        event({ author_mid: 2, content_key: "b:1", duration: 600, progress: 600, view_at: at(0) }),
+      ],
+      5,
+      { recentSinceSec: at(-6), sortBy: "watchSeconds" },
+    );
+    expect(authors).toHaveLength(1);
+    expect(authors[0].mid).toBe(2);
+    expect(authors[0].recentWatchSeconds).toBe(600);
+  });
+
   it("名字为空时先用兜底表，再没有就显示 UID（避免整行空白）", () => {
     const events = [event({ author_mid: 42, author_name: "", content_key: "a:1" })];
     const withMap = buildTopAuthors(events, 5, { nameByMid: new Map([[42, "补上的真名"]]) });
@@ -682,5 +714,152 @@ describe("周期报告", () => {
   it("周报固定 7 天，月报固定 30 天", () => {
     expect(buildHistoryReport([], "week", NOW).totalDays).toBe(7);
     expect(buildHistoryReport([], "month", NOW).totalDays).toBe(30);
+  });
+
+  it("年报带月度趋势，周报不带", () => {
+    const year = buildHistoryReport([event({ view_at: at(0) })], "year", NOW);
+    expect(year.monthlySeries?.length).toBeGreaterThan(0);
+    expect(year.monthlySeries?.reduce((sum, point) => sum + point.views, 0)).toBe(1);
+    expect(buildHistoryReport([], "week", NOW).monthlySeries).toBeUndefined();
+  });
+
+  it("报告同时给出观看时长与完成度统计", () => {
+    const report = buildHistoryReport(
+      [event({ view_at: at(0), duration: 100, progress: 50 })],
+      "week",
+      NOW,
+    );
+    expect(report.watchTime.totalSeconds).toBe(50);
+    expect(report.completion.completionRate).toBe(0);
+  });
+});
+
+describe("观看时长估算", () => {
+  it("按进度折算，-1 按完整，缺失时长返回 null", () => {
+    expect(estimateWatchedSeconds(event({ duration: 100, progress: 30 }))).toBe(30);
+    expect(estimateWatchedSeconds(event({ duration: 100, progress: -1 }))).toBe(100);
+    expect(estimateWatchedSeconds(event({ progress: 30 }))).toBeNull();
+    expect(estimateWatchedSeconds(event({ duration: 0, progress: 0 }))).toBeNull();
+  });
+
+  it("进度超过总时长时夹到总时长", () => {
+    expect(estimateWatchedSeconds(event({ duration: 100, progress: 160 }))).toBe(100);
+  });
+
+  it("同一视频多条观测只取最大进度，不重复累计", () => {
+    const stats = buildWatchTimeStats([
+      event({ content_key: "a:1", duration: 100, progress: 20, view_at: at(0, 9) }),
+      event({ content_key: "a:1", duration: 100, progress: 80, view_at: at(0, 10) }),
+      event({ content_key: "a:2", duration: 60, progress: 60, view_at: at(-1) }),
+    ]);
+    // a:1 取 80，a:2 取 60
+    expect(stats.totalSeconds).toBe(140);
+    expect(stats.coveredContents).toBe(2);
+    expect(stats.totalContents).toBe(2);
+    expect(stats.coverageRatio).toBe(1);
+    expect(stats.activeDays).toBe(2);
+    expect(stats.averagePerActiveDaySeconds).toBe(70);
+    expect(stats.averagePerContentSeconds).toBe(70);
+  });
+
+  it("最长一天按当天各视频最大进度求和", () => {
+    const stats = buildWatchTimeStats([
+      event({ content_key: "a:1", duration: 100, progress: 40, view_at: at(0, 9) }),
+      event({ content_key: "a:1", duration: 100, progress: 90, view_at: at(0, 10) }),
+      event({ content_key: "a:2", duration: 60, progress: 30, view_at: at(0, 11) }),
+      event({ content_key: "a:3", duration: 60, progress: 60, view_at: at(-1) }),
+    ]);
+    expect(stats.longestDay).toBe(toDayKey(at(0)));
+    expect(stats.longestDaySeconds).toBe(120);
+  });
+
+  it("没有时长的视频计入覆盖率分母但不计时长", () => {
+    const stats = buildWatchTimeStats([
+      event({ content_key: "a:1", duration: 100, progress: 50 }),
+      event({ content_key: "a:2" }),
+    ]);
+    expect(stats.totalSeconds).toBe(50);
+    expect(stats.coveredContents).toBe(1);
+    expect(stats.totalContents).toBe(2);
+    expect(stats.coverageRatio).toBe(0.5);
+  });
+});
+
+describe("完成度与重看", () => {
+  it("完整播放率按内容算，不按原始记录算", () => {
+    const stats = buildCompletionStats([
+      // a 完整看过，且有多次中间观测，不能把分母撑大
+      event({ content_key: "a:1", duration: 100, progress: 10 }),
+      event({ content_key: "a:1", duration: 100, progress: 100 }),
+      event({ content_key: "a:1", duration: 100, progress: 100 }),
+      // b 只看了一半
+      event({ content_key: "a:2", duration: 100, progress: 50 }),
+    ]);
+    expect(stats.uniqueContents).toBe(2);
+    expect(stats.completedContents).toBe(1);
+    expect(stats.completionRate).toBe(0.5);
+    expect(stats.averageProgress).toBeCloseTo(0.75, 5);
+  });
+
+  it("重看率按完整播放次数 / 视频数，保留循环播放", () => {
+    const stats = buildCompletionStats([
+      event({ content_key: "a:1", duration: 100, progress: 10 }),
+      event({ content_key: "a:1", duration: 100, progress: 100 }),
+      event({ content_key: "a:1", duration: 100, progress: 10 }),
+      event({ content_key: "a:1", duration: 100, progress: 100 }),
+      event({ content_key: "a:2", duration: 100, progress: 100 }),
+    ]);
+    expect(stats.completedPlays).toBe(3);
+    expect(stats.rewatchRate).toBe(1.5);
+    expect(stats.topRewatched[0]).toEqual({
+      contentKey: "a:1",
+      title: "a:1",
+      count: 2,
+    });
+  });
+
+  it("只看过一次完整播放的视频不进「最常重看」", () => {
+    const stats = buildCompletionStats([
+      event({ content_key: "a:1", duration: 100, progress: 100 }),
+      event({ content_key: "a:2", duration: 100, progress: 100 }),
+    ]);
+    expect(stats.topRewatched).toHaveLength(0);
+  });
+});
+
+describe("年度与月度序列", () => {
+  it("当前年份只到本月，不补未来月份", () => {
+    const series = buildMonthlyViewSeries([], 2026, NOW);
+    expect(series).toHaveLength(10);
+    expect(series[0].month).toBe("2026-01");
+    expect(series[9].month).toBe("2026-10");
+  });
+
+  it("过去年份补满 12 个月", () => {
+    expect(buildMonthlyViewSeries([], 2025, NOW)).toHaveLength(12);
+  });
+
+  it("月度序列按本地年份与月份归集并去重", () => {
+    const series = buildMonthlyViewSeries(
+      [
+        event({ view_at: at(0, 9), content_key: "a:1" }),
+        event({ view_at: at(0, 10), content_key: "a:1" }),
+        event({ view_at: at(-3), content_key: "a:2" }),
+      ],
+      2026,
+      NOW,
+    );
+    const october = series.find((point) => point.month === "2026-10");
+    expect(october?.views).toBe(3);
+    expect(october?.uniqueContents).toBe(2);
+  });
+
+  it("年份列表倒序，年份过滤不改变原数组", () => {
+    const events = [event({ view_at: at(0) }), event({ view_at: at(-400) })];
+    const years = listHistoryYears(events);
+    expect(years).toEqual([...years].sort((a, b) => b - a));
+    const filtered = filterEventsByYear(events, new Date(at(0) * 1000).getFullYear());
+    expect(filtered.length).toBeLessThanOrEqual(events.length);
+    expect(events).toHaveLength(2);
   });
 });

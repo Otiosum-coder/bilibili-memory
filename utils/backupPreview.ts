@@ -148,7 +148,9 @@ export const formatBackupPreview = (rows: BackupPreviewRow[]): string => {
 
   const totalNew = rows.reduce((sum, row) => sum + row.isNew, 0);
   lines.push("");
-  lines.push(`合计新增约 ${totalNew} 条。本地更新的数据不会被覆盖。`);
+  lines.push(
+    `合计新增约 ${totalNew} 条。本地更新的数据不会被覆盖。`,
+  );
 
   return lines.join("\n");
 };

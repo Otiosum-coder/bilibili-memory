@@ -1229,6 +1229,97 @@ export const deleteHistoryContent = async (
   await done;
 };
 
+export interface HistoryCleanupPreview {
+  events: number;
+  contents: number;
+  oldestViewAt: number | null;
+  newestViewAt: number | null;
+}
+
+export const previewHistoryInRange = async (
+  startSec: number,
+  endSec: number,
+): Promise<HistoryCleanupPreview> => {
+  const events = await getHistoryEventsInRange(startSec, endSec);
+  const contentKeys = new Set(events.map((event) => event.content_key));
+  return {
+    events: events.length,
+    contents: contentKeys.size,
+    oldestViewAt: events.length > 0 ? Math.min(...events.map((event) => event.view_at)) : null,
+    newestViewAt: events.length > 0 ? Math.max(...events.map((event) => event.view_at)) : null,
+  };
+};
+
+/**
+ * 删除指定时间范围内的观看记录。
+ *
+ * 不能只删事件：`history` 里还存着每个内容的最新投影。这里先找出仍保留的
+ * 最新事件，更新投影；同时给每条被删事件写 event tombstone，避免下次同步
+ * 把同一批记录重新导回来。
+ */
+export const deleteHistoryInRange = async (
+  startSec: number,
+  endSec: number,
+): Promise<{ eventsDeleted: number; contentsDeleted: number }> => {
+  const events = await getHistoryEventsInRange(startSec, endSec);
+  if (events.length === 0) return { eventsDeleted: 0, contentsDeleted: 0 };
+
+  const deletedEventIds = new Set(events.map((event) => event.event_id));
+  const affectedContentKeys = new Set(events.map((event) => event.content_key));
+  const allEvents = await getAllHistoryEvents();
+  const latestRemaining = new Map<string, HistoryEvent>();
+  for (const event of allEvents) {
+    if (deletedEventIds.has(event.event_id)) continue;
+    if (!affectedContentKeys.has(event.content_key)) continue;
+    const previous = latestRemaining.get(event.content_key);
+    if (!previous || event.view_at > previous.view_at) {
+      latestRemaining.set(event.content_key, event);
+    }
+  }
+
+  const latestItems = await getAllHistory();
+  const latestByContent = new Map(
+    latestItems.map((item) => [
+      getHistoryContentKey({ business: item.business, id: item.id }),
+      item,
+    ]),
+  );
+
+  const db = await openDB();
+  const tx = db.transaction(["history", "historyEvents", "historyTombstones"], "readwrite");
+  const latestStore = tx.objectStore("history");
+  const eventStore = tx.objectStore("historyEvents");
+  const tombstoneStore = tx.objectStore("historyTombstones");
+  const done = transactionDone(tx);
+  const now = Date.now();
+
+  for (const event of events) {
+    eventStore.delete(event.event_id);
+    tombstoneStore.put({
+      tombstone_id: `event:${event.event_id}`,
+      scope: "event",
+      content_key: event.content_key,
+      event_id: event.event_id,
+      deleted_through_view_at: event.view_at,
+      deleted_at: now,
+      source: "extension-ui",
+    } satisfies HistoryTombstone);
+  }
+
+  for (const contentKey of affectedContentKeys) {
+    const previousLatest = latestByContent.get(contentKey);
+    const replacement = latestRemaining.get(contentKey);
+    if (replacement) {
+      latestStore.put(historyEventToItem(replacement));
+    } else if (previousLatest) {
+      latestStore.delete(previousLatest.id);
+    }
+  }
+
+  await done;
+  return { eventsDeleted: events.length, contentsDeleted: affectedContentKeys.size };
+};
+
 export const getAllHistory = async (limit?: number): Promise<HistoryItem[]> => {
   const db = await openDB();
   const tx = db.transaction("history", "readonly");
@@ -2489,6 +2580,23 @@ export const getAllSubscribedCollections = async (): Promise<SubscribedCollectio
   return getSubscribedCollections();
 };
 
+/** 首屏 KPI 只需要合集内容条数；传入合集 id 时只统计仍然订阅的合集 */
+export const countSubscribedCollectionResources = async (
+  collectionIds?: number[],
+): Promise<number> => {
+  const db = await openDB();
+  const tx = db.transaction("subscribedCollectionResources", "readonly");
+  const store = tx.objectStore("subscribedCollectionResources");
+  if (!collectionIds) return await requestResult(store.count());
+
+  const index = store.index("collection_id");
+  let total = 0;
+  for (const id of collectionIds) {
+    total += await requestResult(index.count(id));
+  }
+  return total;
+};
+
 /** 获取所有订阅合集资源 */
 export const getAllSubscribedCollectionResources = async (): Promise<
   SubscribedCollectionResource[]
@@ -2800,6 +2908,13 @@ export const getAllFavFolders = async (): Promise<FavoriteFolder[]> => {
   });
 };
 
+/** 只数收藏资源条数，首屏 KPI 不需要把 1300+ 条完整记录读进内存 */
+export const countFavResources = async (): Promise<number> => {
+  const db = await openDB();
+  const tx = db.transaction("favResources", "readonly");
+  return await requestResult(tx.objectStore("favResources").count());
+};
+
 /**
  * 获取所有收藏夹资源
  */
@@ -2987,24 +3102,42 @@ export const smartMergeFavResources = async (
     const total = remoteItems.length;
 
     remoteItems.forEach((remoteItem) => {
-      // 已在消失档案里：跳过，绝不写回
-      if (vanishedKeys.has(`${remoteItem.folder_id}:${remoteItem.id}`)) {
-        skipped++;
-        processed++;
-        return;
-      }
-
+      const vanishedKey = `${remoteItem.folder_id}:${remoteItem.id}`;
       const getReq = store.get([remoteItem.folder_id, remoteItem.id]);
       getReq.onsuccess = () => {
         const localItem = getReq.result as FavoriteResource | undefined;
 
-        if (!localItem || remoteItem.fav_time >= localItem.fav_time) {
-          store.put(remoteItem);
+        // 已经在消失档案里、且当前收藏夹没有这条记录：跳过，绝不复活。
+        // 但如果 favResources 里仍有这条记录，它只是元数据被占位内容覆盖，
+        // 这里应该做字段级恢复，而不是因为“档案里也有”就整条跳过。
+        if (!localItem) {
+          if (vanishedKeys.has(vanishedKey)) {
+            skipped++;
+          } else {
+            store.put(remoteItem);
+            merged++;
+          }
+          processed++;
+          return;
+        }
+
+        const mergedItem = mergeRestoredFavorite(remoteItem, localItem);
+        const changed =
+          mergedItem.title !== localItem.title ||
+          mergedItem.cover !== localItem.cover ||
+          mergedItem.coverAssetId !== localItem.coverAssetId ||
+          mergedItem.fav_time !== localItem.fav_time ||
+          mergedItem.recoveredAt !== localItem.recoveredAt ||
+          mergedItem.recoverySource !== localItem.recoverySource ||
+          mergedItem.invalidatedKind !== localItem.invalidatedKind ||
+          mergedItem.invalidatedAt !== localItem.invalidatedAt;
+
+        if (changed) {
+          store.put(mergedItem);
           merged++;
         } else {
           skipped++;
         }
-
         processed++;
       };
       getReq.onerror = () => {
@@ -4155,10 +4288,11 @@ export const smartMergeVanishArchive = async (
     }
 
     const remoteIsNewer = (remote.probeAttemptedAt ?? 0) > (local.probeAttemptedAt ?? 0);
-    const base = remoteIsNewer ? remote : local;
+    const mergedArchive = mergeVanishArchive([local], [remote])[0];
     store.put({
-      ...base,
-      vanishedAt: Math.min(local.vanishedAt, remote.vanishedAt),
+      ...mergedArchive,
+      // 探测时间取两边较新的，避免旧备份让已核查状态回退
+      probeAttemptedAt: Math.max(local.probeAttemptedAt ?? 0, remote.probeAttemptedAt ?? 0),
       // 封面归档指针是本地资产，优先保留已有的
       coverAssetId: local.coverAssetId ?? remote.coverAssetId,
     });

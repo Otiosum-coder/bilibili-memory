@@ -13,9 +13,10 @@ import {
   DEFAULT_FOLLOWING_SYNC_INTERVAL_MINUTES,
 } from "../utils/constants";
 import {
+  countFavResources,
   countAssets,
+  countSubscribedCollectionResources,
   getAllFavFolders,
-  getAllFavResources,
   getAllFollowing,
   getAllFollowingEvents,
   getAllInteractions,
@@ -73,6 +74,7 @@ import {
   type DailyViewPoint,
   type DurationBucket,
   type HistoryReport,
+  type MonthlyViewPoint,
   type ReportKind,
 } from "../utils/historyStats";
 import { getStorageValue, setStorageValue } from "../utils/storage";
@@ -96,6 +98,41 @@ interface DashboardKpiSnapshot {
   at: number;
   values: Record<string, number>;
 }
+
+const DASHBOARD_CACHE_TTL_MS = 60_000;
+
+interface DashboardMetrics {
+  historyCount: number;
+  favoriteCount: number;
+  folderCount: number;
+  collectionCount: number;
+  collectionResourceCount: number;
+  vanishedCount: number;
+}
+
+interface DashboardCacheData {
+  at: number;
+  metrics: DashboardMetrics;
+  kpiBaseline: Record<string, number> | null;
+  favoriteCoverStats: { archived: number; total: number };
+  following: FollowingItem[];
+  events: FollowingEvent[];
+  interactions: Awaited<ReturnType<typeof getAllInteractions>>;
+  progress: FollowingSyncProgress | null;
+  hasBaseline: boolean;
+  lastSyncAt: number | null;
+  intervalMinutes: number;
+  assetCount: number;
+  avatarAssetCount: number;
+  coverAssetCount: number;
+  coverArchiveProgress: CoverArchiveProgress | null;
+  collectionCoverArchiveProgress: CoverArchiveProgress | null;
+  viewEvents: HistoryEvent[];
+  recordStartedAt: number | null;
+  interactionProgress: InteractionSyncProgress | null;
+}
+
+let dashboardCache: DashboardCacheData | null = null;
 
 /** 每个 KPI 点进去对应的页面；失效内容单独走消失档案 */
 const KPI_ROUTES: Record<string, string> = {
@@ -127,6 +164,8 @@ const VIEW_WINDOW_OPTIONS = [
 ] as const;
 
 const MAX_VIEW_WINDOW_DAYS = 365;
+/** 首屏只读最近 90 天，全年记录在第二段后台补齐，避免首次进入被整年事件拖住 */
+const INITIAL_VIEW_WINDOW_DAYS = 90;
 
 /** 「最近在看的 UP 主」用的近期窗口 */
 const AUTHOR_RECENT_OPTIONS = [
@@ -134,6 +173,13 @@ const AUTHOR_RECENT_OPTIONS = [
   { days: 30, label: "近 30 天" },
   { days: 90, label: "近 90 天" },
 ] as const;
+
+type AuthorSortKey = "watchSeconds" | "recentVideos";
+
+const AUTHOR_SORT_OPTIONS: { key: AuthorSortKey; label: string }[] = [
+  { key: "watchSeconds", label: "观看时长" },
+  { key: "recentVideos", label: "视频数" },
+];
 
 /** 报告清单里的统计周期说明 */
 const REPORT_KIND_WINDOW_LABEL: Record<ReportKind, string> = {
@@ -825,6 +871,47 @@ const DurationDonut = ({ buckets }: { buckets: DurationBucket[] }) => {
   );
 };
 
+/** 报告里的时长展示：统计是估算值，不展开到秒 */
+const formatReportDuration = (seconds: number): string => {
+  if (!Number.isFinite(seconds) || seconds <= 0) return "0 分钟";
+  const totalMinutes = Math.round(seconds / 60);
+  if (totalMinutes < 60) return `${Math.max(1, totalMinutes)} 分钟`;
+  const hours = Math.floor(totalMinutes / 60);
+  const minutes = totalMinutes % 60;
+  return minutes > 0 ? `${hours} 小时 ${minutes} 分` : `${hours} 小时`;
+};
+
+const formatReportPercent = (ratio: number): string =>
+  Number.isFinite(ratio) ? `${Math.round(ratio * 100)}%` : "—";
+
+/** 年报里的月度趋势：只用来比较月份高低，不引入第二套坐标轴 */
+const ReportMonthlyBars = ({ points }: { points: MonthlyViewPoint[] }) => {
+  const max = Math.max(1, ...points.map((point) => point.uniqueContents));
+  return (
+    <div className="mt-3 flex h-28 items-end gap-1.5">
+      {points.map((point) => (
+        <div
+          key={point.month}
+          className="flex h-full min-w-0 flex-1 flex-col items-center justify-end"
+          title={`${point.month.slice(0, 4)} 年 ${Number(point.month.slice(5))} 月 · ${point.uniqueContents} 个视频`}
+        >
+          <div
+            className="w-full rounded-t bg-pink-500/80"
+            style={{
+              height: point.uniqueContents > 0
+                ? `${Math.max(3, (point.uniqueContents / max) * 100)}%`
+                : "2px",
+            }}
+          />
+          <span className="mt-1 text-[10px] text-gray-400 dark:text-neutral-500">
+            {Number(point.month.slice(5))}月
+          </span>
+        </div>
+      ))}
+    </div>
+  );
+};
+
 /** 报告内容用一个弹窗承载，不新开页面 */
 const HistoryReportModal = ({
   report,
@@ -848,6 +935,7 @@ const HistoryReportModal = ({
   const dailyAverage =
     report.activeDays > 0 ? Math.round((totalVideos / report.activeDays) * 10) / 10 : 0;
   const hourAxisLabels = buildHourAxisLabels();
+  const [dailyTrendView, setDailyTrendView] = useState<"bar" | "heatmap">("bar");
 
   return (
     <div
@@ -882,8 +970,10 @@ const HistoryReportModal = ({
             { label: "看过的视频", value: totalVideos },
             { label: "完整播放", value: report.completedPlays },
             { label: "活跃天数", value: report.activeDays },
-            { label: "活跃日均", value: dailyAverage },
-            { label: "最长连续", value: `${report.longestStreak} 天` },
+            { label: "日均视频数", value: dailyAverage },
+            ...(report.kind === "year"
+              ? [{ label: "最长连续", value: `${report.longestStreak} 天` }]
+              : []),
           ].map((item) => (
             <div
               key={item.label}
@@ -897,6 +987,64 @@ const HistoryReportModal = ({
           ))}
         </div>
 
+        <section className="mt-4 rounded-xl border border-gray-100 p-4 dark:border-neutral-800">
+          <div className="flex flex-wrap items-baseline justify-between gap-2">
+            <h3 className="text-sm font-semibold text-gray-900 dark:text-neutral-100">
+              本期观看时长
+            </h3>
+            <p className="text-xs text-gray-400 dark:text-neutral-500">
+              按视频进度估算
+            </p>
+          </div>
+          <div className="mt-3 grid grid-cols-2 gap-3 sm:grid-cols-4">
+            {[
+              {
+                label: "累计时长",
+                value: formatReportDuration(report.watchTime.totalSeconds),
+              },
+              {
+                label: "日均时长",
+                value: formatReportDuration(report.watchTime.averagePerActiveDaySeconds),
+              },
+              {
+                label: "平均每个视频",
+                value: formatReportDuration(report.watchTime.averagePerContentSeconds),
+              },
+              {
+                label: "完整播放率",
+                value: formatReportPercent(report.completion.completionRate),
+              },
+            ].map((item) => (
+              <div key={item.label}>
+                <p className="text-xs text-gray-500 dark:text-neutral-400">{item.label}</p>
+                <p className="mt-1 text-lg font-semibold tabular-nums text-gray-900 dark:text-neutral-100">
+                  {item.value}
+                </p>
+              </div>
+            ))}
+          </div>
+          <p className="mt-3 text-xs leading-relaxed text-gray-400 dark:text-neutral-500">
+            同一条视频重复观测只取最远进度，扩展未运行时的观看无法计入；
+            {report.watchTime.totalContents > 0
+              ? `已覆盖 ${report.watchTime.coveredContents}/${report.watchTime.totalContents} 个视频（${formatReportPercent(report.watchTime.coverageRatio)}）。`
+              : "本期暂无可估算时长的记录。"}
+          </p>
+        </section>
+
+        {report.monthlySeries?.length ? (
+          <section className="mt-4 rounded-xl border border-gray-100 p-4 dark:border-neutral-800">
+            <div className="flex flex-wrap items-baseline justify-between gap-2">
+              <h3 className="text-sm font-semibold text-gray-900 dark:text-neutral-100">
+                月度趋势
+              </h3>
+              <p className="text-xs text-gray-400 dark:text-neutral-500">
+                {report.periodLabel.slice(0, 4)} 年 · 按不同视频数
+              </p>
+            </div>
+            <ReportMonthlyBars points={report.monthlySeries} />
+          </section>
+        ) : null}
+
         {/* 本期关注变动：报告原本只讲"看了什么"，这里补上"关注关系发生了什么" */}
         {following ? (
           <section className="mt-4 rounded-xl border border-gray-100 p-4 dark:border-neutral-800">
@@ -908,7 +1056,7 @@ const HistoryReportModal = ({
                 按插件的关注同步记录统计
               </p>
             </div>
-            <div className="mt-2 flex flex-wrap items-baseline gap-x-6 gap-y-2 text-sm">
+            <div className="mt-2 flex flex-wrap items-baseline gap-x-5 gap-y-2 text-sm">
               <span className="text-gray-600 dark:text-neutral-300">
                 新增关注{" "}
                 <span className="text-lg font-semibold tabular-nums text-pink-600 dark:text-pink-400">
@@ -923,8 +1071,19 @@ const HistoryReportModal = ({
                 </span>{" "}
                 人
               </span>
-              <span className="text-xs text-gray-400 dark:text-neutral-500">
-                改名 {following.renamed} · 账号注销 {following.accountGone}
+              <span className="text-gray-600 dark:text-neutral-300">
+                改名{" "}
+                <span className="text-lg font-semibold tabular-nums text-sky-600 dark:text-sky-400">
+                  {following.renamed}
+                </span>{" "}
+                人
+              </span>
+              <span className="text-gray-600 dark:text-neutral-300">
+                账号注销{" "}
+                <span className="text-lg font-semibold tabular-nums text-gray-500 dark:text-neutral-400">
+                  {following.accountGone}
+                </span>{" "}
+                人
               </span>
             </div>
             <p className="mt-2 text-xs leading-relaxed text-gray-400 dark:text-neutral-500">
@@ -934,7 +1093,41 @@ const HistoryReportModal = ({
         ) : null}
 
         <div className="mt-5 rounded-xl border border-gray-100 p-4 dark:border-neutral-800">
-          <DailyViewChart points={report.series} />
+          <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
+            <div>
+              <h3 className="text-sm font-semibold text-gray-900 dark:text-neutral-100">
+                每日观看趋势
+              </h3>
+              <p className="mt-1 text-xs text-gray-400 dark:text-neutral-500">
+                按不同视频数，热力模式适合看全年规律
+              </p>
+            </div>
+            <div className="flex rounded-md border border-gray-200 p-0.5 text-[10px] dark:border-neutral-700">
+              {([
+                { value: "bar", label: "柱状" },
+                { value: "heatmap", label: "热力" },
+              ] as const).map((option) => (
+                <button
+                  key={option.value}
+                  type="button"
+                  onClick={() => setDailyTrendView(option.value)}
+                  aria-pressed={dailyTrendView === option.value}
+                  className={`rounded px-2.5 py-1 transition-colors ${
+                    dailyTrendView === option.value
+                      ? "bg-pink-500 text-white"
+                      : "text-gray-500 hover:bg-gray-50 dark:text-neutral-400 dark:hover:bg-neutral-800"
+                  }`}
+                >
+                  {option.label}
+                </button>
+              ))}
+            </div>
+          </div>
+          {dailyTrendView === "heatmap" ? (
+            <DailyViewHeatmap points={report.series} />
+          ) : (
+            <DailyViewChart points={report.series} />
+          )}
         </div>
 
         <div className="mt-4 space-y-4">
@@ -965,9 +1158,9 @@ const HistoryReportModal = ({
                 <h3 className="text-sm font-semibold text-gray-900 dark:text-neutral-100">
                   看得最多的 UP 主
                 </h3>
-                <span className="text-xs text-gray-400 dark:text-neutral-500">按不同视频数</span>
+                <span className="text-xs text-gray-400 dark:text-neutral-500">按观看时长</span>
               </div>
-              <ul className="space-y-2.5">
+              <ul className="space-y-2">
                 {report.topAuthors.map((author) => (
                   <li key={author.mid} className="text-sm">
                     <div className="flex items-baseline gap-2">
@@ -977,11 +1170,16 @@ const HistoryReportModal = ({
                       >
                         {author.name}
                       </span>
-                      <span className="shrink-0 text-xs text-gray-400 dark:text-neutral-500">
-                        完整播放 {author.completedPlays} 次
-                      </span>
-                      <span className="w-14 shrink-0 text-right text-xs font-medium tabular-nums text-gray-700 dark:text-neutral-200">
-                        {author.uniqueContents} 个
+                      <span className="shrink-0 text-right text-xs tabular-nums text-gray-500 dark:text-neutral-400">
+                        观看{" "}
+                        <span className="font-medium text-gray-700 dark:text-neutral-200">
+                          {formatReportDuration(author.watchSeconds)}
+                        </span>
+                        <span className="mx-1 text-gray-300 dark:text-neutral-600">·</span>
+                        <span className="font-medium text-gray-700 dark:text-neutral-200">
+                          {author.uniqueContents}
+                        </span>{" "}
+                        个视频
                       </span>
                     </div>
                     {/* 占比条：以榜首为满格，一眼看出梯队差距 */}
@@ -990,8 +1188,8 @@ const HistoryReportModal = ({
                         className="h-full rounded-full bg-pink-400/80"
                         style={{
                           width: `${Math.round(
-                            (author.uniqueContents /
-                              Math.max(1, report.topAuthors[0]?.uniqueContents ?? 1)) *
+                            (author.watchSeconds /
+                              Math.max(1, report.topAuthors[0]?.watchSeconds ?? 1)) *
                               100,
                           )}%`,
                         }}
@@ -1253,6 +1451,7 @@ const InfoTip = ({
 export const Dashboard = () => {
   const navigate = useNavigate();
   const [loading, setLoading] = useState(true);
+  const [secondaryLoading, setSecondaryLoading] = useState(true);
   const [syncing, setSyncing] = useState(false);
   const [rangeDays, setRangeDays] = useState<number>(30);
   /** 「最近变动」面板：预览条数由常量决定，完整列表在弹窗里 */
@@ -1264,6 +1463,7 @@ export const Dashboard = () => {
   const [viewWindowDays, setViewWindowDays] = useState<number>(30);
   const [trendChart, setTrendChart] = useState<TrendChartKind>("bar");
   const [authorRecentDays, setAuthorRecentDays] = useState<number>(30);
+  const [authorSortBy, setAuthorSortBy] = useState<AuthorSortKey>("watchSeconds");
   const [reportKind, setReportKind] = useState<ReportKind | null>(null);
   const [metrics, setMetrics] = useState({
     historyCount: 0,
@@ -1318,151 +1518,236 @@ export const Dashboard = () => {
     };
   }, []);
 
-  const load = useCallback(async () => {
-    setLoading(true);
+  const applyCache = useCallback((cache: DashboardCacheData) => {
+    setMetrics(cache.metrics);
+    setKpiBaseline(cache.kpiBaseline);
+    kpiBaselineLoadedRef.current = true;
+    setFavoriteCoverStats(cache.favoriteCoverStats);
+    setFollowing(cache.following);
+    setEvents(cache.events);
+    setProgress(cache.progress);
+    setHasBaseline(cache.hasBaseline);
+    setLastSyncAt(cache.lastSyncAt);
+    setIntervalMinutes(cache.intervalMinutes);
+    setAssetCount(cache.assetCount);
+    setAvatarAssetCount(cache.avatarAssetCount);
+    setCoverAssetCount(cache.coverAssetCount);
+    setCoverArchiveProgress(cache.coverArchiveProgress);
+    setCollectionCoverArchiveProgress(cache.collectionCoverArchiveProgress);
+    setViewEvents(cache.viewEvents);
+    setRecordStartedAt(cache.recordStartedAt);
+    setInteractions(cache.interactions);
+    setInteractionProgress(cache.interactionProgress);
+    setLoading(false);
+    setSecondaryLoading(false);
+  }, []);
+
+  const load = useCallback(async (options: { background?: boolean } = {}) => {
+    if (!options.background) {
+      setLoading(true);
+      setSecondaryLoading(true);
+    }
     try {
+      // 第一段只读首屏真正要用的数据：KPI、趋势、UP 榜、关注变动。
+      // 图片张数、互动/消失档案这些放第二段，避免拖住首屏。
       const [
         historyCount,
-        favorites,
+        favoriteCount,
         folders,
         collections,
-        collectionResources,
         followingList,
         eventList,
         savedProgress,
         savedBaseline,
         savedLastSync,
         savedInterval,
-        assets,
-        avatarAssets,
-        coverAssets,
-        savedCoverArchiveProgress,
-        savedCollectionCoverArchiveProgress,
         viewEventList,
         earliestViewAt,
-        interactionList,
-        storedArchive,
-        legacyArchive,
         savedKpiSnapshot,
-        savedInteractionProgress,
       ] = await Promise.all([
         getTotalHistoryCount(),
-        getAllFavResources(),
+        countFavResources(),
         getAllFavFolders(),
         getAllSubscribedCollections(),
-        getAllSubscribedCollectionResources(),
         getAllFollowing(),
         getAllFollowingEvents(),
         getStorageValue<FollowingSyncProgress | null>(FOLLOWING_SYNC_PROGRESS, null),
         getStorageValue(HAS_FULL_FOLLOWING_SYNC, false),
         getStorageValue<number | null>(FOLLOWING_LAST_SYNC, null),
         getStorageValue(FOLLOWING_SYNC_INTERVAL, DEFAULT_FOLLOWING_SYNC_INTERVAL_MINUTES),
-        countAssets(),
-        // 按类型直接数库里的实际张数，而不是依赖进度计数器——
-        // 进度只是个累加值，一旦没存住，面板就会显示 0 张而库里其实已有上千张
-        countAssets("avatar"),
-        countAssets("cover"),
-        getStorageValue<CoverArchiveProgress | null>(FAV_COVER_ARCHIVE_PROGRESS, null),
-        getStorageValue<CoverArchiveProgress | null>(COLLECTION_COVER_ARCHIVE_PROGRESS, null),
-        // 只读最近一年的事件：观看事件表比 history 投影大一个数量级，
-        // 统计永远先限定窗口，绝不整表读进内存
         getHistoryEventsInRange(
-          Math.floor((Date.now() - MAX_VIEW_WINDOW_DAYS * DAY_MS) / 1000),
+          Math.floor((Date.now() - INITIAL_VIEW_WINDOW_DAYS * DAY_MS) / 1000),
           Math.floor(Date.now() / 1000),
         ),
         getEarliestHistoryEventViewAt(),
-        getAllInteractions(),
-        getAllVanishArchive(),
-        getAllVanishedFavResources(),
         getStorageValue<DashboardKpiSnapshot | null>(DASHBOARD_KPI_SNAPSHOT, null),
-        getStorageValue<InteractionSyncProgress | null>(INTERACTIONS_SYNC_PROGRESS, null),
       ]);
 
-      // KPI 的「失效内容」必须和消失档案页默认视图同口径：
-      // 持久档案 + 旧档案 + 当前收藏实时派生，再按字段择优合并。
-      const archiveItems = normalizeArchiveReasons(
-        enrichArchiveFromLive(
-          mergeVanishArchive(
-            mergeArchiveWithLegacy(storedArchive, legacyArchive),
-            collectLiveVanishArchive({
-              favorites,
-              collections: [],
-              following: followingList,
-              interactions: interactionList,
-              isInvalidated: isInvalidatedResource,
-            }),
-          ),
-          favorites,
-        ),
-      );
-      const vanishedCount = archiveItems.filter((item) => item.source === "favorites").length;
-      // 合集内容只统计当前仍订阅的合集。已取消/已删除合集的资源会保留给
-      // 消失档案详情使用，不能算进「当前合集内容」，否则 KPI 会虚高。
-      const currentCollectionIds = new Set(collections.map((collection) => collection.id));
-      const collectionResourceCount = collectionResources.filter((resource) =>
-        currentCollectionIds.has(resource.collection_id),
-      ).length;
-      const favoriteCoverCandidates = favorites.filter((item) => Boolean(item.cover));
-      setFavoriteCoverStats({
-        archived: favoriteCoverCandidates.filter((item) => Boolean(item.coverAssetId)).length,
-        total: favoriteCoverCandidates.length,
-      });
+      const collectionResourceCount = await countSubscribedCollectionResources(
+        collections.map((collection) => collection.id),
+      ).catch(() => 0);
 
-      setMetrics({
+      const initialMetrics: DashboardMetrics = {
         historyCount,
-        favoriteCount: favorites.length,
+        favoriteCount,
         folderCount: folders.length,
         collectionCount: collections.length,
         collectionResourceCount,
-        vanishedCount,
-      });
+        // 失效内容需要扫描多条本地记录，第二段再补
+        vanishedCount: 0,
+      };
+      setMetrics(initialMetrics);
       setFollowing(followingList);
       setEvents(eventList);
       setProgress(savedProgress);
       setHasBaseline(savedBaseline);
       setLastSyncAt(savedLastSync);
       setIntervalMinutes(savedInterval);
-      setAssetCount(assets);
-      setAvatarAssetCount(avatarAssets);
-      setCoverAssetCount(coverAssets);
-      setCoverArchiveProgress(savedCoverArchiveProgress);
-      setCollectionCoverArchiveProgress(savedCollectionCoverArchiveProgress);
       setViewEvents(viewEventList);
       setRecordStartedAt(earliestViewAt);
-      setInteractions(interactionList);
-      setInteractionProgress(savedInteractionProgress);
 
-      const kpiValues: Record<string, number> = {
-        historyCount,
-        favoriteCount: favorites.length,
-        collectionCount: collections.length,
-        collectionResourceCount,
-        followingCount: followingList.length,
-        vanishedCount,
-      };
       if (!kpiBaselineLoadedRef.current) {
         kpiBaselineLoadedRef.current = true;
         setKpiBaseline(savedKpiSnapshot?.values ?? null);
       }
-      // 每次打开都把「这一次」记成下一次的基准；差值必须是两次访问之间，
-      // 而不是页面内刷新前后。写入失败不影响页面展示。
-      void setStorageValue<DashboardKpiSnapshot>(DASHBOARD_KPI_SNAPSHOT, {
-        at: Date.now(),
-        values: kpiValues,
-      }).catch((error) => {
-        console.warn("保存总览 KPI 快照失败:", error);
-      });
+
+      // 首屏可以出了
+      setLoading(false);
+
+      // 第二段：补合集内容、失效内容、图片归档、互动记录。
+      try {
+        const [
+          fullViewEvents,
+          favorites,
+          collectionResources,
+          assets,
+          avatarAssets,
+          coverAssets,
+          savedCoverArchiveProgress,
+          savedCollectionCoverArchiveProgress,
+          interactionList,
+          storedArchive,
+          legacyArchive,
+          savedInteractionProgress,
+        ] = await Promise.all([
+          // 首屏先用 90 天，这里再补全年；报告和 365 天窗口都依赖完整事件
+          getHistoryEventsInRange(
+            Math.floor((Date.now() - MAX_VIEW_WINDOW_DAYS * DAY_MS) / 1000),
+            Math.floor(Date.now() / 1000),
+          ),
+          getAllFavResources(),
+          getAllSubscribedCollectionResources(),
+          countAssets(),
+          countAssets("avatar"),
+          countAssets("cover"),
+          getStorageValue<CoverArchiveProgress | null>(FAV_COVER_ARCHIVE_PROGRESS, null),
+          getStorageValue<CoverArchiveProgress | null>(COLLECTION_COVER_ARCHIVE_PROGRESS, null),
+          getAllInteractions(),
+          getAllVanishArchive(),
+          getAllVanishedFavResources(),
+          getStorageValue<InteractionSyncProgress | null>(INTERACTIONS_SYNC_PROGRESS, null),
+        ]);
+
+        const archiveItems = normalizeArchiveReasons(
+          enrichArchiveFromLive(
+            mergeVanishArchive(
+              mergeArchiveWithLegacy(storedArchive, legacyArchive),
+              collectLiveVanishArchive({
+                favorites,
+                collections: [],
+                following: followingList,
+                interactions: interactionList,
+                isInvalidated: isInvalidatedResource,
+              }),
+            ),
+            favorites,
+          ),
+        );
+        const vanishedCount = archiveItems.filter((item) => item.source === "favorites").length;
+        const currentCollectionIds = new Set(collections.map((collection) => collection.id));
+        const collectionResourceCount = collectionResources.filter((resource) =>
+          currentCollectionIds.has(resource.collection_id),
+        ).length;
+        const favoriteCoverCandidates = favorites.filter((item) => Boolean(item.cover));
+        const nextFavoriteCoverStats = {
+          archived: favoriteCoverCandidates.filter((item) => Boolean(item.coverAssetId)).length,
+          total: favoriteCoverCandidates.length,
+        };
+
+        const nextMetrics: DashboardMetrics = {
+          ...initialMetrics,
+          collectionResourceCount,
+          vanishedCount,
+        };
+        setMetrics(nextMetrics);
+        setFavoriteCoverStats(nextFavoriteCoverStats);
+        setViewEvents(fullViewEvents);
+        setAssetCount(assets);
+        setAvatarAssetCount(avatarAssets);
+        setCoverAssetCount(coverAssets);
+        setCoverArchiveProgress(savedCoverArchiveProgress);
+        setCollectionCoverArchiveProgress(savedCollectionCoverArchiveProgress);
+        setInteractions(interactionList);
+        setInteractionProgress(savedInteractionProgress);
+
+        const kpiValues: Record<string, number> = {
+          historyCount,
+          favoriteCount: favorites.length,
+          collectionCount: collections.length,
+          collectionResourceCount,
+          followingCount: followingList.length,
+          vanishedCount,
+        };
+        void setStorageValue<DashboardKpiSnapshot>(DASHBOARD_KPI_SNAPSHOT, {
+          at: Date.now(),
+          values: kpiValues,
+        }).catch((error) => {
+          console.warn("保存总览 KPI 快照失败:", error);
+        });
+
+        dashboardCache = {
+          at: Date.now(),
+          metrics: nextMetrics,
+          kpiBaseline: savedKpiSnapshot?.values ?? null,
+          favoriteCoverStats: nextFavoriteCoverStats,
+          following: followingList,
+          events: eventList,
+          interactions: interactionList,
+          progress: savedProgress,
+          hasBaseline: savedBaseline,
+          lastSyncAt: savedLastSync,
+          intervalMinutes: savedInterval,
+          assetCount: assets,
+          avatarAssetCount: avatarAssets,
+          coverAssetCount: coverAssets,
+          coverArchiveProgress: savedCoverArchiveProgress,
+          collectionCoverArchiveProgress: savedCollectionCoverArchiveProgress,
+          viewEvents: fullViewEvents,
+          recordStartedAt: earliestViewAt,
+          interactionProgress: savedInteractionProgress,
+        };
+      } catch (error) {
+        console.error("加载总览次要数据失败:", error);
+      }
     } catch (error) {
       console.error("加载总览失败:", error);
       toast.error("加载总览失败");
     } finally {
       setLoading(false);
+      setSecondaryLoading(false);
     }
   }, []);
 
   useEffect(() => {
+    const cached = dashboardCache;
+    if (cached) {
+      applyCache(cached);
+      if (Date.now() - cached.at < DASHBOARD_CACHE_TTL_MS) return;
+      void load({ background: true });
+      return;
+    }
     void load();
-  }, [load]);
+  }, [applyCache, load]);
 
   /**
    * 只重读归档相关的数据，避免整页重载。
@@ -1522,7 +1807,8 @@ export const Dashboard = () => {
       const response = await browser.runtime.sendMessage({ action: "syncFollowing" });
       if (!response?.success) throw new Error(response?.error || "关注同步失败");
       toast.success(response.message ?? "关注同步完成");
-      await load();
+      dashboardCache = null;
+      await load({ background: true });
     } catch (error) {
       const message = error instanceof Error ? error.message : "关注同步失败";
       setSyncError(`关注同步失败：${message}`);
@@ -1539,7 +1825,8 @@ export const Dashboard = () => {
       const response = await browser.runtime.sendMessage({ action: "syncInteractions" });
       if (!response?.success) throw new Error(response?.error || "互动记录同步失败");
       toast.success(response.message ?? "互动记录同步完成");
-      await load();
+      dashboardCache = null;
+      await load({ background: true });
     } catch (error) {
       const message = error instanceof Error ? error.message : "互动记录同步失败";
       setSyncError(`互动记录同步失败：${message}`);
@@ -1570,7 +1857,8 @@ export const Dashboard = () => {
         );
       }
       toast.success(messages.join("；"));
-      await load();
+      dashboardCache = null;
+      await load({ background: true });
     } catch (error) {
       toast.error(error instanceof Error ? error.message : "图片归档失败");
     } finally {
@@ -1656,8 +1944,9 @@ export const Dashboard = () => {
       buildTopAuthors(statsEvents, DASHBOARD_TOP_AUTHOR_LIMIT, {
         recentSinceSec: startOfLocalDaySec(Date.now()) - (authorRecentDays - 1) * (DAY_MS / 1000),
         nameByMid: authorNameByMid,
+        sortBy: authorSortBy,
       }),
-    [statsEvents, authorRecentDays, authorNameByMid],
+    [statsEvents, authorRecentDays, authorNameByMid, authorSortBy],
   );
 
   /**
@@ -1711,11 +2000,12 @@ export const Dashboard = () => {
     );
   }, [reportKind, events]);
 
-  /** 覆盖天数不够的报告不出现按钮，避免生成一份看不出东西的报告 */
-  const availableReportKinds = useMemo(
-    () => REPORT_KINDS.filter((kind) => reportAvailability.available[kind]),
-    [reportAvailability],
-  );
+  /** 覆盖天数不够的报告不出现按钮，避免生成一份看不出东西的报告；年报先始终展示，便于预览 */
+  const availableReportKinds = useMemo(() => {
+    const kinds = REPORT_KINDS.filter((kind) => reportAvailability.available[kind]);
+    if (!kinds.includes("year")) kinds.push("year");
+    return kinds;
+  }, [reportAvailability]);
 
   const followingStats = useMemo(() => buildFollowingStats(following), [following]);
 
@@ -1858,7 +2148,29 @@ export const Dashboard = () => {
         </div>
 
         {loading ? (
-          <div className="py-20 text-center text-sm text-gray-400 dark:text-neutral-500">加载中…</div>
+          <div className="space-y-5" aria-busy="true" aria-label="正在加载总览">
+            <div className="flex flex-wrap gap-3">
+              {Array.from({ length: 6 }).map((_, index) => (
+                <div
+                  key={index}
+                  className="h-[76px] min-w-[8.5rem] max-w-[15rem] flex-1 animate-pulse rounded-xl bg-gray-100 dark:bg-neutral-800/70"
+                />
+              ))}
+            </div>
+            <div className="rounded-xl border border-gray-100 bg-white p-4 shadow-sm dark:border-neutral-800 dark:bg-neutral-900">
+              <div className="h-4 w-24 animate-pulse rounded bg-gray-100 dark:bg-neutral-800/70" />
+              <div className="mt-4 h-28 animate-pulse rounded-lg bg-gray-100 dark:bg-neutral-800/70" />
+              <div className="mt-3 h-52 animate-pulse rounded-lg bg-gray-50 dark:bg-neutral-800/40" />
+            </div>
+            <div className="grid gap-4 lg:grid-cols-2">
+              <div className="h-56 animate-pulse rounded-xl bg-gray-100 dark:bg-neutral-800/70" />
+              <div className="h-56 animate-pulse rounded-xl bg-gray-100 dark:bg-neutral-800/70" />
+            </div>
+            <div className="grid gap-4 lg:grid-cols-2">
+              <div className="h-64 animate-pulse rounded-xl bg-gray-100 dark:bg-neutral-800/70" />
+              <div className="h-64 animate-pulse rounded-xl bg-gray-100 dark:bg-neutral-800/70" />
+            </div>
+          </div>
         ) : (
           <div className="space-y-5">
             {/* A. 跨模块指标：沿用旧版的紧凑左对齐；口径说明只放在需要解释的
@@ -1894,9 +2206,11 @@ export const Dashboard = () => {
                         <p className="text-xs text-gray-500 dark:text-neutral-400">{metric.label}</p>
                         <div className="mt-1 flex items-baseline gap-1.5">
                           <p className="text-xl font-semibold tabular-nums text-gray-900 dark:text-neutral-100">
-                            {metric.value}
+                            {secondaryLoading && metric.key === "vanishedCount"
+                              ? "—"
+                              : metric.value}
                           </p>
-                          {delta !== null ? (
+                          {!(secondaryLoading && metric.key === "vanishedCount") && delta !== null ? (
                             <span
                               className={`rounded-full px-2 py-0.5 text-xs font-medium tabular-nums ${
                                 delta > 0
@@ -2070,12 +2384,41 @@ export const Dashboard = () => {
                       ))}
                     </span>
                   </div>
-                  <ul className="space-y-2">
+                  <div className="flex items-center gap-2 border-b border-gray-100 pb-1 text-[10px] text-gray-400 dark:border-neutral-800 dark:text-neutral-500">
+                    <span className="min-w-0 flex-1">UP 主</span>
+                    {AUTHOR_SORT_OPTIONS.map((option) => (
+                      <button
+                        key={option.key}
+                        type="button"
+                        onClick={() => setAuthorSortBy(option.key)}
+                        title={`点击按${option.label}排序`}
+                        aria-pressed={authorSortBy === option.key}
+                        className={`flex shrink-0 items-center justify-end gap-0.5 whitespace-nowrap text-right transition-colors ${
+                          option.key === "watchSeconds" ? "w-[5.5rem]" : "w-11"
+                        } ${
+                          authorSortBy === option.key
+                            ? "font-medium text-pink-600 dark:text-pink-400"
+                            : "hover:text-gray-600 dark:hover:text-neutral-300"
+                        }`}
+                      >
+                        {option.label}
+                        <span
+                          aria-hidden="true"
+                          className={`w-2 text-[9px] leading-none ${
+                            authorSortBy === option.key ? "opacity-100" : "opacity-0"
+                          }`}
+                        >
+                          ↓
+                        </span>
+                      </button>
+                    ))}
+                  </div>
+                  <ul className="mt-0.5">
                     {topAuthors.map((author) => (
                       <li
                         key={author.mid}
-                        className="flex items-center gap-2 text-sm"
-                        title={`UID ${author.mid} · 最近 ${authorRecentDays} 天看了 ${author.recentVideos} 个视频 · 近一年共 ${author.uniqueContents} 个 · 完整播放 ${author.completedPlays} 次${
+                        className="flex items-center gap-2 py-1 text-sm"
+                        title={`UID ${author.mid} · 最近 ${authorRecentDays} 天观看约 ${formatReportDuration(author.recentWatchSeconds)} · ${author.recentVideos} 个视频 · 近一年共 ${author.uniqueContents} 个 · 完整播放 ${author.completedPlays} 次${
                           author.lastViewedAt
                             ? ` · 最近一次 ${formatDayLabel(toDayKey(author.lastViewedAt))}`
                             : ""
@@ -2090,13 +2433,16 @@ export const Dashboard = () => {
                         >
                           {author.name}
                         </a>
-                        <span className="shrink-0 rounded-full bg-pink-50 px-2 py-0.5 text-xs text-pink-600 dark:bg-pink-500/10 dark:text-pink-400">
-                          {author.recentVideos} 个视频
+                        <span className="w-[5.5rem] shrink-0 whitespace-nowrap text-right text-xs tabular-nums text-gray-700 dark:text-neutral-200">
+                          {formatReportDuration(author.recentWatchSeconds)}
+                        </span>
+                        <span className="w-11 shrink-0 text-right text-xs tabular-nums text-gray-400 dark:text-neutral-500">
+                          {author.recentVideos}
                         </span>
                       </li>
                     ))}
                     {topAuthors.length === 0 ? (
-                      <li className="text-sm text-gray-400 dark:text-neutral-500">
+                      <li className="py-1 text-sm text-gray-400 dark:text-neutral-500">
                         窗口内还没有记录
                       </li>
                     ) : null}
@@ -2128,7 +2474,9 @@ export const Dashboard = () => {
                                 {REPORT_KIND_LABEL[kind]}
                               </span>
                               <span className="mt-0.5 block text-[11px] text-gray-400 dark:text-neutral-500">
-                                {REPORT_KIND_WINDOW_LABEL[kind]}
+                                {kind === "year" && !reportAvailability.available.year
+                                  ? `自然年 · 目前只覆盖 ${reportAvailability.coverageDays} 天，可先预览`
+                                  : REPORT_KIND_WINDOW_LABEL[kind]}
                               </span>
                             </span>
                           </span>

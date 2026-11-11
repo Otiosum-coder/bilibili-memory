@@ -60,7 +60,7 @@ export const ProjectInfoModal = ({ open, onClose, version }: ProjectInfoModalPro
         role="dialog"
         aria-modal="true"
         aria-label="项目信息"
-        className="relative max-h-[85vh] w-full max-w-[520px] overflow-y-auto rounded-2xl border border-gray-200 bg-white shadow-2xl dark:border-neutral-800 dark:bg-neutral-900"
+        className="relative max-h-[82vh] w-full max-w-[440px] overflow-y-auto rounded-2xl border border-gray-200 bg-white shadow-2xl dark:border-neutral-800 dark:bg-neutral-900"
       >
         <button
           type="button"
@@ -71,15 +71,15 @@ export const ProjectInfoModal = ({ open, onClose, version }: ProjectInfoModalPro
           <X className="h-4 w-4" />
         </button>
 
-        <div className="px-7 pb-4 pt-7 text-center">
+        <div className="px-5 pb-3 pt-5 text-center">
           <img
             src="/brand/lockup.png"
             alt="哔哩哔哩记忆"
-            className="mx-auto w-full max-w-[340px]"
+            className="mx-auto w-full max-w-[260px]"
           />
         </div>
 
-        <div className="border-t border-gray-100 px-6 py-4 dark:border-neutral-800">
+        <div className="border-t border-gray-100 px-5 py-3.5 dark:border-neutral-800">
           <p className="mb-1.5 text-[10px] font-medium tracking-wide text-gray-400 dark:text-neutral-500">
             GitHub
           </p>

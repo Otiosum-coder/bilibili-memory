@@ -17,7 +17,9 @@ import {
   Settings2,
   AlertCircle,
   LoaderCircle,
+  Trash2,
 } from "lucide-react";
+import { HistoryCleanupModal } from "../components/HistoryCleanupModal";
 import { Pagination } from "../components/Pagination";
 import {
   GRID_COLUMNS,
@@ -76,6 +78,7 @@ export const History: React.FC = () => {
   const [pageSize, setPageSize] = useState(DEFAULT_PAGE_SIZE);
   const [isSyncModalOpen, setIsSyncModalOpen] = useState(false);
   const [isViewSettingsModalOpen, setIsViewSettingsModalOpen] = useState(false);
+  const [isCleanupModalOpen, setIsCleanupModalOpen] = useState(false);
   const [loadError, setLoadError] = useState("");
   const [isToolbarExpanded, setIsToolbarExpanded] = useState(true);
 
@@ -476,6 +479,16 @@ export const History: React.FC = () => {
               </button>
               <button
                 type="button"
+                onClick={() => setIsCleanupModalOpen(true)}
+                className="inline-flex h-10 items-center gap-2 whitespace-nowrap rounded-lg border border-gray-200 bg-white px-3.5 text-sm font-medium text-gray-600 transition-colors hover:border-rose-200 hover:bg-rose-50 hover:text-rose-600 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-rose-500 focus-visible:ring-offset-2 dark:border-neutral-700 dark:bg-neutral-900 dark:text-neutral-300 dark:hover:border-rose-500/40 dark:hover:bg-rose-500/10 dark:hover:text-rose-400 dark:focus-visible:ring-offset-[#0a0a0a]"
+                title="清理历史记录"
+                aria-label="清理历史记录"
+              >
+                <Trash2 className="h-4 w-4" />
+                <span className="hidden sm:inline">清理历史</span>
+              </button>
+              <button
+                type="button"
                 onClick={() => void handleRefresh()}
                 className="inline-flex h-10 w-10 items-center justify-center rounded-lg border border-gray-200 bg-white text-gray-600 transition-colors hover:border-pink-200 hover:bg-pink-50 hover:text-pink-600 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-pink-500 focus-visible:ring-offset-2 disabled:cursor-not-allowed disabled:opacity-50 dark:border-neutral-700 dark:bg-neutral-900 dark:text-neutral-300 dark:hover:border-pink-500/40 dark:hover:bg-pink-500/10 dark:hover:text-pink-400 dark:focus-visible:ring-offset-[#0a0a0a]"
                 disabled={isLoading}
@@ -854,6 +867,14 @@ export const History: React.FC = () => {
           )}
         </div>
       )}
+
+      <HistoryCleanupModal
+        open={isCleanupModalOpen}
+        onClose={() => setIsCleanupModalOpen(false)}
+        onDeleted={() => {
+          void handleRefresh();
+        }}
+      />
 
       <HistorySyncModal
         open={isSyncModalOpen}

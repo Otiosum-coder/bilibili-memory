@@ -30,6 +30,8 @@ export interface StatsEvent {
   view_at: number;
   author_mid: number;
   author_name: string;
+  /** 标题；部分内容类型可能缺失。用于「最常重看」等需要人话的展示 */
+  title?: string;
   /** 观看进度（秒）。接口对直播不返回，可能缺失。`-1` 表示已看完 */
   progress?: number;
   /** 视频总时长（秒）。接口对直播不返回，可能缺失 */
@@ -386,6 +388,229 @@ export const buildDurationDistribution = (
   return result;
 };
 
+/**
+ * 一条观测折算出的观看秒数。
+ *
+ * 口径：
+ * - 没有时长（直播/文章/接口缺失）→ null，不进累计；
+ * - `progress === -1` → 按完整时长算；
+ * - 其它进度夹在 `[0, duration]`，防止接口返回超过总时长。
+ *
+ * 注意：这是**观测值**，不是精确播放器计时。同步会重复捕获同一视频，
+ * 所以上层累计时必须按 content_key 去重（见 buildWatchTimeStats）。
+ */
+export const estimateWatchedSeconds = (event: StatsEvent): number | null => {
+  const duration = Number(event.duration);
+  if (!Number.isFinite(duration) || duration <= 0) return null;
+  const progress = Number(event.progress);
+  if (progress === -1) return duration;
+  if (!Number.isFinite(progress)) return null;
+  return Math.max(0, Math.min(duration, progress));
+};
+
+export interface WatchTimeStats {
+  /** 按 content_key 取「看得最远的一次」后累计的秒数 */
+  totalSeconds: number;
+  /** 有观看记录的天数 */
+  activeDays: number;
+  /** 活跃日均秒数 */
+  averagePerActiveDaySeconds: number;
+  /** 单日估算时长最长的一天 */
+  longestDaySeconds: number;
+  longestDay: string | null;
+  /** 平均每个有时长信息的视频看了多久 */
+  averagePerContentSeconds: number;
+  /** 有时长信息 / 全部视频数 */
+  coveredContents: number;
+  totalContents: number;
+  /** 有时长信息的视频占比（0–1） */
+  coverageRatio: number;
+}
+
+/**
+ * 观看时长估算。
+ *
+ * 为什么不把每条事件的进度直接相加：一次连续观看会被同步记成几十条观测，
+ * 直接相加会把同一段观看重复算几十次。这里按 content_key 取观测到的最大进度，
+ * 再把不同视频的最大进度相加。循环播放/重看无法从接口可靠还原，因此是下界估算。
+ */
+export const buildWatchTimeStats = (events: readonly StatsEvent[]): WatchTimeStats => {
+  const activeDays = new Set<string>();
+  const contents = new Set<string>();
+  const secondsByContent = new Map<string, number>();
+  const secondsByDayContent = new Map<string, Map<string, number>>();
+
+  for (const event of events) {
+    const day = toDayKey(event.view_at);
+    activeDays.add(day);
+    contents.add(event.content_key);
+
+    const seconds = estimateWatchedSeconds(event);
+    if (seconds === null) continue;
+
+    const previous = secondsByContent.get(event.content_key) ?? -1;
+    if (seconds > previous) secondsByContent.set(event.content_key, seconds);
+
+    const dayMap = secondsByDayContent.get(day) ?? new Map<string, number>();
+    const previousToday = dayMap.get(event.content_key) ?? -1;
+    if (seconds > previousToday) dayMap.set(event.content_key, seconds);
+    secondsByDayContent.set(day, dayMap);
+  }
+
+  let totalSeconds = 0;
+  for (const seconds of secondsByContent.values()) totalSeconds += seconds;
+
+  let longestDaySeconds = 0;
+  let longestDay: string | null = null;
+  for (const [day, dayMap] of secondsByDayContent) {
+    let daySeconds = 0;
+    for (const seconds of dayMap.values()) daySeconds += seconds;
+    if (daySeconds > longestDaySeconds) {
+      longestDaySeconds = daySeconds;
+      longestDay = day;
+    }
+  }
+
+  const coveredContents = secondsByContent.size;
+  return {
+    totalSeconds,
+    activeDays: activeDays.size,
+    averagePerActiveDaySeconds: activeDays.size > 0 ? totalSeconds / activeDays.size : 0,
+    longestDaySeconds,
+    longestDay,
+    averagePerContentSeconds: coveredContents > 0 ? totalSeconds / coveredContents : 0,
+    coveredContents,
+    totalContents: contents.size,
+    coverageRatio: contents.size > 0 ? coveredContents / contents.size : 0,
+  };
+};
+
+export interface CompletionStats {
+  uniqueContents: number;
+  /** 至少完整播放过一次的视频数 */
+  completedContents: number;
+  /** 至少完整播放过一次的占比 */
+  completionRate: number;
+  /** 观测到的完整播放次数（下界，跨轮次计） */
+  completedPlays: number;
+  /** 完整播放次数 / 视频数，可大于 1 */
+  rewatchRate: number;
+  /** 每个视频最高进度的平均值（0–1） */
+  averageProgress: number;
+  /** 完整播放次数 >1 的视频 Top3 */
+  topRewatched: Array<{ contentKey: string; title: string; count: number }>;
+}
+
+/**
+ * 完成度与重看。
+ *
+ * 「完整播放率」按内容算（至少完整看过一次的视频占比），不按原始记录算——
+ * 否则同步次数越多，分母越大，完成率会荒谬地越来越低。
+ * 「重看率」用观测到的完整播放次数 ÷ 视频数，是估算下界。
+ */
+export const buildCompletionStats = (events: readonly StatsEvent[]): CompletionStats => {
+  const contents = new Set<string>();
+  const maxProgress = new Map<string, number>();
+  const titleByContent = new Map<string, string>();
+
+  for (const event of events) {
+    contents.add(event.content_key);
+    if (event.title) titleByContent.set(event.content_key, event.title);
+
+    const duration = Number(event.duration);
+    const progress = Number(event.progress);
+    if (!Number.isFinite(duration) || duration <= 0) continue;
+    const ratio = progress === -1 ? 1 : Number.isFinite(progress) ? Math.min(1, Math.max(0, progress / duration)) : 0;
+    maxProgress.set(event.content_key, Math.max(maxProgress.get(event.content_key) ?? 0, ratio));
+  }
+
+  const completed = countCompletedPlays(events);
+  let progressSum = 0;
+  for (const ratio of maxProgress.values()) progressSum += ratio;
+
+  const topRewatched = [...completed.byContent.entries()]
+    .filter(([, count]) => count > 1)
+    .sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]))
+    .slice(0, 3)
+    .map(([contentKey, count]) => ({
+      contentKey,
+      title: titleByContent.get(contentKey) || contentKey,
+      count,
+    }));
+
+  const uniqueContents = contents.size;
+  return {
+    uniqueContents,
+    completedContents: completed.contents,
+    completionRate: uniqueContents > 0 ? completed.contents / uniqueContents : 0,
+    completedPlays: completed.total,
+    rewatchRate: uniqueContents > 0 ? completed.total / uniqueContents : 0,
+    averageProgress: maxProgress.size > 0 ? progressSum / maxProgress.size : 0,
+    topRewatched,
+  };
+};
+
+export interface MonthlyViewPoint {
+  /** YYYY-MM */
+  month: string;
+  views: number;
+  uniqueContents: number;
+}
+
+/**
+ * 某一年的月度观看序列。
+ *
+ * 当前年份只画到本月，过去的年份画满 12 个月；不把未来月份补出来。
+ * 不用 buildDailyViewSeries 的 365 天切片，因为跨年窗口会混入上一年 12 月。
+ */
+export const buildMonthlyViewSeries = (
+  events: readonly StatsEvent[],
+  year: number,
+  nowMs: number,
+): MonthlyViewPoint[] => {
+  const now = new Date(nowMs);
+  const currentYear = now.getFullYear();
+  if (year > currentYear) return [];
+  const endMonth = year === currentYear ? now.getMonth() + 1 : 12;
+
+  const series: MonthlyViewPoint[] = [];
+  const indexByMonth = new Map<string, number>();
+  for (let month = 1; month <= endMonth; month++) {
+    const key = `${year}-${`${month}`.padStart(2, "0")}`;
+    indexByMonth.set(key, series.length);
+    series.push({ month: key, views: 0, uniqueContents: 0 });
+  }
+
+  const uniqueByIndex = new Map<number, Set<string>>();
+  for (const event of events) {
+    const date = new Date(event.view_at * 1000);
+    if (date.getFullYear() !== year) continue;
+    const key = `${year}-${`${date.getMonth() + 1}`.padStart(2, "0")}`;
+    const index = indexByMonth.get(key);
+    if (index === undefined) continue;
+    series[index].views += 1;
+    const set = uniqueByIndex.get(index) ?? new Set<string>();
+    set.add(event.content_key);
+    uniqueByIndex.set(index, set);
+  }
+  for (const [index, set] of uniqueByIndex) series[index].uniqueContents = set.size;
+  return series;
+};
+
+/** 有观看记录的年份，倒序；用于总览的年份选择器 */
+export const listHistoryYears = (events: readonly StatsEvent[]): number[] =>
+  [...new Set(events.map((event) => new Date(event.view_at * 1000).getFullYear()))].sort(
+    (a, b) => b - a,
+  );
+
+export const filterEventsByYear = <T extends StatsEvent>(
+  events: readonly T[],
+  year: number | null,
+): T[] =>
+  year === null
+    ? [...events]
+    : events.filter((event) => new Date(event.view_at * 1000).getFullYear() === year);
+
 export interface TopAuthor {
   mid: number;
   name: string;
@@ -395,6 +620,10 @@ export interface TopAuthor {
   completedPlays: number;
   /** 近期窗口内看过的不同视频数 */
   recentVideos: number;
+  /** 估算观看时长（秒）；没有时长信息的视频不计 */
+  watchSeconds: number;
+  /** 近期窗口内估算观看时长（秒） */
+  recentWatchSeconds: number;
   /** 最近一次观看的时间（秒），没看过为 null */
   lastViewedAt: number | null;
 }
@@ -410,6 +639,10 @@ export interface TopAuthorOptions {
    * 实测确实存在整条记录名字为空的 UP 主。调用方可以传关注列表里的当前昵称来补。
    */
   nameByMid?: ReadonlyMap<number, string>;
+  /**
+   * 排序口径。默认按不同视频数（旧行为）；报告和总览可改成观看时长。
+   */
+  sortBy?: "recentVideos" | "watchSeconds";
 }
 
 /** 榜单条目的显示名：事件里的名字 → 兜底表 → UID（与关注列表的兜底文案一致） */
@@ -460,12 +693,41 @@ export const buildTopAuthors = (
 
   // 完整播放次数按内容归属到作者
   const authorByContent = new Map<string, number>();
-  for (const event of events) authorByContent.set(event.content_key, event.author_mid);
+  const secondsByContent = new Map<string, number>();
+  const recentSecondsByContent = new Map<string, number>();
+  for (const event of events) {
+    authorByContent.set(event.content_key, event.author_mid);
+    const seconds = estimateWatchedSeconds(event);
+    if (seconds !== null) {
+      secondsByContent.set(
+        event.content_key,
+        Math.max(secondsByContent.get(event.content_key) ?? 0, seconds),
+      );
+      if (event.view_at >= recentSinceSec) {
+        recentSecondsByContent.set(
+          event.content_key,
+          Math.max(recentSecondsByContent.get(event.content_key) ?? 0, seconds),
+        );
+      }
+    }
+  }
   const completedByAuthor = new Map<number, number>();
   for (const [contentKey, count] of countCompletedPlays(events).byContent) {
     const mid = authorByContent.get(contentKey);
     if (mid === undefined) continue;
     completedByAuthor.set(mid, (completedByAuthor.get(mid) ?? 0) + count);
+  }
+  const watchSecondsByAuthor = new Map<number, number>();
+  for (const [contentKey, seconds] of secondsByContent) {
+    const mid = authorByContent.get(contentKey);
+    if (mid === undefined) continue;
+    watchSecondsByAuthor.set(mid, (watchSecondsByAuthor.get(mid) ?? 0) + seconds);
+  }
+  const recentWatchSecondsByAuthor = new Map<number, number>();
+  for (const [contentKey, seconds] of recentSecondsByContent) {
+    const mid = authorByContent.get(contentKey);
+    if (mid === undefined) continue;
+    recentWatchSecondsByAuthor.set(mid, (recentWatchSecondsByAuthor.get(mid) ?? 0) + seconds);
   }
 
   return [...byMid.entries()]
@@ -476,16 +738,25 @@ export const buildTopAuthors = (
       uniqueContents: value.contents.size,
       completedPlays: completedByAuthor.get(mid) ?? 0,
       recentVideos: value.recentContents.size,
+      watchSeconds: watchSecondsByAuthor.get(mid) ?? 0,
+      recentWatchSeconds: recentWatchSecondsByAuthor.get(mid) ?? 0,
       lastViewedAt: value.lastViewedAt > 0 ? value.lastViewedAt : null,
     }))
     // 「最近在看的」只保留窗口内真正看过的作者。否则近期只有 2 个人有记录时，
     // 榜单仍会补到 5 行，后 3 行显示「0 个视频」，看起来像统计出错。
     .filter((author) => recentSinceSec <= 0 || author.recentVideos > 0)
     .sort((a, b) => {
-      // 近期优先：不传窗口时 recentVideos 等于 uniqueContents，等价于按视频数排序
-      if (b.recentVideos !== a.recentVideos) return b.recentVideos - a.recentVideos;
-      if (b.uniqueContents !== a.uniqueContents) return b.uniqueContents - a.uniqueContents;
-      if (b.views !== a.views) return b.views - a.views;
+      if (options.sortBy === "watchSeconds") {
+        const aSeconds = recentSinceSec > 0 ? a.recentWatchSeconds : a.watchSeconds;
+        const bSeconds = recentSinceSec > 0 ? b.recentWatchSeconds : b.watchSeconds;
+        if (bSeconds !== aSeconds) return bSeconds - aSeconds;
+        if (b.recentVideos !== a.recentVideos) return b.recentVideos - a.recentVideos;
+      } else {
+        // 近期优先：不传窗口时 recentVideos 等于 uniqueContents，等价于按视频数排序
+        if (b.recentVideos !== a.recentVideos) return b.recentVideos - a.recentVideos;
+        if (b.uniqueContents !== a.uniqueContents) return b.uniqueContents - a.uniqueContents;
+        if (b.views !== a.views) return b.views - a.views;
+      }
       return a.mid - b.mid;
     })
     .slice(0, Math.max(0, limit));
@@ -592,6 +863,12 @@ export interface HistoryReport {
   longestStreak: number;
   /** 本期观测到的完整播放次数（下界） */
   completedPlays: number;
+  /** 本期观看时长估算 */
+  watchTime: WatchTimeStats;
+  /** 本期完成度 / 重看估算 */
+  completion: CompletionStats;
+  /** 仅年报：按月份拆分的观看趋势 */
+  monthlySeries?: MonthlyViewPoint[];
 }
 
 /**
@@ -644,6 +921,10 @@ export const buildHistoryReport = (
   const series = buildDailyViewSeries(periodEvents, totalDays, nowMs);
   const hours = buildHourHistogram(periodEvents);
   const peakHour = findPeakHourWindow(hours, 2);
+  const monthlySeries =
+    kind === "year"
+      ? buildMonthlyViewSeries(periodEvents, new Date(startMs).getFullYear(), nowMs)
+      : undefined;
 
   return {
     kind,
@@ -656,11 +937,14 @@ export const buildHistoryReport = (
     peakHour,
     hours,
     // 报告里给 10 位：界面是两列布局，5 行会显得太空
-    topAuthors: buildTopAuthors(periodEvents, 10, options),
+    topAuthors: buildTopAuthors(periodEvents, 10, { ...options, sortBy: "watchSeconds" }),
     durationBuckets: buildDurationDistribution(periodEvents),
     series,
     longestStreak: computeLongestStreak(series),
     completedPlays: countCompletedPlays(periodEvents).total,
+    watchTime: buildWatchTimeStats(periodEvents),
+    completion: buildCompletionStats(periodEvents),
+    monthlySeries,
   };
 };
 

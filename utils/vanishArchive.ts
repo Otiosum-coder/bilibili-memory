@@ -578,6 +578,7 @@ export const mergeRestoredFavorite = (
     intro: current.intro || snapshot.intro,
     upper: current.upper?.name ? current.upper : (snapshot.upper ?? current.upper),
     duration: current.duration || snapshot.duration,
+    fav_time: current.fav_time || snapshot.fav_time,
     ctime: current.ctime || snapshot.ctime,
     pubtime: current.pubtime || snapshot.pubtime,
     bvid: current.bvid || current.bv_id || snapshot.bvid,
