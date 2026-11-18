@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { Link } from "react-router-dom";
 import {
   ArrowDownUp,
   BadgeCheck,
@@ -266,16 +267,36 @@ const formatSnapshotValue = (key: string, value: unknown): string => {
  *
  * 返回空数组说明快照为空或全是未知字段——调用方据此退回原始 JSON 展示。
  */
-const buildSnapshotRows = (snapshot: unknown): Array<{ label: string; value: string }> => {
+const buildSnapshotRows = (
+  snapshot: unknown,
+): Array<{ label: string; value: string; href?: string }> => {
   if (!snapshot || typeof snapshot !== "object" || Array.isArray(snapshot)) return [];
-  const rows: Array<{ label: string; value: string }> = [];
-  for (const [key, raw] of Object.entries(snapshot as Record<string, unknown>)) {
+  const record = snapshot as Record<string, unknown>;
+  const rows: Array<{ label: string; value: string; href?: string }> = [];
+  const folderId = Number(record.folder_id);
+  const collectionId = Number(record.collection_id);
+  for (const [key, raw] of Object.entries(record)) {
+    // B站同一稿件会同时返回 bvid 和 bv_id，两个字段值相同；只展示一次。
+    if (key === "bv_id" && record.bvid) continue;
     const label = SNAPSHOT_FIELD_LABELS[key];
     if (!label || SNAPSHOT_FIELD_HIDDEN.has(key)) continue;
     const value = formatSnapshotValue(key, raw);
     if (!value) continue;
-    // 同名字段可能以不同 key 出现（如 bvid / bv_id），保持首次出现的顺序即可
-    rows.push({ label, value });
+    let href: string | undefined;
+    if (
+      (key === "folder_id" || key === "folderName") &&
+      Number.isSafeInteger(folderId) &&
+      folderId > 0
+    ) {
+      href = `/favorites?folder=${folderId}`;
+    } else if (
+      (key === "collection_id" || key === "collectionName") &&
+      Number.isSafeInteger(collectionId) &&
+      collectionId > 0
+    ) {
+      href = `/collections?collection=${collectionId}`;
+    }
+    rows.push({ label, value, href });
   }
   return rows;
 };
@@ -1230,12 +1251,16 @@ const Vanished = () => {
   );
 
   /** 收藏夹 id → 名称：档案按「收藏夹 + 视频」存条目，同一条 BV 在多个夹子里会出现多条 */
-  const folderLabelFor = (item: VanishArchiveItem): string | null => {
+  const folderIdFor = (item: VanishArchiveItem): number | null => {
     if (item.kind !== "favorite") return null;
     const snapshot = item.item as { folder_id?: unknown } | null | undefined;
     const rawFolderId = snapshot?.folder_id ?? item.sourceId.split(":")[0];
     const folderId = Number(rawFolderId);
-    if (!Number.isFinite(folderId) || folderId <= 0) return null;
+    return Number.isFinite(folderId) && folderId > 0 ? folderId : null;
+  };
+  const folderLabelFor = (item: VanishArchiveItem): string | null => {
+    const folderId = folderIdFor(item);
+    if (!folderId) return null;
     const title = folders.find((folder) => folder.id === folderId)?.title;
     return title ? `收藏夹：${title}` : `收藏夹 ID ${folderId}`;
   };
@@ -1570,6 +1595,7 @@ const Vanished = () => {
         undefined)
       : undefined;
   const detailRows = detailItem ? buildSnapshotRows(detailItem.item) : [];
+  const detailFolderId = detailItem ? folderIdFor(detailItem) : null;
   const detailFolderLabel = detailItem ? folderLabelFor(detailItem) : null;
 
   /** 侧栏筛选按钮：与「互动记录」「关注列表」保持同一套样式与计数位置 */
@@ -2359,7 +2385,16 @@ const Vanished = () => {
                   <div className="flex justify-between gap-3">
                     <dt className="text-gray-500 dark:text-neutral-400">所属收藏夹</dt>
                     <dd className="min-w-0 break-all text-right text-gray-700 dark:text-neutral-200">
-                      {detailFolderLabel.replace(/^收藏夹：/, "")}
+                      {detailFolderId ? (
+                        <Link
+                          to={`/favorites?folder=${detailFolderId}`}
+                          className="text-pink-600 underline-offset-2 hover:underline dark:text-pink-400"
+                        >
+                          {detailFolderLabel.replace(/^收藏夹：/, "")}
+                        </Link>
+                      ) : (
+                        detailFolderLabel.replace(/^收藏夹：/, "")
+                      )}
                     </dd>
                   </div>
                 ) : null}
@@ -2396,9 +2431,9 @@ const Vanished = () => {
 
                 {detailRows.length > 0 ? (
                   <dl className="mt-2 divide-y divide-gray-100 overflow-hidden rounded-lg border border-gray-100 dark:divide-neutral-800 dark:border-neutral-800">
-                    {detailRows.map((row) => (
+                    {detailRows.map((row, index) => (
                       <div
-                        key={row.label}
+                        key={`${row.label}-${index}`}
                         className="flex items-start justify-between gap-4 px-3 py-2 text-xs"
                       >
                         <dt className="shrink-0 text-gray-500 dark:text-neutral-400">
@@ -2408,7 +2443,16 @@ const Vanished = () => {
                           className="min-w-0 break-all text-right text-gray-700 dark:text-neutral-200"
                           title={row.value}
                         >
-                          {row.value}
+                          {row.href ? (
+                            <Link
+                              to={row.href}
+                              className="text-pink-600 underline-offset-2 hover:underline dark:text-pink-400"
+                            >
+                              {row.value}
+                            </Link>
+                          ) : (
+                            row.value
+                          )}
                         </dd>
                       </div>
                     ))}

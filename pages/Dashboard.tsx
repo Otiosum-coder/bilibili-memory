@@ -6,6 +6,10 @@ import {
   FOLLOWING_LAST_SYNC,
   FOLLOWING_SYNC_INTERVAL,
   FOLLOWING_SYNC_PROGRESS,
+  FAVORITE_FOLDER_SYNC_PROGRESS,
+  ALL_FAVORITE_FOLDERS_SYNC_PROGRESS,
+  COLLECTION_ARCHIVE_SYNC_PROGRESS,
+  COLLECTION_LATEST_UPDATED_ID,
   INTERACTIONS_SYNC_PROGRESS,
   FAV_COVER_ARCHIVE_PROGRESS,
   COLLECTION_COVER_ARCHIVE_PROGRESS,
@@ -26,6 +30,8 @@ import {
   getAllVanishArchive,
   getEarliestHistoryEventViewAt,
   getHistoryEventsInRange,
+  getLatestFavoriteFolderId,
+  getLatestUpdatedCollectionId,
   getTotalHistoryCount,
 } from "../utils/db";
 import { isInvalidatedResource } from "../utils/favVanishedDiff";
@@ -99,8 +105,6 @@ interface DashboardKpiSnapshot {
   values: Record<string, number>;
 }
 
-const DASHBOARD_CACHE_TTL_MS = 60_000;
-
 interface DashboardMetrics {
   historyCount: number;
   favoriteCount: number;
@@ -109,30 +113,6 @@ interface DashboardMetrics {
   collectionResourceCount: number;
   vanishedCount: number;
 }
-
-interface DashboardCacheData {
-  at: number;
-  metrics: DashboardMetrics;
-  kpiBaseline: Record<string, number> | null;
-  favoriteCoverStats: { archived: number; total: number };
-  following: FollowingItem[];
-  events: FollowingEvent[];
-  interactions: Awaited<ReturnType<typeof getAllInteractions>>;
-  progress: FollowingSyncProgress | null;
-  hasBaseline: boolean;
-  lastSyncAt: number | null;
-  intervalMinutes: number;
-  assetCount: number;
-  avatarAssetCount: number;
-  coverAssetCount: number;
-  coverArchiveProgress: CoverArchiveProgress | null;
-  collectionCoverArchiveProgress: CoverArchiveProgress | null;
-  viewEvents: HistoryEvent[];
-  recordStartedAt: number | null;
-  interactionProgress: InteractionSyncProgress | null;
-}
-
-let dashboardCache: DashboardCacheData | null = null;
 
 /** 每个 KPI 点进去对应的页面；失效内容单独走消失档案 */
 const KPI_ROUTES: Record<string, string> = {
@@ -1518,30 +1498,6 @@ export const Dashboard = () => {
     };
   }, []);
 
-  const applyCache = useCallback((cache: DashboardCacheData) => {
-    setMetrics(cache.metrics);
-    setKpiBaseline(cache.kpiBaseline);
-    kpiBaselineLoadedRef.current = true;
-    setFavoriteCoverStats(cache.favoriteCoverStats);
-    setFollowing(cache.following);
-    setEvents(cache.events);
-    setProgress(cache.progress);
-    setHasBaseline(cache.hasBaseline);
-    setLastSyncAt(cache.lastSyncAt);
-    setIntervalMinutes(cache.intervalMinutes);
-    setAssetCount(cache.assetCount);
-    setAvatarAssetCount(cache.avatarAssetCount);
-    setCoverAssetCount(cache.coverAssetCount);
-    setCoverArchiveProgress(cache.coverArchiveProgress);
-    setCollectionCoverArchiveProgress(cache.collectionCoverArchiveProgress);
-    setViewEvents(cache.viewEvents);
-    setRecordStartedAt(cache.recordStartedAt);
-    setInteractions(cache.interactions);
-    setInteractionProgress(cache.interactionProgress);
-    setLoading(false);
-    setSecondaryLoading(false);
-  }, []);
-
   const load = useCallback(async (options: { background?: boolean } = {}) => {
     if (!options.background) {
       setLoading(true);
@@ -1587,14 +1543,20 @@ export const Dashboard = () => {
         collections.map((collection) => collection.id),
       ).catch(() => 0);
 
+      // 失效内容的主来源是已落库的消失档案；先用它填 KPI，
+      // 第二段实时合并后再校正，避免首屏长时间显示占位符。
+      const quickVanishArchive = await getAllVanishArchive().catch(() => []);
+      const quickVanishedCount = quickVanishArchive.filter(
+        (entry) => entry.source === "favorites",
+      ).length;
+
       const initialMetrics: DashboardMetrics = {
         historyCount,
         favoriteCount,
         folderCount: folders.length,
         collectionCount: collections.length,
         collectionResourceCount,
-        // 失效内容需要扫描多条本地记录，第二段再补
-        vanishedCount: 0,
+        vanishedCount: quickVanishedCount,
       };
       setMetrics(initialMetrics);
       setFollowing(followingList);
@@ -1705,27 +1667,6 @@ export const Dashboard = () => {
           console.warn("保存总览 KPI 快照失败:", error);
         });
 
-        dashboardCache = {
-          at: Date.now(),
-          metrics: nextMetrics,
-          kpiBaseline: savedKpiSnapshot?.values ?? null,
-          favoriteCoverStats: nextFavoriteCoverStats,
-          following: followingList,
-          events: eventList,
-          interactions: interactionList,
-          progress: savedProgress,
-          hasBaseline: savedBaseline,
-          lastSyncAt: savedLastSync,
-          intervalMinutes: savedInterval,
-          assetCount: assets,
-          avatarAssetCount: avatarAssets,
-          coverAssetCount: coverAssets,
-          coverArchiveProgress: savedCoverArchiveProgress,
-          collectionCoverArchiveProgress: savedCollectionCoverArchiveProgress,
-          viewEvents: fullViewEvents,
-          recordStartedAt: earliestViewAt,
-          interactionProgress: savedInteractionProgress,
-        };
       } catch (error) {
         console.error("加载总览次要数据失败:", error);
       }
@@ -1739,15 +1680,58 @@ export const Dashboard = () => {
   }, []);
 
   useEffect(() => {
-    const cached = dashboardCache;
-    if (cached) {
-      applyCache(cached);
-      if (Date.now() - cached.at < DASHBOARD_CACHE_TTL_MS) return;
-      void load({ background: true });
-      return;
-    }
+    // 恢复最早的总览刷新方式：每次进入总览都从 IndexedDB 重新读取，
+    // 不使用模块级缓存，避免切页回来仍看到旧数据。
     void load();
-  }, [applyCache, load]);
+  }, [load]);
+
+  // 从后台切回总览（切标签、切应用、合盖恢复）时补一次静默刷新。
+  const foregroundRefreshAtRef = useRef(Date.now());
+  useEffect(() => {
+    let timer: number | undefined;
+    const refresh = () => {
+      if (document.visibilityState !== "visible") return;
+      const now = Date.now();
+      if (now - foregroundRefreshAtRef.current < 1000) return;
+      window.clearTimeout(timer);
+      timer = window.setTimeout(() => {
+        foregroundRefreshAtRef.current = Date.now();
+        void load({ background: true });
+      }, 300);
+    };
+    document.addEventListener("visibilitychange", refresh);
+    window.addEventListener("focus", refresh);
+    return () => {
+      window.clearTimeout(timer);
+      document.removeEventListener("visibilitychange", refresh);
+      window.removeEventListener("focus", refresh);
+    };
+  }, [load]);
+
+  // 后台收藏/合集同步完成时自动补一次刷新；页面保持原样，不回骨架。
+  useEffect(() => {
+    let timer: number | undefined;
+    const listener = (changes: Record<string, unknown>) => {
+      const completed = [
+        FAVORITE_FOLDER_SYNC_PROGRESS,
+        ALL_FAVORITE_FOLDERS_SYNC_PROGRESS,
+        COLLECTION_ARCHIVE_SYNC_PROGRESS,
+      ].some((key) => {
+        const next = changes[key] as { newValue?: { status?: string } } | undefined;
+        return next?.newValue?.status === "completed";
+      });
+      if (!completed && !(COLLECTION_LATEST_UPDATED_ID in changes)) return;
+      window.clearTimeout(timer);
+      timer = window.setTimeout(() => {
+        void load({ background: true });
+      }, 500);
+    };
+    browser.storage.local.onChanged.addListener(listener);
+    return () => {
+      window.clearTimeout(timer);
+      browser.storage.local.onChanged.removeListener(listener);
+    };
+  }, [load]);
 
   /**
    * 只重读归档相关的数据，避免整页重载。
@@ -1807,7 +1791,6 @@ export const Dashboard = () => {
       const response = await browser.runtime.sendMessage({ action: "syncFollowing" });
       if (!response?.success) throw new Error(response?.error || "关注同步失败");
       toast.success(response.message ?? "关注同步完成");
-      dashboardCache = null;
       await load({ background: true });
     } catch (error) {
       const message = error instanceof Error ? error.message : "关注同步失败";
@@ -1825,7 +1808,6 @@ export const Dashboard = () => {
       const response = await browser.runtime.sendMessage({ action: "syncInteractions" });
       if (!response?.success) throw new Error(response?.error || "互动记录同步失败");
       toast.success(response.message ?? "互动记录同步完成");
-      dashboardCache = null;
       await load({ background: true });
     } catch (error) {
       const message = error instanceof Error ? error.message : "互动记录同步失败";
@@ -1857,7 +1839,6 @@ export const Dashboard = () => {
         );
       }
       toast.success(messages.join("；"));
-      dashboardCache = null;
       await load({ background: true });
     } catch (error) {
       toast.error(error instanceof Error ? error.message : "图片归档失败");
@@ -2062,6 +2043,21 @@ export const Dashboard = () => {
   })();
 
   /** KPI 涨跌：只跟「上次打开总览」比；没有基准或没变化就不显示 */
+  const handleKpiNavigate = async (metricKey: string) => {
+    if (metricKey === "favoriteCount") {
+      const folderId = await getLatestFavoriteFolderId().catch(() => null);
+      navigate(folderId ? `/favorites?folder=${folderId}` : "/favorites");
+      return;
+    }
+    if (metricKey === "collectionCount" || metricKey === "collectionResourceCount") {
+      const collectionId = await getLatestUpdatedCollectionId().catch(() => null);
+      navigate(collectionId ? `/collections?collection=${collectionId}` : "/collections");
+      return;
+    }
+    const route = KPI_ROUTES[metricKey];
+    if (route) navigate(route);
+  };
+
   const kpiDelta = (key: string, value: number): number | null => {
     if (!kpiBaseline || key === "vanishedCount") return null;
     const previous = kpiBaseline[key];
@@ -2197,7 +2193,7 @@ export const Dashboard = () => {
                     {/* 覆盖整张卡的主点击区，? 按钮放在它上层，避免按钮嵌套 */}
                     <button
                       type="button"
-                      onClick={() => route && navigate(route)}
+                      onClick={() => void handleKpiNavigate(metric.key)}
                       aria-label={route ? `打开${metric.label}` : metric.label}
                       className="absolute inset-0 rounded-xl focus-visible:outline-none"
                     />
@@ -2206,11 +2202,9 @@ export const Dashboard = () => {
                         <p className="text-xs text-gray-500 dark:text-neutral-400">{metric.label}</p>
                         <div className="mt-1 flex items-baseline gap-1.5">
                           <p className="text-xl font-semibold tabular-nums text-gray-900 dark:text-neutral-100">
-                            {secondaryLoading && metric.key === "vanishedCount"
-                              ? "—"
-                              : metric.value}
+                            {metric.value}
                           </p>
-                          {!(secondaryLoading && metric.key === "vanishedCount") && delta !== null ? (
+                          {delta !== null ? (
                             <span
                               className={`rounded-full px-2 py-0.5 text-xs font-medium tabular-nums ${
                                 delta > 0

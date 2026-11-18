@@ -32,6 +32,7 @@ import {
   DEFAULT_FAV_FULL_SYNC_INTERVAL_MINUTES,
   COLLECTION_COVER_ARCHIVE_PROGRESS,
   COLLECTION_ARCHIVE_SYNC_PROGRESS,
+  COLLECTION_LATEST_UPDATED_ID,
   COLLECTION_ARCHIVE_PAGE_DELAY_MS,
   COLLECTION_ARCHIVE_SYNC_STALE_MS,
   DEFAULT_FOLLOWING_AUTO_SYNC_ENABLED,
@@ -186,7 +187,9 @@ import {
 } from "../utils/favPublicApi";
 import {
   applyLocalCover,
+  applyLocalTitle,
   buildLocalCoverIndex,
+  buildLocalTitleIndex,
   resourceBvid,
 } from "../utils/favLocalRecovery";
 import {
@@ -3055,10 +3058,13 @@ export default defineBackground(() => {
       // 第零步：本地交叉引用（**零网络请求**，所以排在最前）。
       // 同一个稿件可能也在观看历史 / 喜欢的音乐 / 订阅合集里，
       // 那些记录是稿件失效**之前**抓下来的，封面往往还是好的。
+      const localHistory = await getAllHistory();
+      const localLikedMusic = await getAllLikedMusic();
+      const localCollectionResources = await getAllSubscribedCollectionResources();
       const localCoverIndex = buildLocalCoverIndex({
-        history: await getAllHistory(),
-        likedMusic: await getAllLikedMusic(),
-        collectionResources: await getAllSubscribedCollectionResources(),
+        history: localHistory,
+        likedMusic: localLikedMusic,
+        collectionResources: localCollectionResources,
       });
       let localCoverHits = 0;
       if (localCoverIndex.size > 0) {
@@ -3077,6 +3083,30 @@ export default defineBackground(() => {
       console.log(
         `本地交叉引用：索引 ${localCoverIndex.size} 条封面，命中补齐 ${localCoverHits} 条（无网络请求）`,
       );
+
+      // 本地标题兜底（零请求）：观看历史 / 喜欢的音乐 / 订阅合集里可能存着
+      // 稿件失效前抓到的真实标题。它比分P 推测标题可靠，优先级更高。
+      const localTitleIndex = buildLocalTitleIndex({
+        history: localHistory,
+        likedMusic: localLikedMusic,
+        collectionResources: localCollectionResources,
+      });
+      let localTitleHits = 0;
+      if (localTitleIndex.size > 0) {
+        for (const resource of candidates) {
+          const candidate = localTitleIndex.get(resourceBvid(resource));
+          if (!candidate) continue;
+          const outcome = applyLocalTitle(working.get(resource.id)!, candidate, Date.now());
+          if (!outcome.changed) continue;
+          markImproved(outcome.resource);
+          localTitleHits += 1;
+          result.recovered += 1;
+          result.recoveredLocal += 1;
+          const source = outcome.resource.recoverySource ?? "local_history";
+          result.sources[source] = (result.sources[source] ?? 0) + 1;
+        }
+      }
+      console.log(`本地标题兜底：命中补齐 ${localTitleHits} 条（无网络请求）`);
 
       // 第一步：本地分P标题还原。零网络请求，能本地解决的就不要去麻烦外部站点。
       for (const resource of candidates) {
@@ -3800,6 +3830,18 @@ export default defineBackground(() => {
     }
 
     await replaceSubscribedCollections(collections, { deletedCollectionIds });
+    const previousById = new Map(previousCollections.map((item) => [item.id, item]));
+    const changedCollections = collections.filter((item) => {
+      const previous = previousById.get(item.id);
+      return !previous || previous.mtime !== item.mtime || previous.media_count !== item.media_count;
+    });
+    if (changedCollections.length > 0) {
+      const latestChanged = changedCollections.sort((a, b) => b.mtime - a.mtime)[0];
+      await setStorageValue(COLLECTION_LATEST_UPDATED_ID, {
+        id: latestChanged.id,
+        at: Date.now(),
+      });
+    }
     // 目录同步完成后自动排队首次全量。不能 await：合集内容可能很多，
     // 目录同步的响应要立刻返回；进度写进 storage，页面可以轮询。
     void startCollectionArchiveSync();
@@ -3903,6 +3945,16 @@ export default defineBackground(() => {
     }
 
     await replaceSubscribedCollectionResources(collectionId, resources);
+    const incomingIds = new Set(resources.map((resource) => resource.id));
+    const hasChanges =
+      previous.length !== resources.length ||
+      previous.some((resource) => !incomingIds.has(resource.id));
+    if (hasChanges) {
+      await setStorageValue(COLLECTION_LATEST_UPDATED_ID, {
+        id: collectionId,
+        at: Date.now(),
+      });
+    }
   }
 
   type CollectionArchiveSyncProgress = {

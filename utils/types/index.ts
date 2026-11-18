@@ -337,6 +337,11 @@ export interface FavoriteResource {
   recoveredAt?: number;
   recoverySource?: FavRecoverySource;
   /**
+   * 标题是「分P 推测」得到的（非官方真标题），等待被真实标题覆盖。
+   * 通常还带 `TITLE_GUESS_SUFFIX` 后缀；这个布尔位是更稳的判据。
+   */
+  titleGuessed?: boolean;
+  /**
    * 分P 信息。B站 收藏夹接口本来就返回，但上游从未声明也从未使用。
    *
    * 关键价值：稿件失效后 `title` 会被换成「已失效视频」，但 `pages[0].title`

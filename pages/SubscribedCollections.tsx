@@ -1,9 +1,12 @@
 import { useEffect, useRef, useState } from "react";
+import { useSearchParams } from "react-router-dom";
 import toast from "react-hot-toast";
 import {
   deleteCollectionArchiveResources,
   deleteCollectionArchives,
   getAllCollectionArchives,
+  getAllSubscribedCollectionResources,
+  getAllVanishArchive,
   getSubscribedCollectionResources,
   getSubscribedCollections,
   restoreCollectionArchives,
@@ -37,9 +40,18 @@ const SEARCH_OPTIONS: { value: SearchType; label: string }[] = [
 ];
 
 export const SubscribedCollections = () => {
+  const [searchParams] = useSearchParams();
   const [collections, setCollections] = useState<SubscribedCollection[]>([]);
   const [selectedCollectionId, setSelectedCollectionId] = useState<number | null>(null);
+  /** 从档案详情等位置跳转过来的合集只应用一次 */
+  const requestedCollectionRef = useRef<number | null>(null);
+  if (requestedCollectionRef.current === null) {
+    const raw = Number(searchParams.get("collection"));
+    if (Number.isSafeInteger(raw) && raw > 0) requestedCollectionRef.current = raw;
+  }
   const [resources, setResources] = useState<SubscribedCollectionResource[]>([]);
+  /** 合集本地总条数（在线 + 已消失但本地留档的），用于列表显示真实数量 */
+  const [localCounts, setLocalCounts] = useState<Record<number, number>>({});
   const [isSyncingCollections, setIsSyncingCollections] = useState(false);
   const [isSyncingResources, setIsSyncingResources] = useState(false);
   const [currentPage, setCurrentPage] = useState(1);
@@ -183,15 +195,100 @@ export const SubscribedCollections = () => {
     const sortedList = list.sort((a, b) => a.index - b.index);
     setCollections(sortedList);
     setSelectedCollectionId((currentId) => {
+      const requestedId = requestedCollectionRef.current;
+      if (requestedId) {
+        // 活跃合集里没有时先保留请求，等合集档案加载后尝试打开本地备份。
+        if (sortedList.some((collection) => collection.id === requestedId)) {
+          requestedCollectionRef.current = null;
+          return requestedId;
+        }
+      }
       if (currentId && sortedList.some((collection) => collection.id === currentId))
         return currentId;
       return sortedList[0]?.id ?? null;
     });
+    await loadLocalCounts();
+  };
+
+  /** 统计每个合集的本地总条数：在线 + 已消失但本地留档的。 */
+  const loadLocalCounts = async () => {
+    try {
+      const allResources = await getAllSubscribedCollectionResources();
+      const liveIdsByColl = new Map<number, Set<string>>();
+      const counts = new Map<number, number>();
+      for (const resource of allResources) {
+        const cid = Number(resource.collection_id);
+        if (!Number.isFinite(cid)) continue;
+        counts.set(cid, (counts.get(cid) ?? 0) + 1);
+        if (!liveIdsByColl.has(cid)) liveIdsByColl.set(cid, new Set());
+        liveIdsByColl.get(cid)!.add(String(resource.id));
+      }
+      const archive = await getAllVanishArchive();
+      for (const entry of archive) {
+        if (entry.kind !== "collection") continue;
+        const cid = Number(
+          (entry.item as { collection_id?: unknown } | undefined)?.collection_id,
+        );
+        if (!Number.isFinite(cid)) continue;
+        if (liveIdsByColl.get(cid)?.has(String(entry.sourceId))) continue;
+        counts.set(cid, (counts.get(cid) ?? 0) + 1);
+      }
+      setLocalCounts(Object.fromEntries(counts));
+    } catch (error) {
+      console.warn("统计合集本地条数失败:", error);
+    }
   };
 
   const loadResources = async (collectionId: number) => {
     const list = await getSubscribedCollectionResources(collectionId);
-    setResources(list.sort((a, b) => a.index - b.index));
+    // 把该合集里「已消失」的视频从消失档案合并回来一起显示，并打本地保留标记。
+    // 消失档案是独立存储，合集页默认只读 subscribedCollectionResources；
+    // 不合并的话已删稿件在合集页会「凭空少几条」。
+    let vanishedItems: SubscribedCollectionResource[] = [];
+    try {
+      const archive = await getAllVanishArchive();
+      const liveIds = new Set(list.map((item) => String(item.id)));
+      vanishedItems = archive
+        .filter((entry) => {
+          if (entry.kind !== "collection") return false;
+          const snapshot = entry.item as { collection_id?: unknown } | undefined;
+          return (
+            String(snapshot?.collection_id) === String(collectionId) &&
+            !liveIds.has(String(entry.sourceId))
+          );
+        })
+        .map((entry) => {
+          const snapshot = (entry.item ?? {}) as Partial<SubscribedCollectionResource>;
+          return {
+            id: entry.sourceId,
+            collection_id: collectionId,
+            aid: entry.aid ?? snapshot.aid ?? 0,
+            bvid: entry.bvid ?? snapshot.bvid ?? "",
+            title: entry.title || snapshot.title || "已失效视频",
+            cover: entry.cover || snapshot.cover || "",
+            coverAssetId: entry.coverAssetId ?? snapshot.coverAssetId,
+            duration: entry.duration ?? snapshot.duration ?? 0,
+            author_name: entry.authorName ?? snapshot.author_name ?? "",
+            author_mid: entry.authorMid ?? snapshot.author_mid ?? 0,
+            pubdate: snapshot.pubdate ?? 0,
+            // 用快照里原来的合集顺序，让它回到原位；缺失时才退到底部
+            index:
+              typeof snapshot.index === "number" && Number.isFinite(snapshot.index)
+                ? snapshot.index
+                : Number.MAX_SAFE_INTEGER,
+            attr: snapshot.attr,
+            invalidatedKind: snapshot.invalidatedKind,
+            vanishedInArchive: true,
+          } as SubscribedCollectionResource & { vanishedInArchive: boolean };
+        });
+    } catch (error) {
+      console.warn("合并合集消失档案失败:", error);
+    }
+    setResources(
+      ([...list, ...vanishedItems] as SubscribedCollectionResource[]).sort(
+        (a, b) => a.index - b.index,
+      ),
+    );
     setCurrentPage(1);
     setKeyword("");
   };
@@ -248,6 +345,17 @@ export const SubscribedCollections = () => {
 
     void initializeCollections();
   }, []);
+
+  useEffect(() => {
+    const requestedId = requestedCollectionRef.current;
+    if (!requestedId) return;
+    if (collections.some((collection) => collection.id === requestedId)) return;
+    if (collectionArchives.length === 0) return;
+
+    requestedCollectionRef.current = null;
+    const archive = collectionArchives.find((item) => item.id === requestedId);
+    if (archive) void openArchiveDetail(archive);
+  }, [collections, collectionArchives]);
 
   useEffect(() => {
     if (!selectedCollection) {
@@ -335,7 +443,8 @@ export const SubscribedCollections = () => {
                 )}
               </div>
               <div className="text-xs text-gray-400 dark:text-neutral-500 mt-1 truncate">
-                {collection.upper?.name || "未知 UP 主"} · {collection.media_count} 个视频
+                {collection.upper?.name || "未知 UP 主"} ·{" "}
+                {localCounts[collection.id] ?? collection.media_count} 个视频
               </div>
             </button>
           ))}
@@ -604,6 +713,11 @@ export const SubscribedCollections = () => {
                           <LibraryBig className="w-8 h-8" />
                         </div>
                       )}
+                      {(item as typeof item & { vanishedInArchive?: boolean }).vanishedInArchive ? (
+                        <span className="absolute left-1.5 top-1.5 rounded bg-amber-600/90 px-1.5 py-0.5 text-[11px] font-medium text-white">
+                          已失效 · 本地保留
+                        </span>
+                      ) : null}
                       {/* 时长压在封面右下角。它是"基本不变"的元数据，
                           比标题更能说明这是哪条内容——标题会被占位文案顶掉 */}
                       {formatInteractionDuration(item.duration) ? (

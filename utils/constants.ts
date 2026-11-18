@@ -97,6 +97,7 @@ export const FAV_COVER_ARCHIVE_PROGRESS = "favCoverArchiveProgress";
 export const COLLECTION_COVER_ARCHIVE_PROGRESS = "collectionCoverArchiveProgress";
 /** 订阅合集首次全量内容同步的进度。目录同步后自动排队，也可手动触发/取消。 */
 export const COLLECTION_ARCHIVE_SYNC_PROGRESS = "collectionArchiveSyncProgress";
+export const COLLECTION_LATEST_UPDATED_ID = "collectionLatestUpdatedId";
 /** 合集内容列表接口的翻页间隔，避免一次性打太快 */
 export const COLLECTION_ARCHIVE_PAGE_DELAY_MS = 1_200;
 /** 进度超过这个时间没心跳就认为后台任务已经中断 */
@@ -220,6 +221,19 @@ export const THEME_MODE = "themeMode";
 
 export const UPDATE_HISTORY = [
   {
+    date: "2026-11-18",
+    version: "0.5.3",
+    changes: [
+      "收藏：修复失效稿件标题一直停在「已失效视频」或文件名的问题；恢复时优先用本地历史里的真实标题兜底，不再生成「（视频投稿上传时的标题）」这类猜测标题，已猜测的也会被真实标题覆盖",
+      "收藏：修复标题是猜测值时被恢复流程跳过、点「恢复失效内容」没反应的问题",
+      "订阅合集：已删除的视频会合并显示在合集内，并按原来的位置排列，标记「已失效 · 本地保留」；合集列表数量改为本地实际条数",
+      "消失档案：修复订阅合集内容「恢复到原页面」不生效、刷新后又变回占位的问题，标题与封面按字段合并恢复",
+      "收藏：失效卡片的悬停详情支持鼠标移入不消失，可以直接划选复制",
+      "总览：失效内容数量改成立即显示，不再长时间显示「—」；点击收藏夹 / 合集 KPI 会跳到最近更新的那个",
+      "总览：回到页面或后台同步完成后自动静默刷新，数据与同步结果保持一致",
+    ],
+  },
+  {
     date: "2026-11-11",
     version: "0.5.2",
     changes: [
@@ -227,7 +241,9 @@ export const UPDATE_HISTORY = [
       "总览：最近在看 UP 主改为三列表格，支持按观看时长/视频数排序",
       "历史记录：新增按范围清理，支持日期范围、删除预览和勾选确认",
       "修复加载阶段合集内容 KPI 显示负数",
+      "总览：移除首屏串行合集计数，进一步缩短首次加载",
       "修复报告关注变动样式与 UP 榜信息过密",
+      "消失档案：收藏夹、合集条目可直接跳转到对应页面",
     ],
   },
   {

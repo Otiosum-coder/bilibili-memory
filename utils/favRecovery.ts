@@ -43,6 +43,32 @@ export const RECOVERY_SOURCE_LABEL: Record<FavRecoverySource, string> = {
 /** 分P标题还原出的标题会追加此后缀，标明这是**推测**而非官方标题 */
 export const TITLE_GUESS_SUFFIX = "（视频投稿上传时的标题）";
 
+/**
+ * 分P 标题其实是文件名的情况。
+ *
+ * UP 主没填标题时，分P 名往往就是上传文件名，例如
+ * `studio_video_1780840034214.mp4`、`VID_20260615_223543`。把这种当稿件标题
+ * 等于用垃圾覆盖垃圾，必须拒收。
+ */
+const FILE_LIKE_TITLE = /\.(mp4|flv|mov|mkv|avi|wmv|m4v|webm|ts|mts|3gp)$/i;
+
+/** 标题是否像上传文件名（不含扩展名但形如 `VID_20260615_223543` 的也拦） */
+export const isFileLikeTitle = (title: string | undefined | null): boolean => {
+  const trimmed = (title ?? "").trim();
+  if (!trimmed) return false;
+  if (FILE_LIKE_TITLE.test(trimmed)) return true;
+  return /^(vid|img|dsc|mvimg|screen[_-]?record|studio_video|video|录屏|屏幕录制)[_-]?[\w-]*$/i.test(
+    trimmed,
+  );
+};
+
+/** 标题是否是分P 推测出来的（带后缀，或被标记为 titleGuessed） */
+export const isGuessedTitle = (
+  resource: Pick<FavoriteResource, "title" | "titleGuessed">,
+): boolean =>
+  resource.titleGuessed === true ||
+  (resource.title ?? "").trim().endsWith(TITLE_GUESS_SUFFIX);
+
 export const isPlaceholderTitle = (title: string | undefined | null): boolean => {
   const trimmed = (title ?? "").trim();
   return trimmed === "" || trimmed === PLACEHOLDER_TITLE;
@@ -69,7 +95,12 @@ export interface BiliplusAidInfo {
  */
 export const needsRecovery = (resource: FavoriteResource): boolean => {
   if (!isInvalidatedResource(resource)) return false;
-  return isPlaceholderTitle(resource.title) || isPlaceholderImage(resource.cover);
+  return (
+    isPlaceholderTitle(resource.title) ||
+    isPlaceholderImage(resource.cover) ||
+    // 分P 推测标题（如 `VID_xxx.mp4（视频投稿上传时的标题）`）也要继续找真标题
+    isGuessedTitle(resource)
+  );
 };
 
 /**
@@ -116,8 +147,13 @@ export const chunkAids = (aids: number[], size: number): number[][] => {
 export const isBetterTitle = (oldTitle: string | undefined, newTitle: string | undefined): boolean => {
   const next = (newTitle ?? "").trim();
   if (!next || next === PLACEHOLDER_TITLE) return false;
+  // 文件名/录屏名不是标题，拒收
+  if (isFileLikeTitle(next)) return false;
   const current = (oldTitle ?? "").trim();
-  return current === "" || current === PLACEHOLDER_TITLE;
+  if (current === "" || current === PLACEHOLDER_TITLE) return true;
+  // 当前是分P 推测标题（带后缀），任何真实标题都可以覆盖它
+  if (current.endsWith(TITLE_GUESS_SUFFIX)) return true;
+  return false;
 };
 
 /** 新封面是否比旧封面更有价值（占位图不算） */
@@ -161,6 +197,7 @@ export const applyRecoveryResult = (
 
   if (isBetterTitle(next.title, info.title)) {
     next.title = (info.title ?? "").trim();
+    next.titleGuessed = false;
     fields.push("title");
   }
   if (isBetterCover(next.cover, info.pic)) {
@@ -198,6 +235,8 @@ export const resolveGuessedTitle = (resource: FavoriteResource): string | null =
   if (!Array.isArray(pages) || pages.length !== 1) return null;
   const partTitle = (pages[0]?.title ?? "").trim();
   if (!partTitle || partTitle === PLACEHOLDER_TITLE) return null;
+  // 分P 名是文件名时说明 UP 没填标题，猜出来也是垃圾
+  if (isFileLikeTitle(partTitle)) return null;
   return `${partTitle}${TITLE_GUESS_SUFFIX}`;
 };
 
@@ -213,7 +252,13 @@ export const applyGuessedTitle = (resource: FavoriteResource, now: number): Reco
   if (!guessed) return { resource, changed: false, fields: [] };
 
   return {
-    resource: { ...resource, title: guessed, recoveredAt: now, recoverySource: "bilibili_pages" },
+    resource: {
+      ...resource,
+      title: guessed,
+      titleGuessed: true,
+      recoveredAt: now,
+      recoverySource: "bilibili_pages",
+    },
     changed: true,
     fields: ["title"],
   };
@@ -254,7 +299,7 @@ export const applyPublicMedia = (
   }
 
   if (isBetterTitle(next.title, media.title)) {
-    next = { ...next, title: (media.title ?? "").trim() };
+    next = { ...next, title: (media.title ?? "").trim(), titleGuessed: false };
     fields.push("title");
   }
 

@@ -1,4 +1,4 @@
-import { isBetterCover, type RecoveryOutcome } from "./favRecovery";
+import { isBetterCover, isFileLikeTitle, isGuessedTitle, isPlaceholderTitle, type RecoveryOutcome } from "./favRecovery";
 import { isPlaceholderImage } from "./imageUrl";
 import type { FavoriteResource, FavRecoverySource } from "./types";
 
@@ -96,5 +96,76 @@ export const applyLocalCover = (
     },
     changed: true,
     fields: ["cover"],
+  };
+};
+
+/* ------------------------------------------------------------------ *
+ * 本地标题兜底
+ *
+ * 与封面同理：观看历史 / 喜欢的音乐 / 订阅合集里可能存着稿件失效**之前**
+ * 抓到的真实标题。它比分P 推测标题可靠，优先级也更高。
+ * ------------------------------------------------------------------ */
+
+export interface LocalTitleCandidate {
+  title: string;
+  source: LocalCoverSource;
+}
+
+export interface LocalTitleSources {
+  history?: Array<{ bvid?: string; title?: string }>;
+  likedMusic?: Array<{ bvid?: string; title?: string }>;
+  collectionResources?: Array<{ bvid?: string; title?: string }>;
+}
+
+/**
+ * 建立 `bvid → 真实标题` 索引。
+ *
+ * 只收录「非占位、非文件名型」的标题——历史记录里同样可能存着 `已失效视频`
+ * 或 `studio_video_xxx.mp4`，把它们收进来等于用垃圾覆盖垃圾。
+ * 顺序 history → likedMusic → collection，先到先得。
+ */
+export const buildLocalTitleIndex = (sources: LocalTitleSources): Map<string, LocalTitleCandidate> => {
+  const index = new Map<string, LocalTitleCandidate>();
+  const push = (bvid: string | undefined, title: string | undefined, source: LocalCoverSource) => {
+    const key = (bvid ?? "").trim();
+    const value = (title ?? "").trim();
+    if (!key || !value) return;
+    if (isPlaceholderTitle(value) || isFileLikeTitle(value)) return;
+    if (index.has(key)) return;
+    index.set(key, { title: value, source });
+  };
+  for (const item of sources.history ?? []) push(item.bvid, item.title, "history");
+  for (const item of sources.likedMusic ?? []) push(item.bvid, item.title, "likedMusic");
+  for (const item of sources.collectionResources ?? []) push(item.bvid, item.title, "collection");
+  return index;
+};
+
+/**
+ * 用本地历史里的真实标题补全。
+ *
+ * 触发条件（任一）：当前标题是占位标题，或当前是分P 推测标题。
+ * 已经拿到真标题的记录不动。
+ */
+export const applyLocalTitle = (
+  resource: FavoriteResource,
+  candidate: LocalTitleCandidate | undefined,
+  now: number,
+): RecoveryOutcome => {
+  if (!candidate) return { resource, changed: false, fields: [] };
+  const current = (resource.title ?? "").trim();
+  const needsTitle = isPlaceholderTitle(current) || isGuessedTitle(resource);
+  if (!needsTitle) return { resource, changed: false, fields: [] };
+  if (candidate.title === current) return { resource, changed: false, fields: [] };
+
+  return {
+    resource: {
+      ...resource,
+      title: candidate.title,
+      titleGuessed: false,
+      recoveredAt: resource.recoveredAt ?? now,
+      recoverySource: resource.recoverySource ?? SOURCE_TO_RECOVERY[candidate.source],
+    },
+    changed: true,
+    fields: ["title"],
   };
 };

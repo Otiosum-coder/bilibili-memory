@@ -1,4 +1,5 @@
 import { useEffect, useState, useRef, useMemo } from "react";
+import { useSearchParams } from "react-router-dom";
 import toast from "react-hot-toast";
 import {
   clearFavResourcesByFolder,
@@ -193,8 +194,15 @@ const recoveryProgressText = (progress: RecoveryProgressView | null): string => 
 };
 
 export const Favorites = () => {
+  const [searchParams] = useSearchParams();
   const [folders, setFolders] = useState<FavoriteFolder[]>([]);
   const [selectedFolderId, setSelectedFolderId] = useState<number | null>(null);
+  /** 从档案详情等位置跳转过来的收藏夹只应用一次，之后不再覆盖用户选择 */
+  const requestedFolderRef = useRef<number | null>(null);
+  if (requestedFolderRef.current === null) {
+    const raw = Number(searchParams.get("folder"));
+    if (Number.isSafeInteger(raw) && raw > 0) requestedFolderRef.current = raw;
+  }
   const [resources, setResources] = useState<FavoriteResource[]>([]);
   const [loading, setLoading] = useState(false);
   const [currentPage, setCurrentPage] = useState(1);
@@ -211,6 +219,25 @@ export const Favorites = () => {
     resource: FavoriteResource;
     rect: DOMRect;
   } | null>(null);
+  /**
+   * 浮层要能用鼠标划选文字，所以不能一离开卡片就立刻消失：
+   * 离开卡片后先等一小会儿，鼠标在窗口期内移到浮层上就取消关闭。
+   */
+  const hoverCloseTimerRef = useRef<number | null>(null);
+  const cancelHoverClose = () => {
+    if (hoverCloseTimerRef.current !== null) {
+      window.clearTimeout(hoverCloseTimerRef.current);
+      hoverCloseTimerRef.current = null;
+    }
+  };
+  const scheduleHoverClose = () => {
+    cancelHoverClose();
+    hoverCloseTimerRef.current = window.setTimeout(() => {
+      setHoverResource(null);
+      hoverCloseTimerRef.current = null;
+    }, 220);
+  };
+  useEffect(() => () => cancelHoverClose(), []);
   /**
    * 当前是否只是"附加"到后台已有的恢复任务上（而不是本页发起的）。
    * 附加模式没有 sendMessage 的返回值可等，只能靠进度里的 status 收尾。
@@ -412,6 +439,13 @@ export const Favorites = () => {
     }
 
     if (selectedFolderId === null || !folders.some((folder) => folder.id === selectedFolderId)) {
+      const requestedFolderId = requestedFolderRef.current;
+      if (requestedFolderId && folders.some((folder) => folder.id === requestedFolderId)) {
+        requestedFolderRef.current = null;
+        setSelectedFolderId(requestedFolderId);
+        return;
+      }
+      requestedFolderRef.current = null;
       // Default select first folder
       setSelectedFolderId(folders[0].id);
     }
@@ -1219,13 +1253,16 @@ export const Favorites = () => {
                               className="relative w-full aspect-video"
                               onMouseEnter={(event) => {
                                 if (invalidated) {
+                                  cancelHoverClose();
                                   setHoverResource({
                                     resource: item,
                                     rect: event.currentTarget.getBoundingClientRect(),
                                   });
                                 }
                               }}
-                              onMouseLeave={() => setHoverResource(null)}
+                              onMouseLeave={() => {
+                                if (invalidated) scheduleHoverClose();
+                              }}
                             >
                               <FavoriteCoverImage
                                 cover={item.cover}
@@ -1368,7 +1405,12 @@ export const Favorites = () => {
         <FavResourceHoverPanel
           resource={hoverResource.resource}
           anchor={hoverResource.rect}
-          onClose={() => setHoverResource(null)}
+          onClose={() => {
+            cancelHoverClose();
+            setHoverResource(null);
+          }}
+          onMouseEnter={cancelHoverClose}
+          onMouseLeave={scheduleHoverClose}
         />
       ) : null}
     </div>

@@ -1,4 +1,4 @@
-import { useEffect } from "react";
+import { useEffect, useRef } from "react";
 import { createPortal } from "react-dom";
 import { buildResourceCopyText, resolveFavResourceHint } from "../utils/favResourceInfo";
 import type { FavoriteResource } from "../utils/types";
@@ -43,14 +43,31 @@ export const FavResourceHoverPanel = ({
   resource,
   anchor,
   onClose,
+  onMouseEnter,
+  onMouseLeave,
 }: {
   resource: FavoriteResource;
   anchor: DOMRect;
   onClose: () => void;
+  onMouseEnter?: () => void;
+  onMouseLeave?: () => void;
 }) => {
-  // 位置是悬停瞬间算的：滚动/缩放后不跟随，直接关掉，避免浮层和卡片错位
+  const panelRef = useRef<HTMLDivElement>(null);
+
+  // 位置是悬停瞬间算的：滚动/缩放后不跟随，直接关掉，避免浮层和卡片错位。
+  // 但浮层自身内容较长需要内部滚动，这种情况不能关。
   useEffect(() => {
-    const close = () => onClose();
+    const close = (event?: Event) => {
+      const target = event?.target;
+      if (
+        panelRef.current &&
+        target instanceof Node &&
+        panelRef.current.contains(target)
+      ) {
+        return;
+      }
+      onClose();
+    };
     window.addEventListener("scroll", close, true);
     window.addEventListener("resize", close);
     return () => {
@@ -77,6 +94,9 @@ export const FavResourceHoverPanel = ({
 
   return createPortal(
     <div
+      ref={panelRef}
+      onMouseEnter={onMouseEnter}
+      onMouseLeave={onMouseLeave}
       style={{
         left,
         top: openUp ? undefined : anchor.bottom + ANCHOR_GAP,
@@ -84,7 +104,7 @@ export const FavResourceHoverPanel = ({
         width,
         maxHeight,
       }}
-      className="pointer-events-none fixed z-[70] select-text overflow-y-auto rounded-xl border border-gray-200 bg-white p-4 shadow-xl dark:border-neutral-700 dark:bg-neutral-900"
+      className="pointer-events-auto fixed z-[70] cursor-text select-text overflow-y-auto rounded-xl border border-gray-200 bg-white p-4 shadow-xl dark:border-neutral-700 dark:bg-neutral-900"
     >
       <pre className="m-0 whitespace-pre-wrap break-words font-sans text-xs leading-relaxed text-gray-700 dark:text-neutral-200">
         {text}

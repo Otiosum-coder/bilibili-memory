@@ -27,6 +27,7 @@ import { recordStorageWarning } from "./storageHealth";
 import { estimateJsonBytes } from "./storageFormat";
 import { getStorageValue, setStorageValue } from "./storage";
 import {
+  COLLECTION_LATEST_UPDATED_ID,
   DELETED_HISTORY_IDS,
   HISTORY_EVENT_MIGRATION_REPORT,
   HISTORY_LEGACY_TOMBSTONES_MIGRATED,
@@ -2590,11 +2591,33 @@ export const countSubscribedCollectionResources = async (
   if (!collectionIds) return await requestResult(store.count());
 
   const index = store.index("collection_id");
-  let total = 0;
-  for (const id of collectionIds) {
-    total += await requestResult(index.count(id));
+  const counts = await Promise.all(collectionIds.map((id) => requestResult(index.count(id))));
+  return counts.reduce((sum, count) => sum + count, 0);
+};
+
+/** 最近一次实际更新的合集：同步记录 → mtime → 最新内容 pubdate。 */
+export const getLatestUpdatedCollectionId = async (): Promise<number | null> => {
+  const latest = await getStorageValue<{ id: number; at: number } | null>(
+    COLLECTION_LATEST_UPDATED_ID,
+    null,
+  );
+  const collections = await getAllSubscribedCollections();
+  if (latest && collections.some((collection) => collection.id === latest.id)) {
+    return latest.id;
   }
-  return total;
+  if (collections.length === 0) return null;
+
+  const withMtime = collections
+    .filter((collection) => Number(collection.mtime) > 0)
+    .sort((a, b) => Number(b.mtime) - Number(a.mtime));
+  if (withMtime.length > 0) return withMtime[0].id;
+
+  const resources = await getAllSubscribedCollectionResources();
+  const activeIds = new Set(collections.map((collection) => collection.id));
+  const latestResource = resources
+    .filter((resource) => activeIds.has(resource.collection_id))
+    .sort((a, b) => Number(b.pubdate) - Number(a.pubdate))[0];
+  return latestResource?.collection_id ?? null;
 };
 
 /** 获取所有订阅合集资源 */
@@ -2928,6 +2951,27 @@ export const getAllFavResources = async (): Promise<FavoriteResource[]> => {
     request.onsuccess = () => resolve(request.result);
     request.onerror = () => reject(request.error);
   });
+};
+
+/**
+ * 找出最近收藏的一条资源所在收藏夹，用于总览「收藏内容」KPI 跳转。
+ * fav_time 为 0 的旧数据回退到列表 index（越小越新）。
+ */
+export const getLatestFavoriteFolderId = async (): Promise<number | null> => {
+  const favorites = await getAllFavResources();
+  let latestFolderId: number | null = null;
+  let latestTime = -1;
+  let latestIndex = Number.POSITIVE_INFINITY;
+  for (const item of favorites) {
+    const favTime = Number.isFinite(item.fav_time) ? item.fav_time : 0;
+    const index = Number.isFinite(item.index) ? item.index : Number.POSITIVE_INFINITY;
+    if (favTime > latestTime || (favTime === latestTime && index < latestIndex)) {
+      latestTime = favTime;
+      latestIndex = index;
+      latestFolderId = item.folder_id;
+    }
+  }
+  return latestFolderId;
 };
 
 /**
@@ -4025,12 +4069,28 @@ export const restoreVanishArchiveItems = async (
         ),
       );
     } else {
-      // 合集/关注/互动没有收藏那套字段级规则：快照补缺失，当前记录优先，
-      // 避免恢复动作把后来更新的状态（如关注已注销）回退。
-      store.put({
-        ...snapshot,
-        ...(current && typeof current === "object" ? current : {}),
-      });
+      // 合集/关注/互动：默认当前记录优先，避免恢复动作把后来更新的状态（如关注已注销）回退。
+      // 但标题/封面若当前是缺失或占位，必须用快照里的真实值补上——否则恢复等于没做。
+      const base: Record<string, unknown> =
+        current && typeof current === "object" ? { ...(current as Record<string, unknown>) } : {};
+      const merged: Record<string, unknown> = { ...snapshot, ...base };
+      const curTitle = typeof base.title === "string" ? base.title.trim() : "";
+      const snapTitle = typeof snapshot.title === "string" ? snapshot.title.trim() : "";
+      if ((!curTitle || curTitle === "已失效视频") && snapTitle) {
+        merged.title = snapshot.title;
+      }
+      const curCover = typeof base.cover === "string" ? base.cover : "";
+      const snapCover = typeof snapshot.cover === "string" ? snapshot.cover : "";
+      if (
+        (!curCover || curCover.includes("be27fd62c99036dce67efface486fb0a88ffed06")) &&
+        snapCover
+      ) {
+        merged.cover = snapshot.cover;
+      }
+      if (!merged.coverAssetId && snapshot.coverAssetId) {
+        merged.coverAssetId = snapshot.coverAssetId;
+      }
+      store.put(merged);
     }
     restored += 1;
   });
